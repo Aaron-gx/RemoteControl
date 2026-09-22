@@ -1,6 +1,10 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
+// EnforceProductMode() 在同类内部引用已标记 [Obsolete] 的独立会话字段(UseRdpSession/AllowLegacyRdpSession)，
+// 该类内部引用同样触发 CS0618，这里抑制以保持编译干净。产品定稿为共享模式。
+#pragma warning disable CS0618
+
 namespace Agent.Common;
 
 /// <summary>
@@ -28,22 +32,27 @@ public sealed class AgentConfig
     /// </summary>
     public int MaxOfflineHours { get; set; } = 48;
 
-    // ---- RDP 回环会话 ----
-    /// <summary>远程会话专用本地用户（安装脚本创建）</summary>
+    // ---- RDP 回环会话（旧方案，产品定稿已废弃：见 docs/架构-单会话共享与双光标.md）----
+    /// <summary>远程会话专用本地用户（安装脚本创建）。已废弃：产品定稿为共享模式。</summary>
+    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。仅在 AllowLegacyRdpSession=true 逃生门时使用。")]
     public string WorkerUser { get; set; } = "RemoteWorker";
+    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
     public string WorkerPassword { get; set; } = "";
-    /// <summary>RDP 回环目标地址，必须是 127.0.0.2（策划 §5.3）</summary>
+    /// <summary>RDP 回环目标地址，必须是 127.0.0.2。已废弃（旧方案）。</summary>
+    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
     public string RdpLoopbackHost { get; set; } = "127.0.0.2";
     /// <summary>
     /// 会话模型（产品级开关）：
     /// false（默认）= **共享模式**：Worker 直接跑在"本机已登录用户"的会话里，远程看到并操作的就是
     ///   这个桌面（外加一块虚拟外屏），软件与数据跟本机用户天然一致（同一个账户、同一个 profile），
     ///   窗口可以在物理屏和外屏之间拖；代价是本机与远程共用一套鼠标键盘、且机器必须有人登录着。
-    /// true = 独立会话模式（旧方案）：新建 RemoteWorker 用户 + RDP 回环会话，两边各自桌面、互不干扰，
-    ///   机器停在登录界面也能连；代价是数据不共享（不同 profile），需要 RDPWrap。
+    /// true = 独立会话模式（旧方案，已废弃）：新建 RemoteWorker 用户 + RDP 回环会话，两边各自桌面、
+    ///   互不干扰，机器停在登录界面也能连；代价是数据不共享（不同 profile），需要 RDPWrap。
     /// </summary>
+    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。仅 AllowLegacyRdpSession=true 逃生门保留。")]
     public bool UseRdpSession { get; set; } = false;
-    /// <summary>启动 mstsc 后等待会话建立的最长秒数（首次登录要建配置文件，实测 40~60s）</summary>
+    /// <summary>启动 mstsc 后等待会话建立的最长秒数。已废弃（旧方案）。</summary>
+    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
     public int RdpConnectTimeoutSec { get; set; } = 180;
     /// <summary>
     /// 旧多会话方案的逃生门。**产品本意是共享模式**：在管理员已登录的那个账户上多加一块虚拟外屏，

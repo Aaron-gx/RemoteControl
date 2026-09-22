@@ -5,6 +5,10 @@ using System.Text;
 using Agent.Common;
 using Microsoft.Win32;
 
+// 旧多会话实现，产品定稿已废弃(共享模式)。仅经 AllowLegacyRdpSession 逃生门触发。
+// 抑制 CS0618 警告(引用已废弃配置字段)。
+#pragma warning disable CS0618
+
 namespace Agent.Coordinator;
 
 /// <summary>

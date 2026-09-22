@@ -2,6 +2,10 @@ using System.Diagnostics;
 using System.Text;
 using Agent.Common;
 
+// 兼容旧多会话逃生门：本文件仍引用已废弃的独立会话配置字段(见 AppConfig.cs [Obsolete])，
+// 抑制 CS0618 警告，保留 AllowLegacyRdpSession 逃生能力。产品定稿为共享模式。
+#pragma warning disable CS0618
+
 namespace Agent.Coordinator;
 
 internal static class Program
