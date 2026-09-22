@@ -12,15 +12,16 @@ publish/
 publish-profiling/
 
 # ===== 构建输出目录（可重建，不入库） =====
-build/
-server/
-setup-agent/
-tests/e2e-run/
-tests/e2e-verify/
+# 注意：用 / 前缀限定顶层，避免误伤 src/Server、src/Tests 等源码目录
+/build/
+/server/
+/setup-agent/
+/tests/e2e-run/
+/tests/e2e-verify/
 
 # ===== 逆向/临时研究目录 =====
-pyrev/
-参考/
+/pyrev/
+/参考/
 *.exe_extracted/
 
 # ===== 日志 =====
