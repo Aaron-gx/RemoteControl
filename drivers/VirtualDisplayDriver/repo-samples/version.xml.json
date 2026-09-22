@@ -1,0 +1,18 @@
+{
+  "name": "version.xml",
+  "path": "version.xml",
+  "sha": "78d5d27174c6ff0624c6928d029634911e03cfa6",
+  "size": 1143,
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/version.xml?ref=master",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/version.xml",
+  "git_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/78d5d27174c6ff0624c6928d029634911e03cfa6",
+  "download_url": "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/version.xml",
+  "type": "file",
+  "content": "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHZlcnNp\nb25zPgogICAgPHJlbGVhc2U+CiAgICAgICAgPG5hbWU+VmlydHVhbCBEcml2\nZXIgQ29udHJvbDwvbmFtZT4KICAgICAgICA8YnVpbGQ+MjUuNy4yMjwvYnVp\nbGQ+CiAgICAgICAgPGxpbms+aHR0cHM6Ly9naXRodWIuY29tL3lvdXJ1c2Vy\nbmFtZS95b3VycmVwby9yZWxlYXNlcy9kb3dubG9hZC92MjUuNy4yMi9WaXJ0\ndWFsRHJpdmVyQ29udHJvbC0yNS43LjIyLnppcDwvbGluaz4KICAgICAgICA8\nZGVzY3JpcHRpb24+U3RhYmxlIHJlbGVhc2Ugd2l0aCBzaWduZWQgZHJpdmVy\ncyBhbmQgY29yZSBmdW5jdGlvbmFsaXR5PC9kZXNjcmlwdGlvbj4KICAgIDwv\ncmVsZWFzZT4KICAgIAogICAgPGJldGE+CiAgICAgICAgPG5hbWU+VmlydHVh\nbCBEcml2ZXIgQ29udHJvbDwvbmFtZT4KICAgICAgICA8YnVpbGQ+MjUuNy4y\nMzwvYnVpbGQ+CiAgICAgICAgPGxpbms+aHR0cHM6Ly9naXRodWIuY29tL1Zp\ncnR1YWxEcml2ZXJzL1ZpcnR1YWwtRGlzcGxheS1Ecml2ZXIvcmVsZWFzZXMv\ndGFnLzI1LjcuMjM8L2xpbms+CiAgICAgICAgPGRlc2NyaXB0aW9uPkluc3Rh\nbGxlci1sZXNzIHBvcnRhYmxlIGFwcCB3aXRoIEluc3RhbGwvVW5pbnN0YWxs\nIHN1cHBvcnQsIFJFTE9BRF9EUklWRVIgZnVuY3Rpb25hbGl0eSwgb2ZmaWNp\nYWxseSBzaWduZWQgZHJpdmVycywgYW5kIGFscGhhIFhNTCBFZGl0b3IgZmVh\ndHVyZS4gRml4ZWQgV2luIDEwIGluc3RhbGxhdGlvbiBhbmQgUkVTVEFSVF9E\nUklWRVIgaXNzdWVzLjwvZGVzY3JpcHRpb24+CiAgICA8L2JldGE+CiAgICAK\nICAgIDxhbHBoYT4KICAgICAgICA8bmFtZT5WaXJ0dWFsIERyaXZlciBDb250\ncm9sPC9uYW1lPgogICAgICAgIDxidWlsZD4yNS44LjE0PC9idWlsZD4KICAg\nICAgICA8bGluaz5odHRwczovL2dpdGh1Yi5jb20veW91cnVzZXJuYW1lL3lv\ndXJyZXBvL3JlbGVhc2VzL2Rvd25sb2FkL3YyNS43LjI0L1ZpcnR1YWxEcml2\nZXJDb250cm9sLTI1LjcuMjQuemlwPC9saW5rPgogICAgICAgIDxkZXNjcmlw\ndGlvbj5EZXZlbG9wbWVudCBidWlsZCB3aXRoIGV4cGVyaW1lbnRhbCBmZWF0\ndXJlcyAtIGZvciB0ZXN0aW5nIG9ubHk8L2Rlc2NyaXB0aW9uPgogICAgPC9h\nbHBoYT4KPC92ZXJzaW9ucz4K\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/version.xml?ref=master",
+    "git": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/78d5d27174c6ff0624c6928d029634911e03cfa6",
+    "html": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/version.xml"
+  }
+}

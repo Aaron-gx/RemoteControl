@@ -1,0 +1,18 @@
+{
+  "name": "uninstall.bat",
+  "path": "bin/uninstall.bat",
+  "sha": "7628c234800828c03044169d858fd4dffeed02be",
+  "size": 332,
+  "url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/uninstall.bat?ref=MOD",
+  "html_url": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/uninstall.bat",
+  "git_url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/7628c234800828c03044169d858fd4dffeed02be",
+  "download_url": "https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap/MOD/bin/uninstall.bat",
+  "type": "file",
+  "content": "QGVjaG8gb2ZmDQppZiBub3QgZXhpc3QgIiV+ZHAwUkRQV0luc3QuZXhlIiBn\nb3RvIDplcnJvcg0KIiV+ZHAwUkRQV0luc3QiIC11DQpTQ0hUQVNLUyAvREVM\nRVRFIC9UTiAiUkRQV1VwZGF0ZXIiIC9GDQpybWRpciAvUSAvUyAiQzpcUHJv\nZ3JhbSBGaWxlc1xSRFAgV3JhcHBlciINCmVjaG8uDQpnb3RvIDphbnlrZXkN\nCjplcnJvcg0KZWNobyBbLV0gSW5zdGFsbGVyIGV4ZWN1dGFibGUgbm90IGZv\ndW5kLg0KZWNobyBQbGVhc2UgZXh0cmFjdCBhbGwgZmlsZXMgZnJvbSB0aGUg\nZG93bmxvYWRlZCBwYWNrYWdlIG9yIGNoZWNrIHlvdXIgYW50aS12aXJ1cy4N\nCjphbnlrZXkNCnBhdXNlDQo=\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/uninstall.bat?ref=MOD",
+    "git": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/7628c234800828c03044169d858fd4dffeed02be",
+    "html": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/uninstall.bat"
+  }
+}

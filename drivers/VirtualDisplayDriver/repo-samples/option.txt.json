@@ -1,0 +1,18 @@
+{
+  "name": "option.txt",
+  "path": "Virtual Display Driver (HDR)/option.txt",
+  "sha": "7bc082db42db48d4231a6e7636b1dbc8e98e6af3",
+  "size": 1132,
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Virtual%20Display%20Driver%20(HDR)/option.txt?ref=master",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Virtual%20Display%20Driver%20(HDR)/option.txt",
+  "git_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/7bc082db42db48d4231a6e7636b1dbc8e98e6af3",
+  "download_url": "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Virtual%20Display%20Driver%20(HDR)/option.txt",
+  "type": "file",
+  "content": "MQo2NDAsIDQ4MCwgMzAKNjQwLCA0ODAsIDUwMAo4MDAsIDUwMDAsIDUwMAox\nMDI0LCA3NjgsIDUwMAoxMTUyLCA4NjQsIDUwMAoxMjgwLCA1MDAwLCA1MDAK\nMTI4MCwgNzIwLCA1MDAKMTI4MCwgNzY4LCA1MDAKMTI4MCwgODAwLCA1MDAK\nMTI4MCwgOTYwLCA1MDAKMTI4MCwgMTAyNCwgNTAwCjEzNjAsIDc2OCwgNTAw\nCjEzNjYsIDc2OCwgNTAwCjE0MDAsIDEwNTAsIDUwMAoxNDQwLCA5MDAsIDUw\nMAoxNjAwLCA5MDAsIDUwMAoxNjgwLCAxMDUwLCA1MDAKMTYwMCwgMTAyNCwg\nNTAwCjE5MjAsIDEwODAsIDUwMAoxOTIwLCAxMjAwLCA1MDAKMTkyMCwgMTQ0\nMCwgNTAwCjI1NjAsIDE0NDAsIDUwMAoyNTYwLCAxNjAwLCA1MDAKMjczMiwg\nMjA0OCwgNTAwCjI4ODAsIDE2MjAsIDUwMAoyODgwLCAxODAwLCA1MDAKMzAw\nOCwgMTY5MiwgNTAwCjMyMDAsIDE4MDAsIDUwMAozMjAwLCAyNDAwLCA1MDAK\nMzg0MCwgMjE2MCwgNTAwCjM4NDAsIDI0MDAsIDUwMAo0MDk2LCAyMzA0LCA1\nMDAKNDA5NiwgMjU2MCwgNTAwCjUxMjAsIDI4ODAsIDUwMAo2MDE2LCAzMzg0\nLCA1MDAKNzY4MCwgNDMyMCwgNTAwCjI1NjAsIDEwODAsIDUwMAoyODgwLCAx\nMjAwLCA1MDAKMzQ0MCwgMTQ0MCwgNTAwCjM4NDAsIDE2MDAsIDUwMAo0MzIw\nLCAxODAwLCA1MDAKNTEyMCwgMjE2MCwgNTAwCjU3NjAsIDI0MDAsIDUwMAo2\nODgwLCAyODgwLCA1MDAKNzY4MCwgMzIwMCwgNTAwCjg2NDAsIDM2MDAsIDUw\nMAoxMDI0MCwgNDMyLCA1MDAKMjg4MCwgOTAwLCA1MDAKMzg0MCwgMTA4MCwg\nNTAwCjM4NDAsIDEyMDAsIDUwMAo0MzIwLCAxMjAwLCA1MDAKNTEyMCwgMTQ0\nMCwgNTAwCjUxMjAsIDE2MDAsIDUwMAo1NzYwLCAxNjAwLCA1MDAKNTc2MCwg\nMTgwMCwgNTAwCjY0MDAsIDE4MDAsIDUwMAo2NDgwLCAxODAwLCA1MDAKNzY4\nMCwgMjE2MCwgNTAwCjc2ODAsIDI0MDAsIDUwMAo4NjQwLCAyNDAwLCA1MDAK\nMjM4OCwgMTY2OCwgNTAwCjI0MDAsIDEwODAsIDUwMAozNDU2LCAyMjM0LCA1\nMDAKODY0MCwgMzYwMCwgMzAKODY0MCwgMzYwMCwgNjAKODY0MCwgMzYwMCwg\nNzUKODY0MCwgMzYwMCwgOTAKODY0MCwgMzYwMCwgMTIwCjg2NDAsIDM2MDAs\nIDE0NAo4NjQwLCAzNjAwLCAxNjUKODY0MCwgMzYwMCwgMjQwCjg2NDAsIDM2\nMDAsIDQ4MA==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Virtual%20Display%20Driver%20(HDR)/option.txt?ref=master",
+    "git": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/7bc082db42db48d4231a6e7636b1dbc8e98e6af3",
+    "html": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Virtual%20Display%20Driver%20(HDR)/option.txt"
+  }
+}

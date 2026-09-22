@@ -1,0 +1,95 @@
+usage: .\nefconw [options] [logging]
+
+  options:
+    --install-driver           Invoke the installation of a given PNP driver
+      --inf-path               Path to the INF file to install, absolute or relative to CWD (required)
+    --uninstall-driver         Invoke the removal of a given PNP driver
+      --inf-path               Path to the INF file to uninstall, absolute or relative to CWD (required)
+    --create-device-node       Create a new ROOT enumerated virtual device
+      --hardware-id            Hardware ID of the new device (required)
+      --class-name             Device Class Name of the new device (required)
+      --class-guid             Device Class GUID of the new device (required)
+      --no-duplicates          Skip creation if a device with the same Hardware ID already exists (optional)
+    --remove-device-node       Removes a device and its driver
+      --hardware-id            Hardware ID of the device (required)
+      --class-guid             Device Class GUID of the device (required)
+    --add-class-filter         Adds a service to a device class' filter collection
+      --position               Which filter to modify (required)
+                                 Valid values include: upper|lower
+      --service-name           The driver service name to insert (required)
+      --class-guid             Device Class GUID to modify (required)
+      --attempt-restart-affected Best-effort attempt to restart present devices of this class; a reboot may still be required (optional)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+    --remove-class-filter      Removes a service to a device class' filter collection
+      --position               Which filter to modify (required)
+                                 Valid values include: upper|lower
+      --service-name           The driver service name to insert (required)
+      --class-guid             Device Class GUID to modify (required)
+      --attempt-restart-affected Best-effort attempt to restart present devices of this class; a reboot may still be required (optional)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+    --install-filter-driver    Atomically installs an INF-based filter driver and confirms it is settled
+      --inf-path               Path to the INF file to install, absolute or relative to CWD (required)
+      --class-guid             Additional Device Class GUID to restart/settle, on top of what the INF declares (optional)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+      --health-timeout         Milliseconds to wait for each declared filter service to reach SERVICE_RUNNING when a device of its class is present, default 10000 (optional)
+                                 A filter service with no present device is expected to remain stopped (demand-start); that is not reported as an error
+    --uninstall-filter-driver  Atomically removes a class filter entry and its driver service without ever leaving a dangling filter entry
+      --position               Which filter to modify (required)
+                                 Valid values include: upper|lower
+      --service-name           The driver service name to remove (required)
+      --class-guid             Device Class GUID to modify (required)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+      --stop-timeout           Milliseconds to wait for the service to stop, default 10000 (optional)
+      --retry-timeout          Milliseconds to keep retrying service deletion while the driver image is still in use, default 5000 (optional)
+      --inf-path               Path to the original INF file; if given, also purges the matching published package from the driver store, default: not purged (optional)
+      --all-versions           With --inf-path, purge every version of the matching package in the driver store instead of only the one matching its exact [Version] identity (optional)
+    --remove-driver-store-package Surgically purges one or more packages from the driver store by original INF name, without touching any device node
+      --inf-name               Comma-separated original INF base name(s) to match, e.g. "mydriver.inf" (required)
+      --class-guid             Device Class GUID the package's INF must declare, narrows matches further (optional)
+      --service-name           Filter driver service name the package's INF must register (via UpperFilters/LowerFilters), narrows matches further; does NOT match a function driver's plain AddService entry (optional)
+    --create-driver-service    Creates a new service with a kernel driver as binary
+      --bin-path               Path to the .sys file, absolute or relative to CWD (required)
+      --service-name           The driver service name to create (required)
+      --display-name           The friendly name of the service (required)
+    --remove-driver-service    Removes an existing kernel driver service
+      --service-name           The driver service name to remove (required)
+      --stop-timeout           Milliseconds to wait for the service to stop, default 10000 (optional)
+      --attempt-detach-affected Best-effort attempt to detach present devices bound to this service before removal, so its driver file can be safely replaced/deleted; a reboot may still be required (optional)
+      --restart-timeout        Milliseconds to wait per device detach attempt, default 10000 (optional)
+      --state-file             Where to persist detached devices for a later --reenumerate-affected call, default a per-service-name file under %ProgramData%\nefconc, restricted to Administrators/SYSTEM (optional)
+    --reenumerate-affected     Re-enumerates devices previously detached via --remove-driver-service --attempt-detach-affected
+      --service-name           The driver service name whose detached devices to re-enumerate (required)
+      --restart-timeout        Milliseconds to wait per devnode re-enumeration attempt, default 10000 (optional)
+      --state-file             Where to read detached devices from, default matches --remove-driver-service's default under %ProgramData%\nefconc (optional)
+    --inf-default-install      Installs an INF file with a [DefaultInstall] section
+      --inf-path               Path to the INF file to install, absolute or relative to CWD (required)
+      --attempt-restart-affected Best-effort attempt to restart devices affected by any class filter changes; a reboot may still be required (optional)
+      --class-guid             Additional Device Class GUID to restart devices for, on top of what the INF declares (optional)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+    --inf-default-uninstall    Uninstalls an INF file with a [DefaultUninstall] section
+      --inf-path               Path to the INF file to uninstall, absolute or relative to CWD (required)
+      --attempt-restart-affected Best-effort attempt to restart devices affected by any class filter changes; a reboot may still be required (optional)
+      --class-guid             Additional Device Class GUID to restart devices for, on top of what the INF declares (optional)
+      --restart-timeout        Milliseconds to wait per device restart attempt, default 10000 (optional)
+    --delete-file-on-reboot    Marks a given file to get deleted on next reboot
+      --file-path              Path of the file to remove, absolute or relative to CWD (required)
+    --find-hwid                Shows one or more devices matching a partial Hardware ID
+      --hardware-id            (Partial) Hardware ID of the device to match against (required)
+    --enable-bluetooth-service   Enables a local Bluetooth service
+      --service-name             The service name
+      --service-guid             The service GUID
+    --disable-bluetooth-service  Disables a local Bluetooth service
+      --service-name             The service name
+      --service-guid             The service GUID
+    -v, --version              Display version of this utility
+
+  logging:
+    --default-log-file=.\log.txt       Write details of execution to a log file (optional)
+    --verbose                          Turn on verbose/diagnostic logging: per-command-step detail plus intermediate neflib events (restart strategy attempts, service-deletion retries, ...) not shown otherwise (optional)
+
+  devcon:
+    install [INFFile] [HardwareID]     Creates and installs a ROOT-enumerated device and driver
+      --no-duplicates                  Skip device creation if it already exists; still updates the driver (optional)
+      --remove-duplicates              Remove extra device nodes with same Hardware ID, keeping one (optional, requires --no-duplicates)
+    remove [HardwareID]                Removes all present devices matching the given Hardware ID
+

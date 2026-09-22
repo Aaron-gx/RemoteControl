@@ -1,0 +1,60 @@
+# ===== .NET 构建产物 =====
+**/bin/
+**/obj/
+**/toolsnuget-packages/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# 发布/单文件产物
+publish/
+publish-profiling/
+
+# ===== 构建输出目录（可重建，不入库） =====
+build/
+server/
+setup-agent/
+tests/e2e-run/
+tests/e2e-verify/
+
+# ===== 逆向/临时研究目录 =====
+pyrev/
+参考/
+*.exe_extracted/
+
+# ===== 日志 =====
+*.log
+logs/
+
+# ===== 运行时/本地数据 =====
+*.tmp
+*.temp
+data/
+serverdata/
+
+# ===== 环境 / IDE =====
+.vs/
+.vscode/
+.idea/
+*.user
+
+# ===== 敏感文件（严禁入库） =====
+服务器.txt
+*password*
+*secret*
+*.key
+*.pem
+*.pfx
+
+# ===== 第三方大文件 =====
+third_party/ffmpeg/ffmpeg.exe
+
+# ===== Python 逆向环境 =====
+**/.venv/
+__pycache__/
+*.pyc
+
+# ===== Go 构建 =====
+*.exe
+!src/**/bin/*.exe

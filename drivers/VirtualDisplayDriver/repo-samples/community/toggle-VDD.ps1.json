@@ -1,0 +1,18 @@
+{
+  "name": "toggle-VDD.ps1",
+  "path": "Community Scripts/toggle-VDD.ps1",
+  "sha": "265da86ba50aa579ea01f05dfc71211d3cb6b4ad",
+  "size": 1033,
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Community%20Scripts/toggle-VDD.ps1?ref=master",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Community%20Scripts/toggle-VDD.ps1",
+  "git_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/265da86ba50aa579ea01f05dfc71211d3cb6b4ad",
+  "download_url": "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Community%20Scripts/toggle-VDD.ps1",
+  "type": "file",
+  "content": "ICMgc3VibWl0dGVkIGJ5IHpqb2FzYW4KICMgU2VsZi1lbGV2YXRlIHRoZSBz\nY3JpcHQgaWYgcmVxdWlyZWQKIGlmICgtTm90IChbU2VjdXJpdHkuUHJpbmNp\ncGFsLldpbmRvd3NQcmluY2lwYWxdIFtTZWN1cml0eS5QcmluY2lwYWwuV2lu\nZG93c0lkZW50aXR5XTo6R2V0Q3VycmVudCgpKS5Jc0luUm9sZShbU2VjdXJp\ndHkuUHJpbmNpcGFsLldpbmRvd3NCdWlsdEluUm9sZV0gJ0FkbWluaXN0cmF0\nb3InKSkgewogICAgaWYgKFtpbnRdKEdldC1DaW1JbnN0YW5jZSAtQ2xhc3Mg\nV2luMzJfT3BlcmF0aW5nU3lzdGVtIHwgU2VsZWN0LU9iamVjdCAtRXhwYW5k\nUHJvcGVydHkgQnVpbGROdW1iZXIpIC1nZSA2MDAwKSB7CiAgICAgICAgJENv\nbW1hbmRMaW5lID0gIi1GaWxlIGAiIiArICRNeUludm9jYXRpb24uTXlDb21t\nYW5kLlBhdGggKyAiYCIgIiArICRNeUludm9jYXRpb24uVW5ib3VuZEFyZ3Vt\nZW50cwogICAgICAgIFN0YXJ0LVByb2Nlc3MgLUZpbGVQYXRoIFBvd2VyU2hl\nbGwuZXhlIC1WZXJiIFJ1bmFzIC1Bcmd1bWVudExpc3QgJENvbW1hbmRMaW5l\nCiAgICAgICAgRXhpdAogICAgfQogfQoKJGRldmljZSA9ICBHZXQtUG5wRGV2\naWNlIC1DbGFzcyBEaXNwbGF5IC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRp\nbnVlIHwgV2hlcmUtT2JqZWN0IHsgJF8uRnJpZW5kbHlOYW1lIC1lcSAnSWRk\nU2FtcGxlRHJpdmVyIERldmljZSBIRFInIC1vciAkXy5GcmllbmRseU5hbWUg\nLWVxICdWaXJ0dWFsIERpc3BsYXkgRHJpdmVyJyB9CgppZiAoJGRldmljZSkg\newogICAgaWYgKCRkZXZpY2UuU3RhdHVzIC1lcSAnT0snKSB7CiAgICAgICAg\nV3JpdGUtSG9zdCAiRGlzYWJsaW5nIGRldmljZSI7ICRkZXZpY2UgfCBkaXNh\nYmxlLXBucGRldmljZSAtQ29uZmlybTokZmFsc2UKICAgIH0gZWxzZSB7CiAg\nICAgICAgV3JpdGUtSG9zdCAiRW5hYmxpbmcgZGV2aWNlIjsgJGRldmljZSB8\nIGVuYWJsZS1wbnBkZXZpY2UgLUNvbmZpcm06JGZhbHNlCiAgICB9Cn0gZWxz\nZSB7CiAgICBXcml0ZS1XYXJuaW5nICJEZXZpY2Ugbm90IGZvdW5kIgp9Cg==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Community%20Scripts/toggle-VDD.ps1?ref=master",
+    "git": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/265da86ba50aa579ea01f05dfc71211d3cb6b4ad",
+    "html": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Community%20Scripts/toggle-VDD.ps1"
+  }
+}

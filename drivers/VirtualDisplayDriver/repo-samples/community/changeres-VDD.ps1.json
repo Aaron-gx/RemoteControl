@@ -1,0 +1,18 @@
+{
+  "name": "changeres-VDD.ps1",
+  "path": "Community Scripts/changeres-VDD.ps1",
+  "sha": "2fd7e38a7191948f752d530746d04fffc39c5d60",
+  "size": 1174,
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Community%20Scripts/changeres-VDD.ps1?ref=master",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Community%20Scripts/changeres-VDD.ps1",
+  "git_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/2fd7e38a7191948f752d530746d04fffc39c5d60",
+  "download_url": "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Community%20Scripts/changeres-VDD.ps1",
+  "type": "file",
+  "content": "cGFyYW0oDQogICAgW1BhcmFtZXRlcihNYW5kYXRvcnksIFBvc2l0aW9uPTAp\nXQ0KICAgIFtBbGlhcygiWCIsIkhvcml6b250YWxSZXNvbHV0aW9uIildDQog\nICAgW2ludF0keHJlcywNCiAgICBbUGFyYW1ldGVyKE1hbmRhdG9yeSwgUG9z\naXRpb249MSldDQogICAgW0FsaWFzKCJZIiwiVmVydGljYWxSZXNvbHV0aW9u\nIildDQogICAgW2ludF0keXJlcw0KKQ0KDQojIFNlbGYtZWxldmF0ZSB0aGUg\nc2NyaXB0IGlmIHJlcXVpcmVkDQppZiAoLU5vdCAoW1NlY3VyaXR5LlByaW5j\naXBhbC5XaW5kb3dzUHJpbmNpcGFsXSBbU2VjdXJpdHkuUHJpbmNpcGFsLldp\nbmRvd3NJZGVudGl0eV06OkdldEN1cnJlbnQoKSkuSXNJblJvbGUoW1NlY3Vy\naXR5LlByaW5jaXBhbC5XaW5kb3dzQnVpbHRJblJvbGVdICdBZG1pbmlzdHJh\ndG9yJykpIHsNCiAgICBpZiAoW2ludF0oR2V0LUNpbUluc3RhbmNlIC1DbGFz\ncyBXaW4zMl9PcGVyYXRpbmdTeXN0ZW0gfCBTZWxlY3QtT2JqZWN0IC1FeHBh\nbmRQcm9wZXJ0eSBCdWlsZE51bWJlcikgLWdlIDYwMDApIHsNCiAgICAgICAg\nJENvbW1hbmRMaW5lID0gIi1GaWxlIGAiIiArICRNeUludm9jYXRpb24uTXlD\nb21tYW5kLlBhdGggKyAiYCIgIg0KICAgICAgICAkTXlJbnZvY2F0aW9uLkJv\ndW5kUGFyYW1ldGVycy5HZXRFbnVtZXJhdG9yKCkgfCBGb3JFYWNoLU9iamVj\ndCB7ICRDb21tYW5kTGluZSArPSAiLSQoJF8uS2V5KTokKCRfLlZhbHVlKSAi\nIH0NCiAgICAgICAgU3RhcnQtUHJvY2VzcyAtV29ya2luZ0RpcmVjdG9yeSAk\nUFNTY3JpcHRSb290IC1GaWxlUGF0aCBQb3dlclNoZWxsLmV4ZSAtVmVyYiBS\ndW5hcyAtQXJndW1lbnRMaXN0ICRDb21tYW5kTGluZSAgDQogICAgICAgIGV4\naXQNCiAgICB9DQp9DQoNCiMgSW5zdGFsbCBkZXBlbmRlbmNpZXMgaWYgcmVx\ndWlyZWQNCi4gIiRQU1NjcmlwdFJvb3Rcc2V0LWRlcGVuZGVuY2llcy5wczEi\nDQoNCiMgR2V0dGluZyB0aGUgY29ycmVjdCBkaXNwbGF5DQokZGlzcCA9IEdl\ndC1EaXNwbGF5SW5mbyB8IFdoZXJlLU9iamVjdCB7ICRfLkRpc3BsYXlOYW1l\nIC1lcSAiVkREIGJ5IE1UVCIgfQ0KDQojIFNldHRpbmcgdGhlIHJlc29sdXRp\nb24gb24gdGhlIGRpc3BsYXkNClNldC1EaXNwbGF5UmVzb2x1dGlvbiAtRGlz\ncGxheUlkICRkaXNwLkRpc3BsYXlJZCAtV2lkdGggJHhyZXMgLUhlaWdodCAk\neXJlcw==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Community%20Scripts/changeres-VDD.ps1?ref=master",
+    "git": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/2fd7e38a7191948f752d530746d04fffc39c5d60",
+    "html": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Community%20Scripts/changeres-VDD.ps1"
+  }
+}

@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>LicenseKeygen</AssemblyName>
+    <RootNamespace>LicenseKeygen</RootNamespace>
+    <!-- 程序图标：标题栏/任务栏/资源管理器都显示 logo -->
+    <ApplicationIcon>Assets\mima.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Agent\Agent.Common\Agent.Common.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 内置使用说明：编译进程序，「使用说明」页直接用 MarkdownRenderer 渲染它。
+         LogicalName 写死，避免中文文件名在资源名里被改写导致取不到。 -->
+    <EmbeddedResource Include="上位机使用说明.md" LogicalName="LicenseKeygen.Help.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 界面 logo：作为资源嵌入程序，避免把图片散落在目录里 -->
+    <Resource Include="Assets\mima.png" />
+    <Resource Include="Assets\mima_square.png" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <StartupObject>AgentSetup.Program</StartupObject>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>被控端安装程序</AssemblyName>
+    <RootNamespace>AgentSetup</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <LangVersion>latest</LangVersion>
+    <!-- 单文件发布（含 WPF），安装程序本身不依赖 .NET 运行时 -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- WPF + 单文件：必须把原生库一起解出来，否则启动时报 DllNotFoundException -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <ApplicationIcon />
+  </PropertyGroup>
+
+  <!-- 安装包内容（被控端程序 / 驱动 / 安装脚本 / 连接自检）打包成 zip 内嵌进 exe：
+       用户拿到的是**一个 exe**，不用再拷一堆文件。
+       打包脚本传 -p:PayloadZip=<path>；开发调试时没传则回退到"同目录 payload 文件夹"。 -->
+  <ItemGroup Condition="'$(PayloadZip)' != '' And Exists('$(PayloadZip)')">
+    <EmbeddedResource Include="$(PayloadZip)" LogicalName="payload.zip" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="app.manifest">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

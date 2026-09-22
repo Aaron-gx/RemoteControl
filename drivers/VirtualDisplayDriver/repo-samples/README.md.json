@@ -1,0 +1,18 @@
+{
+  "name": "readme.md",
+  "path": "Virtual Display Driver (HDR)/MttVDD/readme.md",
+  "sha": "e7fd0c05961016f3ca026a35a36d22b5c6c56bf4",
+  "size": 739,
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Virtual%20Display%20Driver%20(HDR)/MttVDD/readme.md?ref=master",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Virtual%20Display%20Driver%20(HDR)/MttVDD/readme.md",
+  "git_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/e7fd0c05961016f3ca026a35a36d22b5c6c56bf4",
+  "download_url": "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Virtual%20Display%20Driver%20(HDR)/MttVDD/readme.md",
+  "type": "file",
+  "content": "IyBHZXQgNSB2aXJ0dWFsIG1vbml0b3JzIGZvciB0aGUgcHJpY2Ugb2YgemVy\nbyEKCiMgU3RlcHMgKGZvciBleHBlcmllbmNlZCBwcm9zIG9ubHkhISEpCjEu\nIERvd25sb2FkIHRoZSBsYXRlc3QgcmVsZWFzZSBhcyBhIHppcCBmaWxlLgoK\nMi4gQXMgYW4gYWRtaW5pc3RyYXRvciwgUnVuIHRoZSAqLmJhdCBmaWxlIHRv\nIGFkZCB0aGUgZHJpdmVyIGNlcnRpZmljYXRlIGFzIGEgdHJ1c3RlZCByb290\nIGNlcnRpZmljYXRlLgoKMy4gRG9uJ3QgaW5zdGFsbCB0aGUgaW5mLiBPcGVu\nIGRldmljZSBtYW5hZ2VyLCBjbGljayBvbiBhbnkgZGV2aWNlLCB0aGVuIGNs\naWNrIG9uIHRoZSAiQWN0aW9uIiBtZW51IGFuZCBjbGljayAiQWRkIExlZ2Fj\neSBIYXJkd2FyZSIKCjQuIFNlbGVjdCAiQWRkIGhhcmR3YXJlIGZyb20gYSBs\naXN0IChBZHZhbmNlZCkiIGFuZCB0aGVuIHNlbGVjdCBEaXNwbGF5IGFkYXB0\nZXJzCgo1LiBDbGljayAiSGF2ZSBEaXNrLi4uIiBhbmQgY2xpY2sgdGhlICJC\ncm93c2UuLi4iIGJ1dHRvbi4gTmF2aWdhdGUgdG8gdGhlIGV4dHJhY3RlZCBm\naWxlcyBhbmQgc2VsZWN0IHRoZSBpbmYgZmlsZS4KCjYuIFlvdSBhcmUgZG9u\nZSEgR28gdG8gZGlzcGxheSBzZXR0aW5ncyB0byBjdXN0b21pemUgdGhlIHJl\nc29sdXRpb24gb2YgdGhlIGFkZGl0aW9uYWwgZGlzcGxheXMuIFRoZXNlIGRp\nc3BsYXlzIHNob3cgdXAgaW4gT2N1bHVzIGFuZCBzaG91bGQgYmUgYWJsZSB0\nbyBiZSBzdHJlYW1lZCBmcm9tLg==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/contents/Virtual%20Display%20Driver%20(HDR)/MttVDD/readme.md?ref=master",
+    "git": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/git/blobs/e7fd0c05961016f3ca026a35a36d22b5c6c56bf4",
+    "html": "https://github.com/VirtualDrivers/Virtual-Display-Driver/blob/master/Virtual%20Display%20Driver%20(HDR)/MttVDD/readme.md"
+  }
+}

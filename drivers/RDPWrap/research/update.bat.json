@@ -1,0 +1,18 @@
+{
+  "name": "update.bat",
+  "path": "bin/update.bat",
+  "sha": "cd09ea13736a9a3748a62bbd57a0eb329af041e7",
+  "size": 310,
+  "url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/update.bat?ref=MOD",
+  "html_url": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/update.bat",
+  "git_url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/cd09ea13736a9a3748a62bbd57a0eb329af041e7",
+  "download_url": "https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap/MOD/bin/update.bat",
+  "type": "file",
+  "content": "QGVjaG8gb2ZmDQppZiBub3QgZXhpc3QgIiV+ZHAwUkRQV0luc3QuZXhlIiBn\nb3RvIDplcnJvcg0KIiV+ZHAwUkRQV0luc3QiIC13DQpwaW5nIC1uIDMgbG9j\nYWxob3N0ID4gbnVsDQpjbWQuZXhlIC9DIHN0YXJ0ICIiICJDOlxQcm9ncmFt\nIEZpbGVzXFJEUCBXcmFwcGVyXFJEUF9DbkMuZXhlIg0KOmVycm9yDQplY2hv\nIFstXSBJbnN0YWxsZXIgZXhlY3V0YWJsZSBub3QgZm91bmQuDQplY2hvIFBs\nZWFzZSBleHRyYWN0IGFsbCBmaWxlcyBmcm9tIHRoZSBkb3dubG9hZGVkIHBh\nY2thZ2Ugb3IgY2hlY2sgeW91ciBhbnRpLXZpcnVzLg0KcGF1c2UNCg==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/update.bat?ref=MOD",
+    "git": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/cd09ea13736a9a3748a62bbd57a0eb329af041e7",
+    "html": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/update.bat"
+  }
+}

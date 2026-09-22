@@ -1,0 +1,28 @@
+<Window x:Class="Viewer.HelpWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="使用说明 — 远程控制" Height="780" Width="940"
+        Background="{StaticResource BgDark}" WindowStartupLocation="CenterOwner">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Markdown 渲染后的文档（之前是纯文本框，会直接显示 ## 与 | 符号） -->
+        <Border Grid.Row="0" Background="{StaticResource BgPanel}" CornerRadius="4">
+            <FlowDocumentScrollViewer x:Name="DocView" VerticalScrollBarVisibility="Auto"
+                                      Padding="16,12,8,12" IsToolBarVisible="False"
+                                      Background="Transparent" Foreground="{StaticResource FgText}"/>
+        </Border>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,0">
+            <Button x:Name="OpenDocsBtn" Content="打开文档目录" Padding="14,6"/>
+            <Button x:Name="CloseBtn" Content="关闭" Padding="14,6" Margin="8,0,0,0"/>
+            <TextBlock Text="字号" Margin="16,0,6,0" Foreground="{StaticResource FgMuted}"/>
+            <Button x:Name="FontDownBtn" Content="A-" Padding="10,6"/>
+            <Button x:Name="FontUpBtn" Content="A+" Padding="10,6" Margin="6,0,0,0"/>
+            <TextBlock x:Name="PathText" Margin="14,0,0,0" Foreground="{StaticResource FgMuted}"/>
+        </StackPanel>
+    </Grid>
+</Window>

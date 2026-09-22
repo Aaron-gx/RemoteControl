@@ -1,0 +1,15 @@
+<Application x:Class="Viewer.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             >
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- 深色主题：显式配色，不跟随 Windows 浅色/深色主题 -->
+                <!-- （旧版把颜色散在这里、只覆盖了 TextBox/ListBox 等少数控件，
+                     结果浅色模式下 ComboBox 下拉与列表出现"白底白字"） -->
+                <ResourceDictionary Source="Themes/Dark.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

@@ -1,0 +1,102 @@
+{
+  "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19",
+  "repository_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver",
+  "labels_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19/labels{/name}",
+  "comments_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19/comments",
+  "events_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19/events",
+  "html_url": "https://github.com/VirtualDrivers/Virtual-Display-Driver/issues/19",
+  "id": 2051654326,
+  "node_id": "I_kwDOKgPBcs56ScK2",
+  "number": 19,
+  "title": "Remote desktop - \\\\.\\DisplayXX",
+  "user": {
+    "login": "Death666Machine",
+    "id": 15040122,
+    "node_id": "MDQ6VXNlcjE1MDQwMTIy",
+    "avatar_url": "https://avatars.githubusercontent.com/u/15040122?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/Death666Machine",
+    "html_url": "https://github.com/Death666Machine",
+    "followers_url": "https://api.github.com/users/Death666Machine/followers",
+    "following_url": "https://api.github.com/users/Death666Machine/following{/other_user}",
+    "gists_url": "https://api.github.com/users/Death666Machine/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/Death666Machine/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/Death666Machine/subscriptions",
+    "organizations_url": "https://api.github.com/users/Death666Machine/orgs",
+    "repos_url": "https://api.github.com/users/Death666Machine/repos",
+    "events_url": "https://api.github.com/users/Death666Machine/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/Death666Machine/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "labels": [
+
+  ],
+  "state": "closed",
+  "locked": false,
+  "assignees": [
+
+  ],
+  "milestone": null,
+  "comments": 8,
+  "created_at": "2023-12-21T04:09:01Z",
+  "updated_at": "2024-01-26T01:39:17Z",
+  "closed_at": "2023-12-21T04:41:23Z",
+  "assignee": null,
+  "author_association": "NONE",
+  "issue_field_values": [
+
+  ],
+  "type": null,
+  "active_lock_reason": null,
+  "sub_issues_summary": {
+    "total": 0,
+    "completed": 0,
+    "percent_completed": 0
+  },
+  "issue_dependencies_summary": {
+    "blocked_by": 0,
+    "total_blocked_by": 0,
+    "blocking": 0,
+    "total_blocking": 0
+  },
+  "body": "Greetings, thank you for your contribution this driver is great! However with that said I am encountering an issue with my current setup.\r\n\r\nCurrently the driver assigns a random Display Number when a Virtual Display is created, the problem I am having is I would like moonlight to always default to this Virtual display so I have manually set the display within sunshine and this works great. However when I connect to my computer via remote desktop it seems as if the Virtual display is assigned  a new display number. Which unfortunately means that I have to reset the chosen display within sunshine which is unfavorable.\r\n\r\nWould it be / is it possible to hard set the display number within the driver so that when connecting via remote desktop I do not have to manually set the display to the new display number assigned?\r\n\r\nFor reference by display numerous I am referring to the \\\\.\\DisplayXX name value.",
+  "closed_by": {
+    "login": "Death666Machine",
+    "id": 15040122,
+    "node_id": "MDQ6VXNlcjE1MDQwMTIy",
+    "avatar_url": "https://avatars.githubusercontent.com/u/15040122?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/Death666Machine",
+    "html_url": "https://github.com/Death666Machine",
+    "followers_url": "https://api.github.com/users/Death666Machine/followers",
+    "following_url": "https://api.github.com/users/Death666Machine/following{/other_user}",
+    "gists_url": "https://api.github.com/users/Death666Machine/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/Death666Machine/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/Death666Machine/subscriptions",
+    "organizations_url": "https://api.github.com/users/Death666Machine/orgs",
+    "repos_url": "https://api.github.com/users/Death666Machine/repos",
+    "events_url": "https://api.github.com/users/Death666Machine/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/Death666Machine/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "timeline_url": "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/issues/19/timeline",
+  "performed_via_github_app": null,
+  "state_reason": "completed",
+  "pinned_comment": null
+}

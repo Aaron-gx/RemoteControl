@@ -1,0 +1,25 @@
+=== 后台定向注入探针（只操作本程序自己创建的窗口）===
+进程 pid=5224，DPI 模式=PerMonitorV2
+目标窗口 hwnd=0x5E0506，当前前台窗口=0x400B0C
+目标按钮中心（屏幕坐标）= (273,234)
+HitTest → hwnd=0x1305E4 class="WindowsForms10.Button.app.0.19fd5c7_r3_ad1" pid=5224
+[PASS] HitTest 命中按钮自身（期望 hwnd=0x1305E4，实得 0x1305E4）
+[PASS] 投递 WM_MOUSEMOVE/LBUTTONDOWN/LBUTTONUP（move=True down=True up=True）
+[PASS] 后台注入点击按钮（目标窗口非前台）：按钮 Click 触发 1 次（期望 1）
+[PASS] HitTest 命中文本框自身（期望 hwnd=0x510CB2，实得 0x510CB2）
+[PASS] 投递点击+WM_CHAR（down=True up=True char=True）
+[PASS] 后台注入输入字符：文本框内容 = "A"（期望含字母 A）
+==> 探针结论：后台定向注入对标准控件可用
+
+--------------------------------------------------------------------
+运行环境：Windows 11 (10.0.26100) x64，PerMonitorV2
+时间：2026-09-22
+命令：DOTNET_ROOT=E:/tools/dotnet BgInputProbe.exe
+源码：src/Tests/BgInputProbe/（自包含；投递前校验命中窗口属于本进程，不碰任何其它程序）
+
+验证到的三件事（这是"两个光标互不干扰"方案成立的前提）：
+  1. 能用屏幕坐标算准"那个位置下面是哪个窗口"（HitTest 命中按钮/文本框自身）；
+  2. 在目标窗口**不是**前台窗口的情况下，投递 WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP
+     能让按钮的 Click 事件真的触发（1 次，不多不少）；
+  3. 投递 WM_CHAR 能让非前台编辑框真的收到字符。
+全程未调用 SetCursorPos / SendInput，即：**系统光标一动不动**。

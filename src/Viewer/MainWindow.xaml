@@ -1,0 +1,113 @@
+<Window x:Class="Viewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:Viewer.Controls"
+        Title="远程控制" Height="800" Width="1280"
+        Background="{StaticResource BgDark}"
+        TextOptions.TextFormattingMode="Display"
+        WindowStartupLocation="CenterScreen">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 连接栏 -->
+        <Border Grid.Row="0" Background="{StaticResource BgPanel}" Padding="10,7">
+            <DockPanel>
+                <TextBlock x:Name="ConnInfo" DockPanel.Dock="Right" MaxWidth="420" Margin="12,0,0,0"
+                           Foreground="{StaticResource FgMuted}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal">
+                <TextBox x:Name="ServerBox" Width="210" VerticalContentAlignment="Center"/>
+                <TextBlock Text="被控端" Margin="12,0,6,0"/>
+                <ComboBox x:Name="AgentBox" Width="196" IsEditable="True" VerticalContentAlignment="Center"/>
+                <Button x:Name="RefreshBtn" Content="刷新" Margin="8,0,0,0"/>
+                <Button x:Name="ConnectBtn" Content="连接" Margin="8,0,0,0" Background="{StaticResource Accent}"/>
+                <TextBlock Text="链路" Margin="12,0,6,0"/>
+                <ComboBox x:Name="LinkModeBox" Width="176" VerticalContentAlignment="Center"
+                          ToolTip="自动：优先直连，连不上自动改用服务器&#10;仅中继：视频一律经服务器&#10;仅直连：视频只走直连，连不上就没有画面">
+                    <ComboBoxItem Content="自动（优先直连）" Tag="auto"/>
+                    <ComboBoxItem Content="仅中继（经服务器）" Tag="relay"/>
+                    <ComboBoxItem Content="仅直连（P2P）" Tag="direct"/>
+                </ComboBox>
+                <Button x:Name="HelpBtn" Content="使用说明" Margin="8,0,0,0"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- 主体 -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="250"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <DockPanel Grid.Column="0" Background="{StaticResource BgPanel}">
+                <Border DockPanel.Dock="Top" Padding="12,10,12,6">
+                    <DockPanel>
+                        <TextBlock Text="已安装软件" FontWeight="SemiBold" FontSize="13.5"/>
+                        <TextBlock x:Name="SwCount" DockPanel.Dock="Right" HorizontalAlignment="Right"
+                                   Foreground="{StaticResource FgMuted}" Text=""/>
+                    </DockPanel>
+                </Border>
+                <Border DockPanel.Dock="Bottom" Padding="10">
+                    <TextBlock Text="🔵 已打开    ⚪ 未打开    右键：打开/关闭" Foreground="{StaticResource FgMuted}" FontSize="11.5"/>
+                </Border>
+                <Grid>
+                    <ListBox x:Name="SoftwareList" ItemsSource="{Binding SoftwareList}">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="ToolTip" Value="{Binding ToolTipText}"/>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding StatusGlyph}" FontSize="11" Margin="0,0,6,0"/>
+                                    <Image Source="{Binding Icon}" Width="18" Height="18" Margin="0,0,7,0"
+                                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                                    <TextBlock Text="{Binding Name}" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                        <ListBox.ContextMenu>
+                            <ContextMenu>
+                                <MenuItem x:Name="MenuOpen" Header="▶ 打开"/>
+                                <MenuItem x:Name="MenuClose" Header="✕ 关闭(退出)"/>
+                            </ContextMenu>
+                        </ListBox.ContextMenu>
+                    </ListBox>
+                    <!-- 列表为空时顶上的一句解释（连接后才会被填充，空着容易让人以为坏了） -->
+                    <TextBlock x:Name="EmptyHint" Visibility="Collapsed" IsHitTestVisible="False"
+                               Foreground="{StaticResource FgMuted}" TextWrapping="Wrap" TextAlignment="Center"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" Margin="18,0"/>
+                </Grid>
+            </DockPanel>
+
+            <Border Grid.Column="1" Background="Black">
+                <controls:RemoteScreenControl x:Name="Screen"/>
+            </Border>
+        </Grid>
+
+        <!-- 状态栏 -->
+        <Border Grid.Row="2" Background="{StaticResource Accent}" Padding="10,5">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="StatusDot" Text="🔴"/>
+                <TextBlock x:Name="StatusText" Text="未连接" Margin="4,0,0,0"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="LatencyText" Text="延迟: --"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="ResolutionText" Text="分辨率: --"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="FpsText" Text="FPS: --"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="BitrateText" Text="码率: --"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="LinkModeText" Text="连接: 中继"/>
+                <TextBlock x:Name="HostText" Text="" Margin="12,0,0,0" Opacity="0.95" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="ClipboardHint" Margin="16,0,0,0" FontWeight="SemiBold"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

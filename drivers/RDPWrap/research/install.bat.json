@@ -1,0 +1,18 @@
+{
+  "name": "install.bat",
+  "path": "bin/install.bat",
+  "sha": "db5252f8690b22f878cf4653af8e8ab1796419d0",
+  "size": 520,
+  "url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/install.bat?ref=MOD",
+  "html_url": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/install.bat",
+  "git_url": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/db5252f8690b22f878cf4653af8e8ab1796419d0",
+  "download_url": "https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap/MOD/bin/install.bat",
+  "type": "file",
+  "content": "QGVjaG8gb2ZmDQppZiBub3QgZXhpc3QgIiV+ZHAwUkRQV0luc3QuZXhlIiBn\nb3RvIDplcnJvcg0KIiV+ZHAwUkRQV0luc3QiIC1pIC1vDQp4Y29weSAiJX5k\ncDAqIiAiQzpcUHJvZ3JhbSBGaWxlc1xSRFAgV3JhcHBlclwiICAvcyAvSSAv\neQ0KcGluZyAtbiAzIGxvY2FsaG9zdCA+IG51bA0KU0NIVEFTS1MgL0NSRUFU\nRSAvU0MgT05TVEFSVCAvREVMQVkgMDAwMjowMCAvVE4gIlJEUFdVcGRhdGVy\nIiAvVFIgIidDOlxQcm9ncmFtIEZpbGVzXFJEUCBXcmFwcGVyXFJEUFdJbnN0\nLmV4ZScgLXciIC9STCBISUdIRVNUIC9SVSBTWVNURU0gL05QDQpjbWQuZXhl\nIC9DIHN0YXJ0ICIiICJDOlxQcm9ncmFtIEZpbGVzXFJEUCBXcmFwcGVyXFJE\nUF9DbkMuZXhlIg0KZXhpdA0KOmVycm9yDQplY2hvIFstXSBJbnN0YWxsZXIg\nZXhlY3V0YWJsZSBub3QgZm91bmQuDQplY2hvIFBsZWFzZSBleHRyYWN0IGFs\nbCBmaWxlcyBmcm9tIHRoZSBkb3dubG9hZGVkIHBhY2thZ2Ugb3IgY2hlY2sg\neW91ciBhbnRpLXZpcnVzLg0KcGF1c2UNCg==\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/contents/bin/install.bat?ref=MOD",
+    "git": "https://api.github.com/repos/sebaxakerhtc/rdpwrap/git/blobs/db5252f8690b22f878cf4653af8e8ab1796419d0",
+    "html": "https://github.com/sebaxakerhtc/rdpwrap/blob/MOD/bin/install.bat"
+  }
+}

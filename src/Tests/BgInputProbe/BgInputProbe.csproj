@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    后台定向注入探针：验证"不碰系统光标、把鼠标事件直接投递给窗口"这条路对标准控件是否真的可用。
+    刻意用 Exe（控制台）而不是 WinExe，这样结果能直接打到 stdout。
+    它只操作**自己创建的窗口**，并且投递前会校验命中窗口属于本进程，绝不碰别的程序。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>BgInputProbe</AssemblyName>
+    <RootNamespace>BgInputProbe</RootNamespace>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Agent\Agent.Common\Agent.Common.csproj" />
+  </ItemGroup>
+
+</Project>
