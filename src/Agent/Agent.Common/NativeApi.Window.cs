@@ -70,6 +70,13 @@ public static partial class NativeApi
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hwnd);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hwnd);
+
+    /// <summary>窗口是否最大化（最大化状态下 SetWindowPos 的位置会被忽略，挪屏前得先还原）</summary>
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hwnd);
+
     // ---------------------------------------------------------------- 桌面 / 窗口站
 
     public const int UOI_NAME = 2;

@@ -54,6 +54,17 @@ public enum MessageType : byte
     Stop = 0x42,
     /// <summary>IPC: 文件传输入队（Worker → Coordinator，JSON FileDropInfo）</summary>
     FileDrop = 0x43,
+    /// <summary>IPC: 视频出口拥塞提示（Coordinator → Worker，JSON BitrateHintInfo）</summary>
+    IpcBitrateHint = 0x44,
+
+    /// <summary>主控端选择远端鼠标走哪条路： [1B RemoteInputMode]</summary>
+    InputModeHint = 0x60,
+    /// <summary>主控端选择"画面显示哪些屏"： [1B CaptureMode]</summary>
+    CaptureModeHint = 0x61,
+    /// <summary>主控端请求"把画面坐标 (x,y) 处的窗口搬到虚拟外屏"： [2B x][2B y]（画面坐标）</summary>
+    MoveWindowHint = 0x62,
+    /// <summary>主控端请求"把某个已运行程序的窗口搬到虚拟外屏"： [4B pid]</summary>
+    MoveAppWindowHint = 0x63,
 
     /// <summary>P2P 直连候选地址（被控端 → 主控端，JSON {port,tcp[],public}）</summary>
     DirectCandidates = 0x50,
@@ -231,6 +242,22 @@ public static class PayloadCodec
         return buf;
     }
 
+    // 0x62 搬窗口 [2B x][2B y]（画面坐标）
+    public static byte[] EncodePoint(ushort x, ushort y)
+    {
+        var buf = new byte[4];
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(0, 2), x);
+        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(2, 2), y);
+        return buf;
+    }
+
+    public static (ushort X, ushort Y) DecodePoint(byte[] p)
+    {
+        Require(p, 4, "坐标");
+        return (BinaryPrimitives.ReadUInt16BigEndian(p.AsSpan(0, 2)),
+                BinaryPrimitives.ReadUInt16BigEndian(p.AsSpan(2, 2)));
+    }
+
     public static (ushort X, ushort Y, short Delta) DecodeMouseWheel(byte[] p)
     {
         Require(p, 6, "鼠标滚轮");
@@ -372,6 +399,41 @@ public sealed class MonitorInfo
     public int Height { get; set; }
     public int Dpi { get; set; } = 96;
     public int Count { get; set; } = 1;
+
+    /// <summary>当前是否显示"全部屏幕"（false = 只显示虚拟外屏）</summary>
+    public bool AllScreens { get; set; }
+
+    /// <summary>
+    /// 被控端每块屏在当前画面里的位置（画面坐标系 = 从 Left/Top 起算）。
+    /// 主控端据此把"物理屏"那几块画成只读区域（远端只能看、点不到），
+    /// 而虚拟外屏那块才是可操作的 —— 这样既能看到主屏上的东西，又不会打扰机器前面的人。
+    /// </summary>
+    public List<ScreenRect> Screens { get; set; } = new();
+}
+
+/// <summary>画面里的一块屏</summary>
+public sealed class ScreenRect
+{
+    public int Left { get; set; }
+    public int Top { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    /// <summary>是不是虚拟外屏（可操作的那块）</summary>
+    public bool IsVirtual { get; set; }
+    /// <summary>主屏（用于画标注）</summary>
+    public bool IsPrimary { get; set; }
+    public string Device { get; set; } = "";
+}
+
+/// <summary>画面模式（主控端 → 被控端）</summary>
+public enum CaptureMode : byte
+{
+    /// <summary>只显示虚拟外屏（默认：省带宽，1080p 一块屏）</summary>
+    VirtualOnly = 0,
+    /// <summary>显示被控端全部屏幕（一块画布：主屏 + 副屏，带宽约等于屏数倍）</summary>
+    AllScreens = 1,
+    /// <summary>只显示物理主屏（看本机用户屏幕上在干什么；那块屏只读，点击窗口=把它搬到副屏）</summary>
+    PrimaryOnly = 2,
 }
 
 /// <summary>Worker 就绪（0x40，IPC）</summary>
@@ -385,6 +447,32 @@ public sealed class WorkerReadyInfo
     public string Version { get; set; } = "";
 }
 
+/// <summary>
+/// 主控端可选的"远端鼠标走哪条路"。默认用真实光标：兼容性最好（悬停/拖拽/原生右键菜单全都能用），
+/// 代价是本机用户的光标会被短暂借用（CursorArbiter 会在他一动鼠标时立刻还回去）。
+/// 后台定向注入完全不碰本机光标，但部分应用（微信这类不吃合成消息的）点了没反应 —— 实测踩到。
+/// </summary>
+public enum RemoteInputMode : byte
+{
+    /// <summary>自动：本机用户空闲 → 真实光标；他在用键鼠 → 后台定向注入（互不打扰，但兼容性看应用）</summary>
+    Auto = 0,
+    /// <summary>始终真实光标（默认，兼容性最好）</summary>
+    AlwaysRealCursor = 1,
+    /// <summary>始终后台定向注入（完全不打扰本机用户，代价是部分应用点不动）</summary>
+    AlwaysBackground = 2,
+}
+
+/// <summary>视频出口拥塞提示（IPC，协调器 → Worker）：让码率自适应知道"中继这条腿堵了"</summary>
+public sealed class BitrateHintInfo
+{
+    /// <summary>视频出口是否拥塞（队列积压或刚丢过帧）</summary>
+    public bool Congested { get; set; }
+    /// <summary>视频发送队列当前积压条数</summary>
+    public int VideoQueued { get; set; }
+    /// <summary>被挤掉的视频块数（累计，单调递增）</summary>
+    public long VideoDropped { get; set; }
+}
+
 /// <summary>Worker 状态（0x41，IPC）</summary>
 public sealed class WorkerStatusInfo
 {
@@ -393,6 +481,27 @@ public sealed class WorkerStatusInfo
     public string Backend { get; set; } = "";
     public long FramesSent { get; set; }
     public long BytesSent { get; set; }
+
+    // ---- 下面几个字段说明"为什么画面不动"：链路拥塞 / 自适应降档。
+    // 以前这些只有被控端日志里有，主控端界面上一片黑，用户只能猜是不是软件坏了。
+
+    /// <summary>当前生效的码率 kbps（自适应会降它；0 = 未知）</summary>
+    public int BitrateKbps { get; set; }
+
+    /// <summary>当前生效的帧率（自适应会降它；0 = 未知）</summary>
+    public int FrameRate { get; set; }
+
+    /// <summary>码率自适应档位（0 = 未降档）</summary>
+    public int AdaptiveLevel { get; set; }
+
+    /// <summary>因帧缓冲写不进去而丢弃的块数（被控端→中继这条链路拥塞的信号，单调递增）</summary>
+    public long RingDropped { get; set; }
+
+    /// <summary>中继发送队列当前积压的消息数（协调器填）</summary>
+    public long RelayQueued { get; set; }
+
+    /// <summary>因中继发送队列满而丢弃的消息数（协调器填，单调递增）</summary>
+    public long RelayDropped { get; set; }
 
     // ---- 以下字段由协调器补上：说明视频**实际**走了哪条路 ----
     // 主控端据此显示"直连/中继"，验收脚本据此断言 P2P 是否真的生效。
@@ -428,6 +537,32 @@ public sealed class WorkerStatusInfo
 
     /// <summary>停机原因</summary>
     public string LicenseLockReason { get; set; } = "";
+
+    // ---- 输入侧状态（主控端用来显示"远端鼠标点在哪块屏、走的哪条路"）----
+    // 现场最费时间的问题就是"看着副屏点，结果点到主屏"，而那时日志和界面都是正常的：
+    // 把这三个事实直接上报，界面上一眼可辨。
+
+    /// <summary>输入换算基准：被采集屏左上角在虚拟桌面中的坐标（远端画面 (x,y) → 桌面 (base+x, base+y)）</summary>
+    public int InputBaseX { get; set; }
+    public int InputBaseY { get; set; }
+
+    /// <summary>被采集屏是不是虚拟外屏（false = 虚拟外屏没装上/被关掉，远端只能操作物理主屏）</summary>
+    public bool CaptureIsVirtual { get; set; }
+
+    /// <summary>当前画面是不是"全部屏幕"（主屏 + 副屏 一块画布）</summary>
+    public bool AllScreens { get; set; }
+
+    /// <summary>远端鼠标当前走哪条路："real" = 真实光标，"background" = 后台定向注入</summary>
+    public string InputPath { get; set; } = "";
+
+    /// <summary>
+    /// 本机光标被别人控制住了（注入的移动到不了目标点，通常是同机还有别的远控软件/旧被控端）。
+    /// 此时被控端已自动改走后台定向注入，点击不会再落到主屏。
+    /// </summary>
+    public bool CursorContested { get; set; }
+
+    /// <summary>光标不受控时，可能是哪些程序在抢（远控/鼠标类进程名，供用户照着关掉）</summary>
+    public string CursorBlockerHint { get; set; } = "";
 
     // ---- 被控端主动上报的自身信息（主控端用来显示"这是哪台电脑"）----
 

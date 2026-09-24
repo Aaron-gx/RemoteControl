@@ -1,7 +1,11 @@
 // Read-only viewer probe: connects to the relay as a viewer, asks for the software
 // list, and reports what actually comes back. Sends no input events.
 const target = process.argv[2] || 'WIN-MEQIVMJ5283-4CD5AFD8';
-const token = process.argv[3] || '【已脱敏】';
+const token = process.argv[3];
+if (!token) {
+  console.error('usage: node scripts/_probe_viewer.js <target> <token> [host] [seconds]');
+  process.exit(2);
+}
 const host = process.argv[4] || '202.60.232.209:8080';
 const seconds = Number(process.argv[5] || 20);
 

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    下拉框冒烟测试：实际渲染主控端的深色主题，对"箭头位置"做命中测试。
+    为什么要它：XAML 的错误多半是运行期才炸（资源键写错、属性名写错、控件被盖住看不见），
+    编译期一律通过 —— 而主控端一崩用户就完全没法用。这里把主题真的加载一遍并验证：
+      · 主题资源能加载、能套到 ComboBox 上（不抛异常）；
+      · 可编辑 / 不可编辑两种下拉框，右侧箭头都"看得见且点得到"（命中测试命中的是箭头按钮）。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>ComboProbe</AssemblyName>
+    <RootNamespace>ComboProbe</RootNamespace>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 直接引用主控端：用的是它编译出来的真实 XAML/BAML -->
+    <ProjectReference Include="..\..\Viewer\Viewer.csproj" />
+  </ItemGroup>
+
+</Project>

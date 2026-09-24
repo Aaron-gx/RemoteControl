@@ -8,6 +8,12 @@ namespace Viewer.Services;
 public sealed class ViewerConfig
 {
     public string ServerUrl { get; set; } = "ws://127.0.0.1:8080/ws";
+    /// <summary>
+    /// 备用中继端点（逗号分隔，可留空）：主地址连不上时按顺序重试这些。
+    /// 留空时会自动尝试同主机的 443 / 8443（部分网络只放行 443）。
+    /// 也可以直接在界面的「服务器」输入框里填多个地址（逗号/分号分隔）。
+    /// </summary>
+    public string ServerUrlFallbacks { get; set; } = "";
     /// <summary>留空 = 由 ServerUrl 推导（http(s)://host:port）</summary>
     public string FileServerUrl { get; set; } = "";
     public string TargetAgentId { get; set; } = "";
@@ -24,12 +30,53 @@ public sealed class ViewerConfig
     /// 注意：控制/剪贴板/文件**始终走中继**（它是信令与兜底通道），这里选的是视频走哪条路。
     /// </summary>
     public string LinkMode { get; set; } = "auto";
+
+    /// <summary>
+    /// 远端鼠标走哪条路：real=始终真实光标（默认，兼容性最好）/ auto=自动 / background=始终后台注入。
+    /// 被控端在"本机用户在忙"时默认会自动改用后台定向注入（不抢他的光标），但微信这类不吃
+    /// 合成消息的应用会点不动（实测踩到），所以默认用真实光标，把选择权留给主控端。
+    /// </summary>
+    public string InputMode { get; set; } = "real";
+
+    /// <summary>
+    /// 主控端显示被控端的哪些屏幕：virtual = 只显示虚拟外屏（默认，省带宽）；
+    /// all = 全部屏幕合成一幅画面（主屏 + 副屏；物理屏那块只读）。
+    /// 被控端按这个下发 CaptureModeHint，连上时会重新告知一次。
+    /// </summary>
+    public string CaptureMode { get; set; } = "virtual";
+
+    /// <summary>
+    /// "主屏 / 全部屏幕"这两档画面里，物理屏那块是不是**只读**。
+    /// false（默认）= 直接可操作：点、拖、滚都送过去（产品负责人要求"把主屏的控制也打开"）；
+    /// true = 只读：点它只是"把那个窗口搬到副屏"（本机用户完全不受打扰，早期默认值）。
+    /// 注意：真机上如果还有人坐着用这台机器，可操作会让他看见远端光标在动 —— 所以做成开关。
+    /// </summary>
+    public bool PhysicalScreenReadOnly { get; set; } = false;
+
     [JsonPropertyName("LogLevel")]
     public string LogLevelName { get; set; } = "Info";
     public double WindowWidth { get; set; } = 1280;
     public double WindowHeight { get; set; } = 800;
 
     public static string ConfigPath => Path.Combine(AppContext.BaseDirectory, "config", "viewer.json");
+
+    /// <summary>
+    /// 配置写不进程序目录时的兜底位置（%APPDATA%\远程控制主控端\configiewer.json）。
+    /// 为什么需要：装在 C:\Program Files 时普通用户对程序目录没有写权限，配置只能写到用户目录，
+    /// 否则「服务器地址/令牌/链路偏好」这些用户改过的东西下次启动就丢了。
+    /// </summary>
+    public static string FallbackConfigPath()
+    {
+        try
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "远程控制主控端", "config", "viewer.json");
+        }
+        catch
+        {
+            return Path.Combine(Path.GetTempPath(), "远程控制主控端", "config", "viewer.json");
+        }
+    }
 
     /// <summary>
     /// 打包时预置的默认值（服务器地址 / 令牌），放在程序同目录。分发出去的主控端是
@@ -60,6 +107,7 @@ public sealed class ViewerConfig
                 var v = line[(eq + 1)..].Trim();
                 if (v.Length == 0) continue;
                 if (k == "serverurl" && (freshConfig || string.IsNullOrWhiteSpace(ServerUrl))) { ServerUrl = v; changed = true; }
+                else if (k == "serverurlfallbacks" && (freshConfig || string.IsNullOrWhiteSpace(ServerUrlFallbacks))) { ServerUrlFallbacks = v; changed = true; }
                 else if (k == "token" && (freshConfig || string.IsNullOrWhiteSpace(AgentToken))) { AgentToken = v; changed = true; }
             }
             return changed;
@@ -79,12 +127,15 @@ public sealed class ViewerConfig
     public static ViewerConfig Load()
     {
         ViewerConfig cfg;
-        var fresh = !File.Exists(ConfigPath);
+        // 程序目录里的配置优先；没有就看兜底位置（Program Files 安装时配置写在用户目录）
+        var effective = File.Exists(ConfigPath) ? ConfigPath
+            : (File.Exists(FallbackConfigPath()) ? FallbackConfigPath() : ConfigPath);
+        var fresh = !File.Exists(effective);
         if (!fresh)
         {
             try
             {
-                cfg = JsonSerializer.Deserialize<ViewerConfig>(File.ReadAllText(ConfigPath), JsonOpts) ?? new ViewerConfig();
+                cfg = JsonSerializer.Deserialize<ViewerConfig>(File.ReadAllText(effective), JsonOpts) ?? new ViewerConfig();
             }
             catch { cfg = new ViewerConfig(); fresh = true; }
         }
@@ -100,14 +151,23 @@ public sealed class ViewerConfig
         return cfg;
     }
 
+    /// <summary>配置实际落盘的位置（正常=程序目录；Program Files 安装时=用户目录）</summary>
+    public static string LastSavedPath { get; private set; } = "";
+
     public void Save()
     {
-        try
+        var json = JsonSerializer.Serialize(this, JsonOpts);
+        foreach (var path in new[] { ConfigPath, FallbackConfigPath() })
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(this, JsonOpts));
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, json);
+                LastSavedPath = path;
+                return;
+            }
+            catch { }
         }
-        catch { }
     }
 
     /// <summary>默认下载目录：优先非系统盘（用户要求不往 C 盘放东西），否则用户下载目录</summary>

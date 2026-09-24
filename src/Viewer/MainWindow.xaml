@@ -4,6 +4,7 @@
         xmlns:controls="clr-namespace:Viewer.Controls"
         Title="远程控制" Height="800" Width="1280"
         Background="{StaticResource BgDark}"
+        Icon="pack://application:,,,/Viewer;component/Assets/viewer.ico"
         TextOptions.TextFormattingMode="Display"
         WindowStartupLocation="CenterScreen">
     <Grid>
@@ -30,6 +31,20 @@
                     <ComboBoxItem Content="自动（优先直连）" Tag="auto"/>
                     <ComboBoxItem Content="仅中继（经服务器）" Tag="relay"/>
                     <ComboBoxItem Content="仅直连（P2P）" Tag="direct"/>
+                </ComboBox>
+                <TextBlock Text="鼠标" Margin="10,0,6,0"/>
+                <ComboBox x:Name="InputModeBox" Width="158" VerticalContentAlignment="Center"
+                          ToolTip="远端鼠标怎么操作被控端：&#10;真实光标（默认）＝兼容性最好，悬停/拖拽/右键菜单全原生；本机用户一动鼠标就会把光标要回去&#10;自动＝本机用户在忙时改用后台注入，完全不抢他的光标（但微信这类应用可能点不动）&#10;后台注入＝始终不碰本机光标">
+                    <ComboBoxItem Content="真实光标（兼容好）" Tag="real"/>
+                    <ComboBoxItem Content="自动（让着本机）" Tag="auto"/>
+                    <ComboBoxItem Content="后台注入" Tag="background"/>
+                </ComboBox>
+                <TextBlock Text="画面" Margin="10,0,6,0"/>
+                <ComboBox x:Name="CaptureModeBox" Width="176" VerticalContentAlignment="Center"
+                          ToolTip="主控端显示被控端的哪些屏幕：&#10;副屏（省流量）＝只显示那块虚拟外屏，1080p，弱网首选（默认）&#10;全部屏幕＝主屏+副屏合成一幅画面（能看到本机用户屏上的东西；那块屏只读，点了不会打扰他）">
+                    <ComboBoxItem Content="副屏（省流量）" Tag="virtual"/>
+                    <ComboBoxItem Content="主屏（点击窗口搬到副屏）" Tag="primary"/>
+                    <ComboBoxItem Content="全部屏幕（主屏+副屏）" Tag="all"/>
                 </ComboBox>
                 <Button x:Name="HelpBtn" Content="使用说明" Margin="8,0,0,0"/>
                 </StackPanel>
@@ -74,6 +89,7 @@
                         <ListBox.ContextMenu>
                             <ContextMenu>
                                 <MenuItem x:Name="MenuOpen" Header="▶ 打开"/>
+                                <MenuItem x:Name="MenuMove" Header="⇄ 搬到副屏（已打开的程序）"/>
                                 <MenuItem x:Name="MenuClose" Header="✕ 关闭(退出)"/>
                             </ContextMenu>
                         </ListBox.ContextMenu>
@@ -105,6 +121,9 @@
                 <TextBlock x:Name="BitrateText" Text="码率: --"/>
                 <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
                 <TextBlock x:Name="LinkModeText" Text="连接: 中继"/>
+                <TextBlock Text="│" Margin="10,0" Opacity="0.5"/>
+                <TextBlock x:Name="AgentStateText" Text="被控端: --" MaxWidth="270"
+                           TextTrimming="CharacterEllipsis" ToolTipService.ShowDuration="60000"/>
                 <TextBlock x:Name="HostText" Text="" Margin="12,0,0,0" Opacity="0.95" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="ClipboardHint" Margin="16,0,0,0" FontWeight="SemiBold"/>
             </StackPanel>

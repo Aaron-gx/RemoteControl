@@ -17,17 +17,20 @@ CRLF = chr(13) + chr(10)
 
 import paramiko
 
-HOST = "202.60.232.209"
-USER = "root"
-PORT = 22
+HOST = os.environ.get("HK_HOST", "202.60.232.209")   # 换一台服务器：set HK_HOST=新IP
+USER = os.environ.get("HK_USER", "root")
+PORT = int(os.environ.get("HK_PORT", "22"))
 PASS_FILE = r"E:\tools\hk-pass.txt"
 KEY_FILE = r"E:\tools\hk_ed25519"
 
 
 def password():
+    env = os.environ.get("HK_PASS", "")          # 多台服务器时用 HK_PASS 指密码
+    if env:
+        return env
     if os.path.exists(PASS_FILE):
         return io.open(PASS_FILE, encoding="utf-8").read().strip()
-    return os.environ.get("HK_PASS", "")
+    return ""
 
 
 def _proxy_sock():

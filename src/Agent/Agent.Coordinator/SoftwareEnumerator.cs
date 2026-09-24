@@ -89,13 +89,24 @@ public sealed class SoftwareEnumerator
         }
 
         // 运行状态
-        var running = GetRunningProcessPaths();
+        // 先按完整路径匹配；对不上再按**可执行文件名**兜一层。
+        // 为什么要兜：注册表里记的往往是启动器路径（例如微信记的是 Weixin.exe，
+        // 实际跑起来可能是版本子目录里的那个，或者进程名与安装路径不一致）——
+        // 结果就是"用户明明开着微信，列表里却显示没打开"（现场反馈）。
+        var (byPath, byName) = GetRunningProcesses();
         foreach (var sw in dict.Values)
         {
-            if (running.TryGetValue(sw.ExePath, out int pid))
+            if (byPath.TryGetValue(sw.ExePath, out int pid))
             {
                 sw.IsRunning = true;
                 sw.Pid = pid;
+                continue;
+            }
+            var file = Path.GetFileName(sw.ExePath);
+            if (!string.IsNullOrEmpty(file) && byName.TryGetValue(file, out int pid2))
+            {
+                sw.IsRunning = true;
+                sw.Pid = pid2;
             }
         }
 
@@ -202,6 +213,51 @@ public sealed class SoftwareEnumerator
             finally { p.Dispose(); }
         }
         return map;
+    }
+
+    /// <summary>
+    /// 当前运行中的进程：返回 (按完整路径 → pid, 按可执行文件名 → pid) 两张表。
+    /// 有第二张是因为注册表里记的常是启动器路径，与实际运行的进程路径对不上
+    /// （现场：微信明明开着，列表里却显示"未打开"）。
+    /// </summary>
+    /// <summary>给"实时状态监测"用的轻量入口：只枚举进程，不做注册表/图标那套慢活儿</summary>
+    public static (Dictionary<string, int> ByPath, Dictionary<string, int> ByName) GetRunningStates()
+        => GetRunningProcesses();
+
+    private static (Dictionary<string, int> ByPath, Dictionary<string, int> ByName) GetRunningProcesses()
+    {
+        var byPath = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var byName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in Process.GetProcesses())
+        {
+            try
+            {
+                string name = p.ProcessName;
+                if (!string.IsNullOrEmpty(name) && !byName.ContainsKey(name))
+                    byName[name] = p.Id;
+
+                var path = p.MainModule?.FileName;
+                if (!string.IsNullOrEmpty(path))
+                {
+                    if (!byPath.ContainsKey(path)) byPath[path] = p.Id;
+                    var file = Path.GetFileName(path);
+                    if (!string.IsNullOrEmpty(file) && !byName.ContainsKey(file))
+                        byName[file] = p.Id;
+                }
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or NotSupportedException)
+            {
+                // 受保护进程读不到路径，但进程名通常还能拿到
+                try
+                {
+                    var name = p.ProcessName;
+                    if (!string.IsNullOrEmpty(name) && !byName.ContainsKey(name)) byName[name] = p.Id;
+                }
+                catch { }
+            }
+            finally { p.Dispose(); }
+        }
+        return (byPath, byName);
     }
 
     public string? GetIconBase64(string exePath)

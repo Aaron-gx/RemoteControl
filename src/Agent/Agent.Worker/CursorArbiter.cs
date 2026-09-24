@@ -56,6 +56,8 @@ public sealed class CursorArbiter : IDisposable
     private long _snapBacks;
     private int _errors;
     private bool _disposed;
+    /// <summary>会话级互斥体：保证一个会话只有一个仲裁器在装钩子（防止两份被控端互相抢光标）</summary>
+    private Mutex? _sessionMutex;
 
     public long LastPhysicalInputTick => Interlocked.Read(ref _lastPhysicalTick);
     public long SnapBackCount => Interlocked.Read(ref _snapBacks);
@@ -66,10 +68,40 @@ public sealed class CursorArbiter : IDisposable
     /// <summary>本机用户在最近 ms 毫秒内动过鼠标或键盘吗</summary>
     public bool LocalActiveWithin(long ms) => Environment.TickCount64 - LastPhysicalInputTick < ms;
 
+    /// <summary>钩子是否已装上（= 正在仲裁光标）</summary>
+    public bool Armed { get; private set; }
+    /// <summary>是不是因为"机器上还有同类远控在跑"才停用的（那种情况下由 <see cref="TryArm"/> 重新启用）</summary>
+    public bool DisarmedByRival { get; private set; }
+
     public CursorArbiter(DisplayInfo virtualMonitor, Logger log)
     {
         _log = log;
         RefreshDisplays(virtualMonitor);
+        TryArm();
+    }
+
+    /// <summary>
+    /// 装上钩子开始仲裁。拿不到会话互斥体（同一会话已经有另一份被控端在管光标）就不装。
+    /// </summary>
+    public bool TryArm()
+    {
+        if (Armed) return true;
+
+        // 同一个会话里**只允许一个仲裁器装钩子**。
+        // 为什么：机器上装了两份被控端时，两份都会装 WH_MOUSE_LL —— 另一份会把远端注入的
+        // 光标当成"本机用户物理输入"抢回去，现场表现就是"在副屏点击、主屏的鼠标也跟着点、
+        // 拖不动"（实测踩到）。拿不到这把锁就干脆不装钩子，只留一份在管。
+        _sessionMutex = new Mutex(false, @"Global\RemoteControlCursorArbiter-" + SessionId());
+        bool mine;
+        try { mine = _sessionMutex.WaitOne(0, false); }
+        catch (AbandonedMutexException) { mine = true; }
+        if (!mine)
+        {
+            _log.Warn("本会话已有另一个被控端在管光标（光标仲裁不重复启用）——请检查是不是装了两份被控端");
+            try { _sessionMutex.Dispose(); } catch { }
+            _sessionMutex = null;
+            return false;
+        }
 
         if (NativeApi.GetCursorPos(out var p)) { _seenX = _physX = p.X; _seenY = _physY = p.Y; }
         if (IsOnVirtual(_physX, _physY))
@@ -85,14 +117,44 @@ public sealed class CursorArbiter : IDisposable
         if (_mouseHook == IntPtr.Zero)
         {
             _log.Warn($"光标仲裁未启用：安装 WH_MOUSE_LL 钩子失败（Win32={NativeApi.LastWin32Error()}）");
-            return;
+            try { _sessionMutex?.ReleaseMutex(); } catch { }
+            try { _sessionMutex?.Dispose(); } catch { }
+            _sessionMutex = null;
+            return false;
         }
         _kbProc = KeyboardProc;
         _kbHook = NativeApi.SetWindowsHookExKb(NativeApi.WH_KEYBOARD_LL, _kbProc, hmod, 0);
+        Armed = true;
+        DisarmedByRival = false;
         Current = this;
         _log.Info($"光标仲裁已启用：外屏=({_virtLeft},{_virtTop})-({_virtRight},{_virtBottom})，" +
                   $"本机物理屏并集=({_physLeft},{_physTop})-({_physRight},{_physBottom})，" +
                   $"回车起点=({_physX},{_physY})");
+        return true;
+    }
+
+    /// <summary>
+    /// 停用仲裁：卸掉钩子、放掉互斥体，**退出对系统光标的争夺**。
+    ///
+    /// 【为什么必须有这一条】机器上还跑着别的远控软件（UU远程 / ToDesk / 向日葵 …）时，
+    /// 两家各装一个全局鼠标钩子会互相把对方的光标和点击抢走：它把光标挪到外屏，我们的钩子
+    /// 判定成"本机用户在动鼠标"，把光标抢回物理屏并把事件重放到物理屏 —— 结果是
+    /// **它在外屏点不动、我们也点不动**，两边都用不了（实测踩到）。
+    /// 这时正确做法不是继续抢，而是不再仲裁：与它共用同一套系统光标，像单机一样用。
+    /// </summary>
+    public void Disarm(string reason, bool byRival = false)
+    {
+        DisarmedByRival = byRival;
+        if (!Armed) return;
+        Armed = false;
+        try { if (_mouseHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_mouseHook); } catch { }
+        try { if (_kbHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_kbHook); } catch { }
+        _mouseHook = _kbHook = IntPtr.Zero;
+        try { _sessionMutex?.ReleaseMutex(); } catch { }
+        try { _sessionMutex?.Dispose(); } catch { }
+        _sessionMutex = null;
+        if (Current == this) Current = null;
+        _log.Warn($"光标仲裁已停用：{reason}");
     }
 
     /// <summary>显示器拓扑变化（外屏重建/换分辨率）后重新取矩形</summary>
@@ -131,6 +193,13 @@ public sealed class CursorArbiter : IDisposable
     private bool IsOnVirtual(int x, int y)
         => x >= _virtLeft && x < _virtRight && y >= _virtTop && y < _virtBottom;
 
+    /// <summary>当前进程所在会话号（互斥体按会话区分：不同会话的钩子互不影响）</summary>
+    private static int SessionId()
+    {
+        try { return System.Diagnostics.Process.GetCurrentProcess().SessionId; }
+        catch { return 0; }
+    }
+
     private int ClampX(int x) => Math.Clamp(x, _physLeft, Math.Max(_physLeft, _physRight - 1));
     private int ClampY(int y) => Math.Clamp(y, _physTop, Math.Max(_physTop, _physBottom - 1));
 
@@ -138,7 +207,7 @@ public sealed class CursorArbiter : IDisposable
 
     private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode < 0 || _disposed) return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        if (nCode < 0 || _disposed || !Armed) return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         try
         {
             var ms = Marshal.PtrToStructure<NativeApi.MSLLHOOKSTRUCT>(lParam);
@@ -186,7 +255,7 @@ public sealed class CursorArbiter : IDisposable
     /// <summary>键盘钩子只用来判断"本机用户是不是正在用键盘"，从不拦截任何按键</summary>
     private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && !_disposed)
+        if (nCode >= 0 && !_disposed && Armed)
         {
             try
             {
@@ -239,6 +308,9 @@ public sealed class CursorArbiter : IDisposable
     {
         _disposed = true;
         if (Current == this) Current = null;
+        try { _sessionMutex?.ReleaseMutex(); } catch { }
+        try { _sessionMutex?.Dispose(); } catch { }
+        _sessionMutex = null;
         try { if (_mouseHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_mouseHook); } catch { }
         try { if (_kbHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_kbHook); } catch { }
         _mouseHook = _kbHook = IntPtr.Zero;

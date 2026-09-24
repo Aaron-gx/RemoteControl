@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    触摸指针注入探针：验证"不移动系统光标，也能在指定坐标产生一次真正的点击"。
+    如果成立，远端点击就可以完全不碰那只唯一的系统光标 —— 本机物理鼠标、别的远控软件
+    各自用自己的鼠标，谁也不用抢（见 docs 里的双光标说明）。
+    只对自己创建的窗口注入，不碰桌面上的其它程序。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>TouchProbe</AssemblyName>
+    <RootNamespace>TouchProbe</RootNamespace>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>

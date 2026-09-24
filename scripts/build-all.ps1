@@ -125,9 +125,11 @@ if (Test-Path $ff) {
     foreach ($target in @("agent", "viewer")) {
         $d = Join-Path $build "$target\third_party\ffmpeg"
         New-Item -ItemType Directory -Force -Path $d | Out-Null
-        Copy-Item $ff $d -Force
+        # 正在运行的主控端会把这里的 ffmpeg.exe 占住（它是解码子进程）——
+        # 被占用时保留原文件继续构建，不要让整包因此失败（实测踩到）。
+        try { Copy-Item $ff $d -Force; Write-Host "  $target\ffmpeg 已拷贝" }
+        catch { Write-Host "  警告：$target 的 ffmpeg.exe 被占用（主控端/被控端正在运行？），保留原文件" -ForegroundColor Yellow }
     }
-    Write-Host "ffmpeg 已拷贝"
 } else {
     Write-Host "警告：未找到 $ff，运行时需要自行提供 ffmpeg.exe" -ForegroundColor Yellow
 }

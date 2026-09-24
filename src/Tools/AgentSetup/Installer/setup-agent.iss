@@ -56,7 +56,7 @@ DisableProgramGroupPage=yes
 DisableWelcomePage=no
 OutputDir={#RepoRoot}\build\setup-agent
 OutputBaseFilename={#AppShortName}-安装程序
-SetupIconFile={#RepoRoot}\src\Tools\AgentSetup\Assets\app.ico
+SetupIconFile={#RepoRoot}\src\Assets\agent.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName}
 Compression=lzma2/max
@@ -81,7 +81,9 @@ cn.RelayPageTitle=连接设置
 cn.RelayPageDesc=这些设置会写进被控端配置；不确定就保持默认。
 cn.RelayServerLabel=中继服务器地址（IP:端口）
 cn.TokenLabel=连接口令
-cn.TokenDefault=默认（本机首次安装时自动生成）
+cn.TokenDefault=留空则只能在「未启用鉴权」的中继上使用
+cn.TokenEmptyWarn=连接口令为空。%n%n如果中继服务器启用了鉴权（服务端配置了 RC_TOKEN），被控端会一直显示「未连接服务器」，主控端列表里也看不到这台机器。%n%n口令必须与服务端的 RC_TOKEN 完全一致。%n%n确实要继续（例如内网测试、中继未启用鉴权）吗？
+cn.TokenEmptyAbort=请返回上一步把「连接口令」填好再安装
 cn.TaskGroupDesc=选择要一起启用的功能；默认项适合绝大多数机器。
 ; 曾经这里还有一个「独立会话模式」勾选项（新建 RemoteWorker 用户 + RDP 回环会话）。
 ; 那个模式与本产品的形态相冲突：它是**另一个账户、另一份 profile**，微信/浏览器/文件都跟
@@ -105,11 +107,18 @@ Name: "novdd"; Description: "{cm:TaskNoVdd}"; GroupDescription: "{cm:TaskGroupDe
 
 [Files]
 ; 被控端程序 / ffmpeg / 驱动（构建脚本先把 ffmpeg 与驱动补齐到 build\agent）
-Source: "{#RepoRoot}\build\agent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}\build\agent\*"; DestDir: "{app}"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs
 ; 安装/卸载脚本放在 app\installer 下：安装时与卸载时都要用（三个脚本必须在一起）
 Source: "{#RepoRoot}\scripts\install-agent.ps1";     DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\create-remote-user.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\uninstall-agent.ps1";   DestDir: "{app}\installer"; Flags: ignoreversion
+
+[Dirs]
+; 程序自己要在这些目录里写日志/配置，而 Program Files 默认只有管理员可写 ——
+; 不显式授权的话，普通用户运行时会写不进去（实测：装到 C:\Program Files 后一启动就弹
+; "Access to the path ...\logs is denied"）。users-modify = 所有用户可修改。
+Name: "{app}\config"; Permissions: users-modify
+Name: "{app}\logs";   Permissions: users-modify
 
 [Icons]
 Name: "{group}\卸载 {#AppShortName}"; Filename: "{uninstallexe}"
@@ -147,6 +156,35 @@ begin
   begin
     ImportedToken := GetIniString('relay', 'token', ImportedToken, Ini);
   end;
+end;
+
+{ ---- 装之前先停掉正在运行的被控端 ----
+  为什么必须在**拷文件之前**做：正在运行的 Agent.Coordinator.exe / Agent.Worker.exe /
+  Agent.Common.dll 是锁住的，Inno 盖不掉 —— 升级后新旧文件混在一起跑，
+  表现就是"行为诡异、鼠标点不到、副屏点击跑到主屏去"（实测踩到）。
+  CloseApplications=no 意味着 Inno 不会替我们做这件事，所以这里显式来一遍。 }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  NeedsRestart := False;
+  Exec('taskkill.exe', '/f /im Agent.Coordinator.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/f /im Agent.Worker.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(900);   { 给系统一点时间释放文件句柄 }
+
+  { 口令为空 = 中继启用鉴权时必然连不上。以前这里什么都不说、安装脚本还随机生成一个令牌，
+    结果是被控端装完一直「不在线」，界面上又没有任何线索（实测踩到）。
+    静默安装（/VERYSILENT）时没有向导，不能弹框，只在日志里留痕。 }
+  if (not WizardSilent) and (Trim(RelayPage.Values[1]) = '') then
+  begin
+    if MsgBox(ExpandConstant('{cm:TokenEmptyWarn}'), mbConfirmation, MB_YESNO) = IDNO then
+    begin
+      Result := ExpandConstant('{cm:TokenEmptyAbort}');
+      Exit;
+    end;
+  end;
+
+  Result := '';
 end;
 
 { ---- 向导页：连接设置 ---- }
@@ -212,4 +250,20 @@ begin
   Result := True;
   if (CurPageID = RelayPage.ID) and (Trim(RelayPage.Values[0]) = '') then
     RelayPage.Values[0] := '{#RelayServer}';
+
+  { 勾了"跳过虚拟外屏"是个代价很大的选择：远程就只能看到并操作本机主屏，
+    本机用户还会看见远端光标在动。实测有客户手滑勾了，表现就是"副屏点了没反应、
+    点击跑到主屏"。这里加一道确认。 }
+  if (CurPageID = wpSelectTasks) and WizardIsTaskSelected('novdd') then
+  begin
+    if MsgBox('你勾选了「跳过虚拟外屏」。' + #13#10 + #13#10 +
+              '那将不再安装/管理远程专用的那块扩展屏，远程只能看到并操作本机主屏，' + #13#10 +
+              '而且本机用户会看见远端的光标在动。' + #13#10 + #13#10 +
+              '确实要这样吗？（推荐选「否」，保持勾选为空）',
+              mbConfirmation, MB_YESNO) = IDNO then
+    begin
+      Result := False;   { 拦下这一页，让用户把勾去掉 }
+      Exit;
+    end;
+  end;
 end;

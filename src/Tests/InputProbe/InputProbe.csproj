@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    输入注入探针：验证"远端点击到底落在哪块屏"。
+    直接引用被控端真实的 InputInjector / MouseRouter / CursorArbiter，走的就是线上那条代码路径，
+    所以结论对现场有效。它只点**自己创建的窗口**（点前会用 WindowFromPoint 校验命中窗口属于本进程，
+    不在自己窗口上就跳过），不碰桌面上别的程序。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>InputProbe</AssemblyName>
+    <RootNamespace>InputProbe</RootNamespace>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Agent\Agent.Common\Agent.Common.csproj" />
+    <!-- 引用真实的被控端实现（WinExe 也是普通程序集，可以直接引用） -->
+    <ProjectReference Include="..\..\Agent\Agent.Worker\Agent.Worker.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -35,6 +35,9 @@ public sealed class FfmpegEncoder : IDisposable
     /// <summary>当前编码器认的输入尺寸（必须是构造时传进来的那个，改不了）</summary>
     public int Width => _width;
     public int Height => _height;
+    /// <summary>当前编码器用的码率/帧率（自适应会换档，换档时整个重建）</summary>
+    public int BitrateKbps => _kbps;
+    public int FrameRate => _fps;
 
     public FfmpegEncoder(string ffmpegPath, string configuredEncoder, int width, int height, int fps, int kbps, Logger log)
     {
@@ -216,9 +219,11 @@ public sealed class FfmpegEncoder : IDisposable
                 sb.Append("-profile:v baseline ");
                 break;
         }
-        int gop = Math.Max(1, _fps * 2);
+        // GOP 收到 1 秒：一是主控端刚接入/刚重置时能很快等到关键帧，二是丢块之后
+        // 最多 1 秒就能靠下一个关键帧自愈（慢链路上 GOP 太长会让画面一直起不来）。
+        int gop = Math.Max(1, _fps);
         sb.Append($"-b:v {_kbps}k -maxrate {_kbps}k -bufsize {_kbps * 2}k ");
-        sb.Append($"-g {gop} -keyint_min {_fps} -sc_threshold 0 -pix_fmt yuv420p -bf 0 ");
+        sb.Append($"-g {gop} -keyint_min {gop} -sc_threshold 0 -pix_fmt yuv420p -bf 0 ");
         sb.Append("-flush_packets 1 -f h264 pipe:1");
         return sb.ToString();
     }

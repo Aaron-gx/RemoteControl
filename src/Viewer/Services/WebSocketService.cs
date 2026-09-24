@@ -24,13 +24,17 @@ public sealed class WebSocketService : IDisposable
     private ClientWebSocket? _ws;
     private CancellationTokenSource? _cts;
     private Task? _runTask;
-    private string _url = "";
+    private List<string> _candidates = new();
+    private int _candidateIndex;
+    private string? _lastGood;
     private string _target = "";
 
     public event Action? Connected;
     public event Action<string>? Disconnected;
     public event Action<ProtocolMessage>? MessageReceived;
     public event Action<long>? LatencyMeasured;
+    /// <summary>上一次"丢弃异常延迟值"的告警时间（限流，别刷屏）</summary>
+    private long _lastBadLatencyLog;
     public event Action<string>? StatusText;
 
     /// <summary>服务器授权状态变化（客户端本地验签后的结论）</summary>
@@ -44,14 +48,49 @@ public sealed class WebSocketService : IDisposable
 
     public WebSocketService(Logger log) => _log = log;
 
-    public void Start(string serverUrl, string targetAgentId)
+    public void Start(string serverUrl, string targetAgentId, string fallbacks = "")
     {
         Stop();
-        _url = serverUrl.Trim();
         _target = targetAgentId.Trim();
+        _candidates = BuildCandidates(serverUrl, fallbacks);
+        _candidateIndex = 0;
+        _lastGood = null;
+        if (_candidates.Count > 1)
+            _log.Info($"中继端点候选（按顺序尝试）：{string.Join(" → ", _candidates)}");
         _cts = new CancellationTokenSource();
         _runTask = Task.Run(() => RunAsync(_cts.Token));
         _ = Task.Run(SendPumpAsync);
+    }
+
+    /// <summary>
+    /// 把"服务器地址 + 备用端点"整理成候选列表。规则与被控端一致：
+    /// 主地址 → 配置里的备用端点（逗号分隔）→ 同主机的 443 / 8443。
+    /// 主地址里写多个（逗号/分号分隔）也认，方便直接在界面输入框里填两台中继。
+    /// 这样一台中继挂了/被限速，主控端会自动换下一台，不用人去改配置。
+    /// </summary>
+    private static List<string> BuildCandidates(string primary, string fallbacks)
+    {
+        var list = new List<string>();
+        void Add(string? u)
+        {
+            if (string.IsNullOrWhiteSpace(u)) return;
+            u = u.Trim();
+            if (!u.StartsWith("ws")) u = "ws://" + u;
+            if (!u.EndsWith("/ws")) u = u.TrimEnd('/') + "/ws";
+            if (!list.Contains(u, StringComparer.OrdinalIgnoreCase)) list.Add(u);
+        }
+
+        foreach (var part in (primary ?? "").Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)) Add(part);
+        foreach (var part in (fallbacks ?? "").Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)) Add(part);
+        if (list.Count == 0) Add("ws://127.0.0.1:8080/ws");
+        try
+        {
+            var u = new Uri(list[0]);
+            if (u.Port != 443) Add($"ws://{u.Host}:443/ws");
+            if (u.Port != 8443) Add($"ws://{u.Host}:8443/ws");
+        }
+        catch { }
+        return list;
     }
 
     public void Stop()
@@ -65,11 +104,11 @@ public sealed class WebSocketService : IDisposable
     /// <summary>中继要求的共享令牌（空 = 不鉴权）</summary>
     public string Token { get; set; } = "";
 
-    private string BuildUrl()
+    private string BuildUrl(string baseUrl)
     {
-        var sep = _url.Contains('?') ? '&' : '?';
+        var sep = baseUrl.Contains('?') ? '&' : '?';
         var token = string.IsNullOrEmpty(Token) ? "" : $"&token={Uri.EscapeDataString(Token)}";
-        return $"{_url}{sep}role=viewer&target={Uri.EscapeDataString(_target)}{token}";
+        return $"{baseUrl}{sep}role=viewer&target={Uri.EscapeDataString(_target)}{token}";
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -80,13 +119,20 @@ public sealed class WebSocketService : IDisposable
             string? closeInfo = null;
             try
             {
+                // 优先复用上次连成功的端点；否则按候选顺序来
+                var baseUrl = _lastGood ?? _candidates[Math.Min(_candidateIndex, _candidates.Count - 1)];
                 _ws = new ClientWebSocket();
-                _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+                // 关掉 WebSocket 自带的保活：它的 pong 宽限默认跟着 KeepAliveInterval，
+                // 弱网下往返十几秒就足以让它判定超时、把连接自己掐掉（实测心跳往返 19.8 秒，
+                // 日志里一分钟断了 5 次，用户看到的就是"连服务器也不行"）。
+                // 改成靠应用层心跳 + 下面的"长时间收不到任何东西才重连"看门狗。
+                _ws.Options.KeepAliveInterval = Timeout.InfiniteTimeSpan;
                 _ws.Options.SetBuffer(512 * 1024, 512 * 1024);
                 StatusText?.Invoke("连接中…");
-                await _ws.ConnectAsync(new Uri(BuildUrl()), ct);
+                await _ws.ConnectAsync(new Uri(BuildUrl(baseUrl)), ct);
                 attempt = 0;
-                _log.Info($"已连接中继 {BuildUrl()}");
+                _lastGood = baseUrl;                 // 这个端点好用，下次优先它
+                _log.Info($"已连接中继 {BuildUrl(baseUrl)}");
                 StatusText?.Invoke("已连接");
                 Connected?.Invoke();
                 // 心跳必须跟着"这一条会话"结束：ReceiveLoop 返回（服务器关连接/出错）之后如果还
@@ -113,6 +159,15 @@ public sealed class WebSocketService : IDisposable
             }
 
             if (ct.IsCancellationRequested) break;
+
+            // 这条端点没连上/中途断了 → 换下一个候选（多台中继时自动切换，不用人管）
+            if (closeInfo != null && _candidates.Count > 1)
+            {
+                _lastGood = null;
+                _candidateIndex = (_candidateIndex + 1) % _candidates.Count;
+                _log.Info($"中继端点切换：下一个 {_candidates[_candidateIndex]}");
+            }
+
             attempt++;
             int delay = Math.Min(20, (int)Math.Pow(2, Math.Min(4, attempt)));
             StatusText?.Invoke($"{delay}s 后重连…");
@@ -121,6 +176,9 @@ public sealed class WebSocketService : IDisposable
         _log.Info("WebSocket 服务已停止");
         StatusText?.Invoke("已断开");
     }
+
+    /// <summary>最近一次收到任何入站消息的时刻（看门狗用；WS 自带保活已关闭）</summary>
+    private long _lastInboundTick = Environment.TickCount64;
 
     private async Task HeartbeatLoopAsync(CancellationToken ct)
     {
@@ -131,6 +189,17 @@ public sealed class WebSocketService : IDisposable
                 await Task.Delay(1000, ct);
                 Queue(new ProtocolMessage(MessageType.Heartbeat,
                     PayloadCodec.EncodeHeartbeat(Environment.TickCount64)));
+                // 看门狗：整整 60 秒一条入站消息都没有（心跳回声都没有）才认为链路死了。
+                // 阈值给得这么宽是因为弱网下心跳往返动辄十几二十秒；WS 自带的保活已经被关掉，
+                // 否则那种链路会被"保活超时"误杀。
+                long silence = Environment.TickCount64 - Interlocked.Read(ref _lastInboundTick);
+                if (silence > 60_000)
+                {
+                    _log.Warn($"已 {silence / 1000} 秒没收到服务器任何消息，判定链路已死，强制重连");
+                    Interlocked.Exchange(ref _lastInboundTick, Environment.TickCount64);
+                    try { _ws?.Abort(); } catch { }
+                    return;
+                }
             }
             catch (OperationCanceledException) { return; }
             catch { }
@@ -157,6 +226,7 @@ public sealed class WebSocketService : IDisposable
                 if (acc.Length > ProtocolMessage.MaxPayload)
                     throw new ProtocolException("接收消息过大");
             } while (!result.EndOfMessage);
+            Interlocked.Exchange(ref _lastInboundTick, Environment.TickCount64);
 
             if (result.MessageType == WebSocketMessageType.Text)
             {
@@ -185,7 +255,26 @@ public sealed class WebSocketService : IDisposable
             {
                 long ts = PayloadCodec.DecodeHeartbeat(msg.Payload);
                 if (ts != 0)
-                    LatencyMeasured?.Invoke(Environment.TickCount64 - ts);
+                {
+                    long rtt = Environment.TickCount64 - ts;
+                    // 只认"合理范围"的延迟。为什么：这个值来自心跳回声，一旦回声里带的是**别的时钟**
+                    // （例如对端/中继用自己的 TickCount 发来的心跳），算出来就是天文数字 ——
+                    // 现场出现过「延迟: 98715937ms」(约 27 小时)，在状态栏反复跳，看着像软件坏了，
+                    // 其实只是这个数没做校验。超过 10 秒一律当噪声丢掉（不影响任何功能，只影响显示）。
+                    if (rtt is >= 0 and <= 10_000)
+                    {
+                        LatencyMeasured?.Invoke(rtt);
+                    }
+                    else
+                    {
+                        long now = Environment.TickCount64;
+                        if (now - _lastBadLatencyLog > 30_000)
+                        {
+                            _lastBadLatencyLog = now;
+                            _log.Warn($"忽略一个异常延迟值 {rtt}ms（心跳回声带的不是本机时钟），仅影响显示");
+                        }
+                    }
+                }
                 continue;
             }
             if (msg.Type == MessageType.DirectCandidates)

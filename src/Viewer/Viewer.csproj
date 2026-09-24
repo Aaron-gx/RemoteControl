@@ -12,10 +12,14 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- exe 的文件图标 = 主控端图标（任务栏/资源管理器/安装程序都用它） -->
+    <ApplicationIcon>..\Assets\viewer.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Agent\Agent.Common\Agent.Common.csproj" />
+    <!-- 窗口图标：WPF 的 Window.Icon 需要资源形式的 ico（与 exe 图标同一份文件） -->
+    <Resource Include="..\Assets\viewer.ico" Link="Assets\viewer.ico" />
   </ItemGroup>
 
 </Project>

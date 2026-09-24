@@ -252,7 +252,7 @@ cserver.exe -addr :8080 -data E:\RemoteControl\serverdata -token <32位令牌>
 ```powershell
 # —— 被控端 ——
 # 启动（已在运行则静默退出，避免双实例）
-Start-Process 'E:\RemoteControlgent\Agent.Coordinator.exe' -WorkingDirectory 'E:\RemoteControlgent'
+Start-Process 'E:\RemoteControl\agent\Agent.Coordinator.exe' -WorkingDirectory 'E:\RemoteControl\agent'
 # 停止：托盘图标右键 → 退出（会结束 Worker 并注销 RDP 会话）
 Get-Process Agent.Coordinator,Agent.Worker,ffmpeg | Stop-Process -Force   # 强制停止（下次登录/手动启动恢复）
 Get-ScheduledTask RemoteControlAgent | Disable-ScheduledTask              # 关闭开机自启
@@ -265,9 +265,9 @@ Invoke-WebRequest http://127.0.0.1:8080/healthz      # ok
 Invoke-WebRequest http://127.0.0.1:8080/api/agents   # 在线被控端
 
 # —— 日志 ——
-#   E:\RemoteControlgent\logs\coordinator-YYYYMMDD.log   被控端主进程（会话/看护/中继/诊断）
-#   E:\RemoteControlgent\logs\worker-YYYYMMDD.log        采集/编码/注入/剪贴板
-#   E:\RemoteControliewer\logsiewer-YYYYMMDD.log       主控端
+#   E:\RemoteControl\agent\logs\coordinator-YYYYMMDD.log   被控端主进程（会话/看护/中继/诊断）
+#   E:\RemoteControl\agent\logs\worker-YYYYMMDD.log        采集/编码/注入/剪贴板
+#   E:\RemoteControl\viewer\logs\viewer-YYYYMMDD.log       主控端
 ```
 
 **常见问题**
@@ -279,7 +279,7 @@ Invoke-WebRequest http://127.0.0.1:8080/api/agents   # 在线被控端
 | 远程键鼠无反应 | 确认 mstsc 未被最小化（最小化会让会话失去显示表面）。协调器每 20s 自动纠正为"隐藏但未最小化" |
 | RDPWrap 失效（3389 未监听） | 系统更新换了 termsrv.dll → 用新版 `rdpwrap.ini` 覆盖 `C:\Program Files\RDP Wrapper
 dpwrap.ini`，然后 `Restart-Service TermService` |
-| 想彻底卸载 | `scripts\create-remote-user.ps1` 反向操作 + `RDPW_Uninstaller.exe` + `nefconw.exe remove "Root\MttVDD"`；注册表备份在 `E:\RemoteControlackup\` |
+| 想彻底卸载 | `scripts\create-remote-user.ps1` 反向操作 + `RDPW_Uninstaller.exe` + `nefconw.exe remove "Root\MttVDD"`；注册表备份在 `E:\RemoteControl\backup\` |
 
 ---
 
@@ -290,6 +290,6 @@ dpwrap.ini`，然后 `Restart-Service TermService` |
 powershell -ExecutionPolicy Bypass -File RemoteControl\scripts\deploy-quick.ps1
 
 # 端到端验收（26 项，证据写入 E:\RemoteControl\e2e）
-E:\RemoteControl\..uild	ests\E2E.exe --server ws://127.0.0.1:8080/ws --dir E:\RemoteControl\e2e `
-    --ffmpeg <repo>	hird_partyfmpegfmpeg.exe --scenario all
+E:\RemoteControl\build\tests\E2E.exe --server ws://127.0.0.1:8080/ws --dir E:\RemoteControl\e2e `
+    --ffmpeg <repo>\third_party\ffmpeg\ffmpeg.exe --scenario all
 ```

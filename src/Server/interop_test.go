@@ -33,7 +33,9 @@ func TestInteropSignWithVendorKey(t *testing.T) {
 	now := time.Now()
 	code := mustSign(t, priv, LicensePayload{
 		Lic: "INTEROP-1", Sub: "跨语言互操作", Srv: "DEP-INTEROP",
-		Nbf: now.Add(-time.Minute).Unix(), Exp: now.Add(24 * time.Hour).Unix(),
+		// 到期时间给足：这条样本只用来验证"Go 签的码 C# 能不能验过"，跟到期日无关；
+		// 以前给 24 小时，结果这个夹具每天过期一次，第二天开始 C# 侧单测必红（实测踩到）。
+		Nbf: now.Add(-time.Minute).Unix(), Exp: now.AddDate(10, 0, 0).Unix(),
 	})
 	// 用内置公钥自验一次（Go 侧闭环）
 	if _, err := VerifyLicense(code, "DEP-INTEROP", "", now); err != nil {

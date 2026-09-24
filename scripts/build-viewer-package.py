@@ -53,7 +53,9 @@ def read_defaults():
 
 
 def main():
-    out = os.path.join(ROOT, 'build', 'viewer')
+    # 刻意发到独立的暂存目录再打包：build\viewer 常常正被"正在运行的主控端"占用
+    # （Viewer.dll 被锁），直接发布到那里会整个失败。打包只关心 zip 内容，用暂存目录更稳。
+    out = os.path.join(ROOT, 'build', 'viewer-staging')
     args = sys.argv[1:]
     if '--out' in args:
         out = args[args.index('--out') + 1]
@@ -70,9 +72,51 @@ def main():
 
     print('2) 写入 viewer-defaults.txt …')
     os.makedirs(out, exist_ok=True)
+    # 客户文档（Viewer 的「使用说明」窗口读的就是它）：从仓库 docs 直接拷，
+    # 不依赖 build-all 是否跑过（暂存目录里不会有 build\viewer\docs）。
+    try:
+        ddir = os.path.join(out, 'docs')
+        os.makedirs(ddir, exist_ok=True)
+        src_doc = os.path.join(ROOT, 'docs', '使用说明.md')
+        if os.path.exists(src_doc):
+            import shutil
+            shutil.copy2(src_doc, os.path.join(ddir, '使用说明.md'))
+            print('   已放入 docs\\使用说明.md')
+    except Exception as e:
+        print(f'   （拷贝使用说明失败：{e}）')
+
+    # ffmpeg：主控端靠它解码，**必须在包里**。
+    # 以前它是 build-all 拷进 build\viewer 的；从暂存目录打包时不会自动带上 —— 
+    # 漏掉它包就少 87MB，客户那边表现是"连上了但没画面"（实测差点发出去）。
+    try:
+        import shutil
+        src_ff = os.path.join(ROOT, 'third_party', 'ffmpeg', 'ffmpeg.exe')
+        if not os.path.exists(src_ff):
+            raise SystemExit(f'找不到 {src_ff}（主控端解码必需），先补齐再打包')
+        fdir = os.path.join(out, 'third_party', 'ffmpeg')
+        os.makedirs(fdir, exist_ok=True)
+        shutil.copy2(src_ff, os.path.join(fdir, 'ffmpeg.exe'))
+        print(f'   已放入 third_party\\ffmpeg\\ffmpeg.exe（{os.path.getsize(src_ff) // 1048576} MB）')
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f'拷贝 ffmpeg 失败：{e}')
+
     with io.open(os.path.join(out, 'viewer-defaults.txt'), 'w', encoding='utf-8') as f:
         f.write('# 主控端预置值（打包时写入）。config\\viewer.json 里为空的项会用这里的值补齐。\n')
         f.write(f'ServerUrl={server}\n')
+        # 备用中继端点（多台服务器时一并预置；一台坏了主控端会自动换下一台）
+        try:
+            for p in (r'E:\RemoteControl\viewer\config\viewer.json',
+                      r'E:\RemoteControl\agent\config\agent.json'):
+                if not os.path.exists(p):
+                    continue
+                fb = (json.load(io.open(p, encoding='utf-8-sig')).get('ServerUrlFallbacks') or '').strip()
+                if fb:
+                    f.write(f'ServerUrlFallbacks={fb}\n')
+                    break
+        except Exception:
+            pass
         f.write(f'Token={token}\n')
 
     print('3) 打 zip 便于分发 …')

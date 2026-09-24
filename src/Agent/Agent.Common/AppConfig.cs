@@ -79,6 +79,13 @@ public sealed class AgentConfig
     /// 窗口能从物理屏拖过来。默认开启（关掉就退化成"远程看物理主屏"）。
     /// </summary>
     public bool EnableVirtualDisplay { get; set; } = true;
+
+    /// <summary>
+    /// 默认给主控端看多少屏：false = 只看虚拟外屏（默认，1080p 一块屏、省带宽）；
+    /// true = 被控端所有屏幕合成一块画布（主屏 + 副屏）。主控端界面上可以随时切，
+    /// 这里只是"连上时先按哪档来"。
+    /// </summary>
+    public bool CaptureAllScreens { get; set; } = false;
     public int VirtualDisplayCount { get; set; } = 1;
     public int VirtualDisplayWidth { get; set; } = 1920;
     public int VirtualDisplayHeight { get; set; } = 1080;
@@ -186,12 +193,39 @@ public sealed class AgentConfig
         File.WriteAllText(path, JsonSerializer.Serialize(this, JsonOpts));
     }
 
+    /// <summary>
+    /// 生成 AgentId。
+    /// 后缀必须是**可复现**的！以前用随机 GUID：一旦配置写不进去（安装目录只读、被从临时目录
+    /// 启动、机器上有多份被控端各写各的），每次重启都会换一个新 AgentId —— 主控端下拉里选中的
+    /// 那台就永远"不在线"，现场表现就是"连不上服务器"（实测：两小时内同一台机器换了三个 ID）。
+    /// 现在用"机器名 + 系统 MachineGuid"哈希：同一台机器永远得到同一个 ID，重装也稳定。
+    /// </summary>
     public static string GenerateAgentId()
     {
         var name = Environment.MachineName;
         var safe = new string(name.Where(char.IsLetterOrDigit).ToArray());
         if (safe.Length == 0) safe = "AGENT";
-        return $"{safe.ToUpperInvariant()}-{Guid.NewGuid().ToString("N")[..8].ToUpperInvariant()}";
+        try
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(name + "|" + MachineGuid()));
+            return $"{safe.ToUpperInvariant()}-{Convert.ToHexString(hash, 0, 4)}";
+        }
+        catch
+        {
+            return $"{safe.ToUpperInvariant()}-{Guid.NewGuid().ToString("N")[..8].ToUpperInvariant()}";
+        }
+    }
+
+    /// <summary>系统 MachineGuid（同一台机器稳定不变，读取不需要管理员权限）</summary>
+    private static string MachineGuid()
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography");
+            return k?.GetValue("MachineGuid")?.ToString() ?? "";
+        }
+        catch { return ""; }
     }
 
     public static readonly JsonSerializerOptions JsonOpts = new()

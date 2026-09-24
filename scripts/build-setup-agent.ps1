@@ -22,7 +22,7 @@
 param(
     [string]$RepoRoot = "",
     [string]$ToolsRoot = "E:\tools",
-    [string]$RelayServer = "202.60.232.209:8080",
+    [string]$RelayServer = "156.225.30.231:18080",
     [string]$Token = "",            # 预置中继令牌（会写进 setup-defaults.ini）
     [switch]$SkipAgentBuild,        # 跳过 dotnet publish（用现有 build\agent）
     [switch]$AlsoLegacyExe          # 额外产出自制版单文件安装器（老脚本分发用，+210MB）
@@ -98,14 +98,18 @@ if (-not (Test-Path -LiteralPath $iscc)) {
 }
 $iss = Join-Path $RepoRoot "src\Tools\AgentSetup\Installer\setup-agent.iss"
 $isccArgs = @("/DRelayServer=$RelayServer", "/DRepoRoot=$RepoRoot")
+# 口令**内嵌**进安装程序：客户通常只拷这一个 exe 到被控机（不带同目录的 setup-defaults.ini），
+# 不内嵌的话向导里口令是空的 → 服务器启用鉴权时装完永远「不在线」（实测踩到）。
 if ($Token) { $isccArgs += "/DDefaultToken=$Token" }
 & $iscc @isccArgs $iss
 if ($LASTEXITCODE -ne 0) { throw "Inno 编译失败（退出码 $LASTEXITCODE）" }
+if ($Token) { Write-Host "   已把连接口令内嵌进安装程序（前 6 位 $($Token.Substring(0,6))…）：单独拷这一个 exe 也带着口令" -ForegroundColor Green }
+else { Write-Host "   ⚠ 本次没有内嵌连接口令（未传 -Token）：向导里口令会为空，服务器启用鉴权时装完连不上" -ForegroundColor Yellow }
 
 $setupExe = Join-Path $out "远程控制被控端-安装程序.exe"
 if (-not (Test-Path -LiteralPath $setupExe)) { throw "没有产出 $setupExe" }
 
-# 可选：预置令牌（只给客户"开箱即用"，不带则向导里填/自动生成）
+# 同目录再放一份 setup-defaults.ini（向导会读它覆盖内嵌值；运维改口令时不必重编安装包）
 $defaults = Join-Path $out "setup-defaults.ini"
 if ($Token) {
     Set-Content -LiteralPath $defaults -Encoding UTF8 -Value @(

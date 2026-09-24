@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 
 namespace Agent.Common;
@@ -6,6 +7,11 @@ public enum LogLevel { Debug, Info, Warn, Error }
 
 /// <summary>
 /// 极简线程安全文件日志： &lt;BaseDir&gt;\logs\&lt;name&gt;-yyyyMMdd.log
+///
+/// 【写不出去不能影响运行】日志目录**一定**要容错：程序装在 Program Files 时，普通用户对
+/// 程序目录没有写权限（只有管理员有）；如果这里抛异常，程序就会一启动就崩、或者弹一个
+/// "Access to the path ...\logs is denied" 的框（实测踩到，客户装到 C:\Program Files 就中招）。
+/// 所以顺序是：程序目录 → %LOCALAPPDATA%\远程控制\logs → 只写控制台（不落盘，程序照常跑）。
 /// </summary>
 public sealed class Logger : IDisposable
 {
@@ -33,6 +39,8 @@ public sealed class Logger : IDisposable
     public static Logger? Current { get; private set; }
 
     public string Path => _path;
+    /// <summary>日志没能写进程序目录时的实际位置（供界面提示；正常时为空）</summary>
+    public string? FallbackPath { get; private set; }
 
     public Logger(string name, string? baseDir = null, LogLevel minLevel = LogLevel.Debug, bool echoConsole = true)
     {
@@ -40,28 +48,72 @@ public sealed class Logger : IDisposable
         _minLevel = minLevel;
         _echoConsole = echoConsole;
         baseDir ??= AppContext.BaseDirectory;
-        var dir = System.IO.Path.Combine(baseDir, "logs");
-        Directory.CreateDirectory(dir);
-        _path = System.IO.Path.Combine(dir, $"{name}-{DateTime.Now:yyyyMMdd}.log");
+
+        var preferred = System.IO.Path.Combine(baseDir, "logs", $"{name}-{DateTime.Now:yyyyMMdd}.log");
+        _path = preferred;
+        _path = TryOpen(baseDir, name, preferred, out var sink);
+        _sink = sink;
+        Current = this;
+
+        if (sink != null && !string.Equals(_path, preferred, StringComparison.OrdinalIgnoreCase))
+        {
+            FallbackPath = _path;
+            Write(LogLevel.Info, $"程序目录不可写（{preferred}），日志改写到：{_path}");
+        }
+    }
+
+    /// <summary>
+    /// 依次尝试"程序目录 → %LOCALAPPDATA%\远程控制"建日志文件，返回实际用到的路径；
+    /// 全部失败返回首选项路径（此时不落盘、只写控制台）。
+    /// </summary>
+    private static string TryOpen(string baseDir, string name, string preferred, out Sink? sink)
+    {
+        sink = null;
+        foreach (var dir in CandidateDirs(baseDir))
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(dir);
+                var path = System.IO.Path.Combine(dir, $"{name}-{DateTime.Now:yyyyMMdd}.log");
+                lock (Sinks)
+                {
+                    if (!Sinks.TryGetValue(path, out var s))
+                    {
+                        var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                        s = new Sink { Writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = true } };
+                        Sinks[path] = s;
+                    }
+                    s.Refs++;
+                    sink = s;
+                }
+                return path;
+            }
+            catch
+            {
+                sink = null;   // 换下一个候选目录
+            }
+        }
+        return preferred;
+    }
+
+    /// <summary>日志目录候选：程序目录优先（绿色版/便携版就在自己旁边），不可写时退到用户目录</summary>
+    private static IEnumerable<string> CandidateDirs(string baseDir)
+    {
+        var programLogs = System.IO.Path.Combine(baseDir, "logs");
+        yield return programLogs;
+
+        string user;
         try
         {
-            lock (Sinks)
-            {
-                if (!Sinks.TryGetValue(_path, out var sink))
-                {
-                    var fs = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-                    sink = new Sink { Writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = true } };
-                    Sinks[_path] = sink;
-                }
-                sink.Refs++;
-                _sink = sink;
-            }
+            user = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "远程控制", "logs");
         }
         catch
         {
-            _sink = null;
+            user = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "远程控制", "logs");
         }
-        Current = this;
+        if (!string.Equals(user, programLogs, StringComparison.OrdinalIgnoreCase))
+            yield return user;
     }
 
     public void Debug(string msg) => Write(LogLevel.Debug, msg);

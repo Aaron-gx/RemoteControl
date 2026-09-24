@@ -27,12 +27,20 @@ public sealed class DirectLinkClient : IDisposable
     public long BytesReceived { get; private set; }
     public string CandidatesTried { get; private set; } = "";
 
+    // 连续失败次数 + 退避截止时刻（环境 TickCount64，毫秒）
+    private int _consecutiveFailures;
+    private long _nextAttemptTick;
+
+    /// <summary>现在是否可以再去尝试直连（连不上时的退避期里返回 false）</summary>
+    public bool CanAttemptNow => Environment.TickCount64 >= Interlocked.Read(ref _nextAttemptTick);
+
     public DirectLinkClient(Logger log) => _log = log;
 
     /// <summary>并行尝试候选；成功后事件通知。返回是否已连上</summary>
     public async Task<bool> TryConnectAsync(IEnumerable<string> candidates, string agentId, string token,
         TimeSpan timeout, CancellationToken outer = default)
     {
+        if (!CanAttemptNow) return false;      // 退避期内：不试、不写日志（见下面退避的注释）
         Stop();
         var list = candidates.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct().ToList();
         CandidatesTried = string.Join(", ", list);
@@ -95,6 +103,8 @@ public sealed class DirectLinkClient : IDisposable
             client.NoDelay = true;
             ActiveEndpoint = ep;
             IsConnected = true;
+            _consecutiveFailures = 0;
+            Interlocked.Exchange(ref _nextAttemptTick, 0);
             _readThread = new Thread(ReadLoop) { IsBackground = true, Name = "direct-read" };
             _readThread.Start();
             _log.Info($"P2P 直连成功：{ep}（视频走直连，控制仍走中继）");
@@ -102,7 +112,18 @@ public sealed class DirectLinkClient : IDisposable
             return true;
         }
 
-        _log.Info($"P2P 直连不可用（尝试了 {CandidatesTried}），继续使用中继");
+        // 连不上就退避：候选地址常常是内网 IP / 没做端口映射的公网地址，跨网络时**永远**连不上；
+        // 而被控端会周期性推送候选、每次都重试一遍，日志里于是刷出一串"P2P 直连不可用"，
+        // 看起来像"软件一直卡在 P2P"（现场反馈）。所以连续失败 3 次后改成 1 分钟起、最多 5 分钟试一次。
+        _consecutiveFailures++;
+        int backoffSec = _consecutiveFailures < 3
+            ? 0
+            : Math.Min(300, 60 * (1 << Math.Min(3, _consecutiveFailures - 3)));
+        if (backoffSec > 0)
+            Interlocked.Exchange(ref _nextAttemptTick, Environment.TickCount64 + backoffSec * 1000L);
+        if (_consecutiveFailures == 1 || backoffSec > 0)
+            _log.Info($"P2P 直连不可用（尝试了 {CandidatesTried}），继续使用中继（视频走服务器）" +
+                      (backoffSec > 0 ? $"；{backoffSec}s 内不再重试" : ""));
         return false;
     }
 

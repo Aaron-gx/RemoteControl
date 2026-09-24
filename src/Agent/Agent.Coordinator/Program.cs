@@ -77,6 +77,8 @@ public sealed class CoordinatorApp : IDisposable
     private int _workerPid = -1;
     /// <summary>经中继发出的视频块数（直连生效后应停止增长；上报给主控端用于显示与验收）</summary>
     private long _relayVideoChunks;
+    /// <summary>上一份状态里"被挤掉的视频块数"，用来判断这一秒有没有真丢</summary>
+    private long _lastVideoDropped;
     /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
     private int _viewerCount;
     /// <summary>上次拉起 Worker 的时间：防止"看护 + 掉线重试"同时拉起两个 Worker 打架（会 0 帧）</summary>
@@ -90,6 +92,8 @@ public sealed class CoordinatorApp : IDisposable
     private DateTime _lastSessionOkUtc = DateTime.MinValue;
     private DateTime _lastInputWarn = DateTime.MinValue;
     private readonly object _workerLock = new();
+    /// <summary>单实例互斥体（持有到进程退出；两个被控端同时跑会各装一个全局鼠标钩子互相打架）</summary>
+    private Mutex? _singleInstance;
 
     public CoordinatorApp(string[] args)
     {
@@ -100,6 +104,22 @@ public sealed class CoordinatorApp : IDisposable
 
         _log = new Logger("coordinator", minLevel: _cfg.MinLogLevel, echoConsole: false);
         _log.Info("========== Agent Coordinator 启动 ==========");
+
+        // 单实例保护：同一台机器只允许一个被控端在跑。
+        // 为什么必须有：两个实例会各装一个全局鼠标钩子（光标仲裁）、各自注入输入 ——
+        // 实测症状就是"在副屏点击，主屏的鼠标也跟着点、按钮点不到、拖不动"，
+        // 而且互相抢窗口与共享帧环，极难排查（升级时装到了另一个目录就会有这种局面）。
+        // 用 Global 前缀覆盖所有会话；WaitOne(0) 拿不到说明已有活着的实例。
+        _singleInstance = new Mutex(false, @"Global\RemoteControlCoordinator");
+        bool firstInstance;
+        try { firstInstance = _singleInstance.WaitOne(0, false); }
+        catch (AbandonedMutexException) { firstInstance = true; }   // 上一个实例异常退出，我们接管
+        if (!firstInstance)
+        {
+            _log.Warn("已有被控端在运行，本次启动退出（单实例保护）。请先从托盘退出旧实例，再启动这个。");
+            Console.Error.WriteLine("已有被控端在运行，本次启动退出（单实例保护）。");
+            Environment.Exit(0);
+        }
         _log.Info($"版本 1.0.0 / AgentId={_cfg.AgentId} / 进程会话={SessionLauncher.CurrentSessionId} / 管理员={SessionLauncher.IsElevated}");
         _log.Info($"配置：UseRdpSession={_cfg.UseRdpSession} EnableVirtualDisplay={_cfg.EnableVirtualDisplay} " +
                   $"Server={_cfg.ServerUrl} WorkerUser={_cfg.WorkerUser} FPS={_cfg.FrameRate} 编码器={_cfg.Encoder}");
@@ -123,7 +143,7 @@ public sealed class CoordinatorApp : IDisposable
         _direct = new DirectLinkServer(_cfg, _log);
         _license = new LicenseGate(Path.Combine(AppContext.BaseDirectory, "config", "license.cache.json"), _log);
         // 直连握手先过授权闸门：授权不可用时不允许任何人通过 P2P 接进来
-        _direct.LicenseCheck = () => _license.IsUsable;
+        _direct.LicenseCheck = () => _license.IsUsable && _cfg.DirectLinkEnabled;
     }
 
 
@@ -175,7 +195,15 @@ public sealed class CoordinatorApp : IDisposable
         // 设置包含 SACL（完整性标签）的安全描述符需要该特权，否则 CreateFileMapping/CreateEvent 会失败
         SessionLauncher.EnablePrivilege("SeSecurityPrivilege", _log);
 
-        _tray = new TrayIcon(_log, $"远程控制 Agent\n{_cfg.AgentId}");
+        _tray = new TrayIcon(_log, $"远程控制 Agent\n{_cfg.AgentId}", new TrayHooks
+        {
+            DirectStatusText = DirectStatusText,
+            DirectEnabled = () => _cfg.DirectLinkEnabled,
+            SetDirectEnabled = SetDirectEnabled,
+            DirectAddressText = () => string.IsNullOrEmpty(_cfg.DirectLinkPublicAddress)
+                ? (_direct.PublicAddress ?? "") : _cfg.DirectLinkPublicAddress,
+            SetDirectPublicAddress = SetDirectPublicAddress,
+        });
         _tray.ExitRequested += () => Shutdown();
 
         EnsureBootAutostart();
@@ -210,6 +238,7 @@ public sealed class CoordinatorApp : IDisposable
         _license.LockedOut += LockDown;
         _license.Tick();
         StartLicenseWatch();
+        _ = Task.Run(() => WatchSoftwareStatesAsync(_cts.Token));   // 软件运行状态实时监测（3 秒一轮）
         _relay.InboundTraffic += OnViewerTraffic;
         _relay.Start();
 
@@ -419,7 +448,7 @@ public sealed class CoordinatorApp : IDisposable
     {
         _ = Task.Run(async () =>
         {
-            long lastFrames = 0, lastQueued = 0, lastDropped = 0;
+            long lastFrames = 0, lastQueued = 0, lastDropped = 0, lastVideoDropped = 0;
             while (!_cts.IsCancellationRequested)
             {
                 try { await Task.Delay(5000, _cts.Token); } catch { return; }
@@ -427,12 +456,20 @@ public sealed class CoordinatorApp : IDisposable
                 {
                     long f = _ipc.FramesForwarded;
                     long q = _relay.QueuedCount, d = _relay.DroppedCount;
+                    long vd = _relay.VideoDropped;
                     double fill = _ipc.Ring?.FillRatio ?? 0;
-                    _log.Info($"[诊断] 转发帧 {f - lastFrames}/5s  发送积压={_relay.PendingSends} " +
-                              $"本周期入队={q - lastQueued} 丢弃={d - lastDropped}  环形水位={fill * 100:F1}%  " +
+                    _log.Info($"[诊断] 转发帧 {f - lastFrames}/5s  发送积压={_relay.PendingSends}（视频 {_relay.VideoPending}）" +
+                              $"本周期入队={q - lastQueued} 控制丢弃={d - lastDropped} 视频挤掉={vd - lastVideoDropped}  " +
+                              $"环形水位={fill * 100:F1}%  " +
                               $"主控端={(HasViewer ? "在线" : "无")}  " +
                               $"直连={(_direct.HasViewer ? $"已建立({_direct.ViewerEndpoint}, {_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB)" : (_direct.UpnpMapped ? "待接入(UPnP已映射)" : "未建立"))}");
-                    lastFrames = f; lastQueued = q; lastDropped = d;
+                    lastFrames = f; lastQueued = q; lastDropped = d; lastVideoDropped = vd;
+                    // 托盘悬停也能看到服务器与直连状态（右键菜单里还有更详细的）。
+                    // 连不上时把**原因**写出来：口令不对和网络不通在用户那里表现完全一样，
+                    // 不写清楚就只能靠猜（现场踩过：装完一直不在线）。
+                    _tray?.SetTooltip(_relay.IsConnected
+                        ? $"服务器√ 直连(可选)：{DirectStatusText()}"
+                        : $"服务器× {_relay.LastFailure}（会自动重试）\n直连(可选)：{DirectStatusText()}");
                 }
                 catch (Exception ex) { _log.Debug($"诊断异常：{ex.Message}"); }
             }
@@ -445,6 +482,13 @@ public sealed class CoordinatorApp : IDisposable
     {
         try
         {
+            // 连接口令为空是"装完一直不在线"最常见的原因（安装时没填、或中继启用了鉴权而口令不对）——
+            // 这种事必须在启动日志里说清楚，否则现场只能看到"被控端在运行但列表里没有它"
+            if (string.IsNullOrWhiteSpace(_cfg.AgentToken))
+                _log.Warn("本机没有配置连接口令（agent.json 的 AgentToken 为空）：中继服务器若启用了鉴权，" +
+                          "本机会一直显示「未连接服务器」、主控端列表里也看不到本机。\n" +
+                          "  改法：重新运行安装程序并在「连接设置」里填入口令，或改 agent.json 的 AgentToken 与服务端 RC_TOKEN 一致后重启被控端。");
+
             // 1. RDP 服务/防火墙
             if (_cfg.UseRdpSession)
             {
@@ -654,7 +698,10 @@ public sealed class CoordinatorApp : IDisposable
     private void OnRelayDisconnected(string reason)
     {
         _log.Info($"中继连接断开：{reason}");
-        _tray?.SetTooltip($"远程控制 Agent（{_cfg.AgentId}）\n未连接服务器（会自动重试）");
+        // 断开原因写进托盘：口令不对时用户重装填一次口令就能解决，网络问题只能等 ——
+        // 这两件事在界面上本来完全一样，都是"不在线"
+        var why = _relay.AuthRejected ? "口令不一致或未填（见日志）" : "网络/服务器不可用";
+        _tray?.SetTooltip($"远程控制 Agent（{_cfg.AgentId}）\n未连接服务器（{why}，会自动重试）\n直连(可选)：{DirectStatusText()}");
     }
 
     /// <summary>主控端刚接入：推送显示器信息 + 软件列表，并让 Worker 重建码流（保证从关键帧开始）</summary>
@@ -697,9 +744,17 @@ public sealed class CoordinatorApp : IDisposable
             case MessageType.OpenSoftware:
             case MessageType.CloseSoftware:
             case MessageType.StreamReset:
+            case MessageType.InputModeHint:
+            case MessageType.CaptureModeHint:
+            case MessageType.MoveWindowHint:
+            case MessageType.MoveAppWindowHint:
             case MessageType.Disconnect:
                 if (_ipc.IsWorkerConnected)
                 {
+                    if (msg.Type == MessageType.InputModeHint && msg.Payload.Length > 0)
+                        _log.Info($"主控端选择鼠标模式：{(RemoteInputMode)msg.Payload[0]}");
+                    if (msg.Type == MessageType.CaptureModeHint && msg.Payload.Length > 0)
+                        _log.Info($"主控端选择画面范围：{(CaptureMode)msg.Payload[0]}");
                     _ipc.Send(msg);
                 }
                 else if (msg.Type is MessageType.OpenSoftware or MessageType.CloseSoftware)
@@ -774,13 +829,13 @@ public sealed class CoordinatorApp : IDisposable
                 if (_monitor != null)
                 {
                     _log.Info($"远程显示器：{_monitor.Width}x{_monitor.Height} @({_monitor.Left},{_monitor.Top}) count={_monitor.Count}");
-                    _relay.Queue(msg);
+                    SendToViewer(msg);
                 }
                 break;
             }
             case MessageType.ClipboardText:
                 _log.Debug($"剪贴板文本（{msg.Payload.Length} 字节）→ 主控端");
-                _relay.Queue(msg);
+                SendToViewer(msg);
                 break;
 
             case MessageType.ClipboardFile:
@@ -795,7 +850,7 @@ public sealed class CoordinatorApp : IDisposable
                 // Worker 重建了码流 → 1) 丢弃共享内存里旧码流的残帧 2) 让主控端同步重建解码器
                 DrainFrameRing();
                 _log.Info("Worker 重建码流，已清空残帧并通知主控端重建解码器");
-                _relay.Queue(msg);
+                SendToViewer(msg);
                 break;
 
             case MessageType.WorkerStatus:
@@ -807,6 +862,19 @@ public sealed class CoordinatorApp : IDisposable
                 st.DirectBytes = _direct.BytesSent;
                 st.DirectActive = _direct.HasViewer;
                 st.RelayChunks = Interlocked.Read(ref _relayVideoChunks);
+                // 中继这条腿的积压/丢弃：主控端据此显示"网络上是不是堵了"
+                st.RelayQueued = _relay.VideoPending;
+                st.RelayDropped = _relay.VideoDropped;
+                // 视频出口拥塞 → 立刻告诉 Worker 降码率。
+                // Worker 自己看不到中继这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
+                bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped;
+                _lastVideoDropped = _relay.VideoDropped;
+                _ipc.Send(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
+                {
+                    Congested = congested,
+                    VideoQueued = _relay.VideoPending,
+                    VideoDropped = _relay.VideoDropped,
+                })));
                 // 授权状态随状态上报一起发出（界面不展示，供厂商侧排障/工具使用）
                 var lp = _license.Payload;
                 st.LicenseId = lp?.Lic ?? "";
@@ -819,23 +887,23 @@ public sealed class CoordinatorApp : IDisposable
                 st.HostName = Environment.MachineName;
                 st.UserName = Environment.UserName;
                 st.OsVersion = _osVersion ??= DescribeOs();
-                st.AgentVersion = "1.0.0";
-                _relay.Queue(new ProtocolMessage(MessageType.WorkerStatus, JsonCodec.Encode(st)));
+                st.AgentVersion = _workerReady?.Version ?? "1.0.0";
+                SendToViewer(new ProtocolMessage(MessageType.WorkerStatus, JsonCodec.Encode(st)));
                 break;
             }
 
             case MessageType.SoftwareState:
-                _relay.Queue(msg);
+                SendToViewer(msg);
                 break;
 
             case MessageType.Error:
                 _log.Error($"Worker 报错：{PayloadCodec.DecodeText(msg.Payload)}");
-                _relay.Queue(msg);
+                SendToViewer(msg);
                 break;
 
             default:
                 _log.Debug($"忽略 Worker 消息 0x{(byte)msg.Type:X2}");
-                _relay.Queue(msg);
+                SendToViewer(msg);
                 break;
         }
     }
@@ -867,7 +935,7 @@ public sealed class CoordinatorApp : IDisposable
             return;
         }
         Interlocked.Increment(ref _relayVideoChunks);
-        _relay.Queue(msg);
+        _relay.QueueVideo(msg);
     }
 
     // ---------------------------------------------------------------- 文件上传
@@ -887,11 +955,91 @@ public sealed class CoordinatorApp : IDisposable
             ReportError($"文件上传失败：{file.FileName}");
             return;
         }
-        _relay.Queue(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(info)));
+        SendToViewer(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(info)));
         _log.Info($"已通知主控端可下载：{info.FileName}（fileId={info.FileId}）");
     }
 
     // ---------------------------------------------------------------- 发送
+
+    /// <summary>
+    /// 把"发给主控端"的消息送出去：**直连（P2P）已建立就优先走直连**，否则回退中继。
+    ///
+    /// 为什么必须这样：以前只有视频走直连，鼠标键盘、软件列表、状态上报、剪贴板全都挤在中继上。
+    /// 一旦中继那条腿出问题（实测：机房侧把出站压到 15KB/s → 主控端下载只有 2KB/s），
+    /// "切到 P2P" 就只能救画面，操作和列表照样卡死。现在所有发给主控端的东西都优先走直连，
+    /// 直连断了自动回退中继，不需要人工干预。
+    /// </summary>
+    private void SendToViewer(ProtocolMessage msg)
+    {
+        if (_direct.HasViewer && _viewerCount <= 1)
+        {
+            _direct.Send(msg);
+            return;
+        }
+        _relay.Queue(msg);
+    }
+
+    /// <summary>把直连候选地址推给主控端（改过公网地址/开关后立刻重推，不用重启）</summary>
+    private void PushDirectCandidates()
+    {
+        try
+        {
+            _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+        }
+        catch (Exception ex) { _log.Debug($"推送直连候选失败：{ex.Message}"); }
+    }
+
+    /// <summary>托盘上显示的直连状态（一句话）</summary>
+    private string DirectStatusText()
+    {
+        if (!_cfg.DirectLinkEnabled) return "已关闭";
+        if (_direct.HasViewer)
+            return $"已建立 ← {_direct.ViewerEndpoint}（{_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB）";
+        if (!string.IsNullOrEmpty(_direct.PublicAddress)) return $"待接入（公网 {_direct.PublicAddress}）";
+        if (_direct.UpnpMapped) return "待接入（UPnP 已映射）";
+        if (_direct.Port > 0) return $"待接入（仅内网 {string.Join("/", _direct.LocalCandidates())}）";
+        return "未启动（端口被占用？）";
+    }
+
+    /// <summary>托盘：开/关直连。关 = 拒绝新的直连握手；开 = 允许（必要时现场启动监听）。都是立即生效。</summary>
+    private void SetDirectEnabled(bool on)
+    {
+        _cfg.DirectLinkEnabled = on;
+        try { _cfg.Save(); } catch (Exception ex) { _log.Warn($"保存配置失败：{ex.Message}"); }
+        if (on)
+        {
+            if (_direct.Port <= 0)
+            {
+                try { _direct.Start(); }
+                catch (Exception ex) { _log.Warn($"启动直连监听失败：{ex.Message}"); }
+            }
+            _log.Info("托盘：已开启 P2P 直连");
+        }
+        else
+        {
+            _direct.StopServing("托盘关闭了直连");
+            _log.Info("托盘：已关闭 P2P 直连（监听端口保留，但拒绝新的直连握手）");
+        }
+        PushDirectCandidates();
+    }
+
+    /// <summary>托盘：设置直连公网地址（做完端口映射后填这里，立即生效并重推候选）</summary>
+    private void SetDirectPublicAddress(string address)
+    {
+        var v = (address ?? "").Trim();
+        _cfg.DirectLinkPublicAddress = v;
+        try { _cfg.Save(); } catch (Exception ex) { _log.Warn($"保存配置失败：{ex.Message}"); }
+        if (v.Length == 0)
+        {
+            _log.Info("托盘：已清空直连公网地址（回退到 UPnP/内网候选；清空要重启被控端才完全生效）");
+        }
+        else
+        {
+            _direct.SetManualPublic(v);
+            _log.Info($"托盘：直连公网地址已设为 {v}");
+        }
+        PushDirectCandidates();
+    }
 
     private void PushMonitorInfo()
     {
@@ -900,19 +1048,66 @@ public sealed class CoordinatorApp : IDisposable
         else if (_workerReady != null)
             mi = new MonitorInfo { Width = _workerReady.Width, Height = _workerReady.Height, Count = 1 };
         else return;
-        _relay.Queue(new ProtocolMessage(MessageType.MonitorInfo, JsonCodec.Encode(mi)));
+        SendToViewer(new ProtocolMessage(MessageType.MonitorInfo, JsonCodec.Encode(mi)));
+    }
+
+    /// <summary>上一次发给主控端的软件列表（实时监测拿它做变化比对）</summary>
+    private List<SoftwareInfo> _lastSoftwareList = new();
+    private readonly object _swListLock = new();
+
+    /// <summary>
+    /// 实时运行状态监测：每 3 秒轻量枚举一次进程，**只把有变化的项**推给主控端。
+    /// 为什么要有它：光靠"主控端打开/关闭"的事件推状态，用户在被控机上手动开关程序时，
+    /// 列表状态就永远不刷新（现场反馈："我都关了它还显示开着"）。
+    /// 只推变化项是为了省流量 —— 每 3 秒把 28 项全推一遍在弱网上是浪费。
+    /// </summary>
+    private async Task WatchSoftwareStatesAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(3000, ct);
+                if (!HasViewer) continue;
+                List<SoftwareInfo> snapshot;
+                lock (_swListLock) snapshot = _lastSoftwareList;
+                if (snapshot.Count == 0) continue;
+
+                var (byPath, byName) = SoftwareEnumerator.GetRunningStates();
+                var changed = new List<SoftwareStateInfo>();
+                foreach (var sw in snapshot)
+                {
+                    int pid = 0;
+                    bool found = byPath.TryGetValue(sw.ExePath, out pid);
+                    if (!found && !string.IsNullOrEmpty(Path.GetFileName(sw.ExePath)))
+                        found = byName.TryGetValue(Path.GetFileName(sw.ExePath), out pid);
+                    bool running = found && pid > 0;
+                    if (running == sw.IsRunning && pid == sw.Pid) continue;
+                    sw.IsRunning = running;
+                    sw.Pid = running ? pid : 0;
+                    changed.Add(new SoftwareStateInfo { ExePath = sw.ExePath, Pid = sw.Pid, IsRunning = running });
+                }
+                foreach (var c in changed)
+                    SendToViewer(new ProtocolMessage(MessageType.SoftwareState, JsonCodec.Encode(c)));
+                if (changed.Count > 0)
+                    _log.Info($"软件运行状态变化 {changed.Count} 项（实时监测，已推给主控端）");
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex) { _log.Debug($"软件状态监测异常：{ex.Message}"); }
+        }
     }
 
     private void SendSoftwareList(SoftwareInfo[] list)
     {
         var payload = JsonCodec.Encode(list);
+        lock (_swListLock) _lastSoftwareList = list.ToList();   // 实时监测拿它做比对
         _log.Info($"上报软件列表：{list.Length} 项（{payload.Length / 1024}KB）");
-        _relay.Queue(new ProtocolMessage(MessageType.SoftwareList, payload));
+        SendToViewer(new ProtocolMessage(MessageType.SoftwareList, payload));
     }
 
     private void ReportError(string message)
     {
-        _relay.Queue(new ProtocolMessage(MessageType.Error, PayloadCodec.EncodeText(message)));
+        SendToViewer(new ProtocolMessage(MessageType.Error, PayloadCodec.EncodeText(message)));
     }
 
     private void WarnRateLimited(string msg)

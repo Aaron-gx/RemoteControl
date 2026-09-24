@@ -13,10 +13,13 @@
     <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- exe 的文件图标 + 托盘图标（托盘从嵌入资源读，见 TrayIcon） -->
+    <ApplicationIcon>..\..\Assets\agent.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
+    <EmbeddedResource Include="..\..\Assets\agent.ico" LogicalName="Agent.Coordinator.agent.ico" />
   </ItemGroup>
 
   <ItemGroup>

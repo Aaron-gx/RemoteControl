@@ -35,9 +35,17 @@ public partial class MainWindow : Window
     private double _lastKbps;
     private long _lastLatency;
     private HwndSource? _hwndSource;
+    /// <summary>系统热键捕获（Win / Alt+Tab / Ctrl+Esc → 转发给被控端），见 HotkeyCapture</summary>
+    private HotkeyCapture? _hotkeys;
+    /// <summary>上一次"请求搬窗口"提示的时刻（显示几秒后自动清掉）</summary>
+    private long _pullNoticeTick;
+    /// <summary>刚把"远程文件"放进本机剪贴板后的保护期：这段时间内不许文本同步把剪贴板覆盖掉</summary>
+    private long _fileClipboardUntil;
     private bool _closing;
     /// <summary>启动后的自动连接只做一次（避免每次点「刷新」都抢连）</summary>
     private bool _autoConnectTried;
+    /// <summary>上一次"因为对方不在线而自动刷新列表"的时刻（节流：别把刷新刷成死循环）</summary>
+    private long _lastAutoRefreshTick;
     /// <summary>中继刚告诉过我们"被控端不在线"（断开提示要说这句而不是泛泛的"未连接"）</summary>
     private bool _agentOffline;
     /// <summary>被控端离线时的面板提示。离线后会一直贴着这句：中继会自动重连，
@@ -62,8 +70,12 @@ public partial class MainWindow : Window
         ServerBox.Text = _cfg.ServerUrl;
         AgentBox.Text = _cfg.TargetAgentId;
         SelectLinkMode(_cfg.LinkMode);
+        SelectInputMode(_cfg.InputMode);
+        SelectCaptureMode(_cfg.CaptureMode);
         Width = Math.Max(900, _cfg.WindowWidth);
         Height = Math.Max(600, _cfg.WindowHeight);
+        // 物理屏是否只读（默认 false = 主屏也能直接操作，见 ViewerConfig.PhysicalScreenReadOnly）
+        Screen.ReadOnlyPhysicalScreens = _cfg.PhysicalScreenReadOnly;
         Screen.ShowPlaceholder("未连接");
         ShowEmptyHint("未连接：点「连接」后显示被控端的软件列表");
 
@@ -102,6 +114,24 @@ public partial class MainWindow : Window
             _log.Info($"链路偏好改为 {mode}（auto=优先直连 / relay=仅中继 / direct=仅直连）");
             ApplyLinkMode();
         };
+        InputModeBox.SelectionChanged += (_, _) =>
+        {
+            var m = SelectedInputMode();
+            if (m == _cfg.InputMode) return;
+            _cfg.InputMode = m;
+            _cfg.Save();
+            _log.Info($"鼠标模式改为 {m}（real=真实光标 / auto=自动 / background=后台注入）");
+            SendInputMode();
+        };
+        CaptureModeBox.SelectionChanged += (_, _) =>
+        {
+            var m = SelectedCaptureMode();
+            if (m == _cfg.CaptureMode) return;
+            _cfg.CaptureMode = m;
+            _cfg.Save();
+            _log.Info($"画面范围改为 {m}（virtual=只显示虚拟外屏 / all=全部屏幕）");
+            SendCaptureMode();
+        };
         ConnectBtn.Click += (_, _) =>
         {
             if (_ws.IsRunning) Disconnect();
@@ -121,6 +151,8 @@ public partial class MainWindow : Window
             ShowEmptyHint(_agentOffline ? OfflineHint : "已连接，正在读取被控端软件列表…");
             // 请求软件列表
             _ws.Queue(new ProtocolMessage(MessageType.RequestSoftwareList, PayloadCodec.Empty()));
+            SendInputMode();       // 每次连上都重新告知鼠标模式（被控端可能刚重启）
+            SendCaptureMode();     // 画面范围同理
         });
 
         _ws.Disconnected += reason => Dispatcher.Invoke(() =>
@@ -146,7 +178,20 @@ public partial class MainWindow : Window
         _ws.StatusText += text => Dispatcher.Invoke(() =>
         {
             _log.Info($"状态：{text}");
-            if (text.Contains("被控端不在线")) _agentOffline = true;
+            if (text.Contains("被控端不在线"))
+            {
+                _agentOffline = true;
+                // 只有可能是"ID 变了"（被控端重装后 AgentId 会变）：自动刷新一次列表，
+                // 顺手切到在线的那台并连上，而不是让用户自己发现再去点「刷新」。
+                // 节流 20 秒，避免"不在线 → 刷新 → 又不在线"转成死循环。
+                long now = Environment.TickCount64;
+                if (now - _lastAutoRefreshTick > 20000)
+                {
+                    _lastAutoRefreshTick = now;
+                    _log.Info("对方不在线：自动刷新一次列表并尝试切换到在线的那台");
+                    _ = RefreshAgentsAsync();
+                }
+            }
         });
         // P2P 直连：被控端上报候选就尝试连（公网优先 → 内网），连上后视频走直连
         _ws.DirectCandidatesReceived += (list, pub) =>
@@ -167,7 +212,15 @@ public partial class MainWindow : Window
         };
         _direct.MessageReceived += msg =>
         {
-            if (msg.Type != MessageType.VideoFrame) return;
+            if (msg.Type != MessageType.VideoFrame)
+            {
+                // 直连上不只有视频：被控端已把"发给主控端的一切"（软件列表、状态上报、
+                // 剪贴板、错误提示…）都改成直连优先。这里必须交给与中继**完全相同**的处理函数。
+                // 以前这里是 `if (msg.Type != VideoFrame) return;` —— 会把它们全丢掉，
+                // 表现就是"切到直连后画面有了，但软件列表/状态栏/剪贴板全没了"。
+                OnRemoteMessage(msg);
+                return;
+            }
             var (_, data) = PayloadCodec.DecodeVideoFrame(msg.Payload);
             _lastBytes += data.Length;          // 直连的字节也要计入码率统计（否则走直连时码率显示 0）
             _relayVideoBytes += data.Length;
@@ -211,14 +264,37 @@ public partial class MainWindow : Window
         Screen.RemoteMouseWheel += (x, y, d) => SendInputMessage(MessageType.MouseWheel, PayloadCodec.EncodeMouseWheel((ushort)x, (ushort)y, d));
         Screen.RemoteKey += (vk, up, flags) => SendInputMessage(MessageType.KeyEvent, PayloadCodec.EncodeKey(vk, up, flags));
 
+        // 在物理屏画面上点了某个窗口：请被控端把它搬到虚拟外屏（人工搬运，不再自动）
+        Screen.RemotePullWindow += (x, y) =>
+        {
+            SendInputMessage(MessageType.MoveWindowHint, PayloadCodec.EncodePoint((ushort)x, (ushort)y));
+            _log.Info($"请求被控端把画面 ({x},{y}) 处的窗口搬到外屏");
+            Screen.SetLayoutNotice("已请求把那个窗口搬到副屏…");
+            _pullNoticeTick = Environment.TickCount64;
+        };
+
+        // 系统热键（Win / Alt+Tab / Ctrl+Esc）：不装钩子的话会在本机生效（Win+R 弹的是本机的运行框），
+        // 所以由钩子截住并转发。只在主控端窗口是前台窗口、且已连接时才接管。
+        _hotkeys = new HotkeyCapture(_log,
+            active: () => _ws.IsConnected && IsActive,
+            forward: (vk, up, flags) =>
+            {
+                // 记一行：现场一看日志就知道"Win/R 到底有没有被转发出去"（排查用，量很小）
+                _log.Info($"热键转发给被控端：vk=0x{vk:X2} {(up ? "抬起" : "按下")}");
+                SendInputMessage(MessageType.KeyEvent, PayloadCodec.EncodeKey(vk, up, flags));
+            });
+
         SoftwareList.MouseRightButtonUp += (_, _) =>
         {
             var item = SoftwareList.SelectedItem as RemoteSoftware;
             MenuOpen.IsEnabled = item != null && !item.IsRunning;
             MenuClose.IsEnabled = item != null && item.IsRunning && item.Pid > 0;
+            // "搬到副屏"：已经打开、而且知道 pid 才可用（被控端靠 pid 找它的窗口）
+            MenuMove.IsEnabled = item != null && item.IsRunning && item.Pid > 0;
         };
         MenuOpen.Click += (_, _) => OpenSelectedSoftware();
         MenuClose.Click += (_, _) => CloseSelectedSoftware();
+        MenuMove.Click += (_, _) => MoveSelectedToVirtualScreen();
 
         PreviewKeyDown += OnPreviewKeyDown;
     }
@@ -242,7 +318,7 @@ public partial class MainWindow : Window
         _vm.AgentText = _cfg.TargetAgentId;
         EnsureDecoder();
         _ws.Token = _cfg.AgentToken;
-        _ws.Start(_cfg.ServerUrl, _cfg.TargetAgentId);
+        _ws.Start(_cfg.ServerUrl, _cfg.TargetAgentId, _cfg.ServerUrlFallbacks);
     }
 
     /// <summary>创建解码器并接上"积压丢块 → 重建解码器 + 请求被控端重建码流"的反馈环</summary>
@@ -310,6 +386,81 @@ public partial class MainWindow : Window
         return "auto";
     }
 
+    private string SelectedCaptureMode()
+    {
+        if (CaptureModeBox.SelectedItem is System.Windows.Controls.ComboBoxItem it)
+            return (it.Tag as string) ?? "virtual";
+        return "virtual";
+    }
+
+    private void SelectCaptureMode(string mode)
+    {
+        foreach (var o in CaptureModeBox.Items)
+            if (o is System.Windows.Controls.ComboBoxItem it &&
+                string.Equals(it.Tag as string, mode, StringComparison.OrdinalIgnoreCase))
+            {
+                CaptureModeBox.SelectedItem = it;
+                return;
+            }
+        CaptureModeBox.SelectedIndex = 0;   // 默认：只显示虚拟外屏（省带宽）
+    }
+
+    /// <summary>
+    /// 告诉被控端"画面显示哪些屏"。为什么做成开关而不是永远全屏：
+    /// 全部屏幕 = 主屏 + 副屏合成一幅画，像素翻倍，弱网下会明显降质；只看外屏是 1080p 一块，省带宽。
+    /// 切换时被控端会重建采集器与编码器，主控端跟着重建解码器（一次短暂等待关键帧）。
+    /// </summary>
+    private void SendCaptureMode()
+    {
+        // 注意：这里要写全名 —— System.Windows.Input 里也有一个 CaptureMode，不限定会有歧义
+        byte code = SelectedCaptureMode() switch
+        {
+            "all" => (byte)Agent.Common.CaptureMode.AllScreens,
+            "primary" => (byte)Agent.Common.CaptureMode.PrimaryOnly,
+            _ => (byte)Agent.Common.CaptureMode.VirtualOnly,
+        };
+        if (!_ws.IsConnected) return;
+        _ws.Queue(new ProtocolMessage(MessageType.CaptureModeHint, new[] { code }));
+        _log.Info($"已告知被控端画面范围：{SelectedCaptureMode()}");
+    }
+
+    private string SelectedInputMode()
+    {
+        if (InputModeBox.SelectedItem is System.Windows.Controls.ComboBoxItem it)
+            return (it.Tag as string) ?? "real";
+        return "real";
+    }
+
+    private void SelectInputMode(string mode)
+    {
+        foreach (var o in InputModeBox.Items)
+            if (o is System.Windows.Controls.ComboBoxItem it &&
+                string.Equals(it.Tag as string, mode, StringComparison.OrdinalIgnoreCase))
+            {
+                InputModeBox.SelectedItem = it;
+                return;
+            }
+        InputModeBox.SelectedIndex = 0;   // 默认：真实光标（兼容性最好）
+    }
+
+    /// <summary>
+    /// 告诉被控端"远端鼠标走哪条路"。
+    /// 为什么要有这个开关：被控端默认会在"本机用户在忙"时自动改用后台定向注入（不抢他的光标），
+    /// 但微信这类不吃合成消息的应用会点不动 —— 实测踩到。所以把选择权交给主控端，默认走真实光标。
+    /// </summary>
+    private void SendInputMode()
+    {
+        byte code = SelectedInputMode() switch
+        {
+            "auto" => (byte)RemoteInputMode.Auto,
+            "background" => (byte)RemoteInputMode.AlwaysBackground,
+            _ => (byte)RemoteInputMode.AlwaysRealCursor,
+        };
+        if (!_ws.IsConnected) return;
+        _ws.Queue(new ProtocolMessage(MessageType.InputModeHint, new[] { code }));
+        _log.Info($"已告知被控端鼠标模式：{SelectedInputMode()}");
+    }
+
     private void SelectLinkMode(string mode)
     {
         int idx = (mode ?? "auto").Trim().ToLowerInvariant() switch { "relay" => 1, "direct" => 2, _ => 0 };
@@ -326,6 +477,13 @@ public partial class MainWindow : Window
             _log.Info("已切到仅中继：断开 P2P 直连，视频改走中继");
         }
         UpdateLinkModeText();
+    }
+
+    /// <summary>取 AgentId 的"机器名"部分（形如 WIN-XXXX-1A2B3C4D → 去掉最后一段）</summary>
+    private static string MachinePrefix(string agentId)
+    {
+        int i = agentId.LastIndexOf('-');
+        return i > 0 ? agentId[..i] : agentId;
     }
 
     private async Task RefreshAgentsAsync()
@@ -347,6 +505,44 @@ public partial class MainWindow : Window
                 AgentBox.Text = ids[0];
             ConnInfo.Text = ids.Count > 0 ? $"在线被控端 {ids.Count} 个" : "没有在线被控端";
             _log.Info($"在线被控端：{(ids.Count == 0 ? "(无)" : string.Join(", ", ids))}");
+
+            // 目标那台不在线、但**同一台机器**的另一个 ID 在线 → 自动切过去。
+            // 为什么需要：被控端重装后 AgentId 会变（历史上是随机后缀），下拉里还选着旧 ID，
+            // 界面只说"不在线"，用户以为坏了 —— 其实换成同机器名的那台就好了（实测被坑三次）。
+            var wanted = _cfg.TargetAgentId?.Trim() ?? "";
+            if (wanted.Length > 0 && ids.Count > 0 &&
+                !ids.Contains(wanted, StringComparer.OrdinalIgnoreCase))
+            {
+                var prefix = MachinePrefix(wanted);
+                // 优先找"同一台机器"的另一个 ID（被控端重装后 ID 会变，历史上最常踩）；
+                // 找不到就看是不是**只有一台在线** —— 那它就是要连的那台，没有别的选择。
+                // 以前只认同名机器：ID 变化 + 恰好只有一台在线时会一直"明明在线却连不上"（实测反馈）。
+                var sibling = ids.FirstOrDefault(i =>
+                    string.Equals(MachinePrefix(i), prefix, StringComparison.OrdinalIgnoreCase));
+                var reason = "同一台机器的新 ID";
+                if (sibling == null && ids.Count == 1)
+                {
+                    sibling = ids[0];
+                    reason = "当前唯一在线的被控端";
+                }
+                if (sibling != null)
+                {
+                    _log.Warn($"目标 {wanted} 不在线，改用{sibling}（{reason}）→ 自动切换到 {sibling}");
+                    ConnInfo.Text = $"目标已变化：{wanted} → {sibling}（{reason}，已自动切换）";
+                    _cfg.TargetAgentId = sibling;
+                    try { _cfg.Save(); } catch { }
+                    AgentBox.Text = sibling;
+
+                    // 刷新时若已经自动换好了目标，就直接连上 —— 否则用户还要再点一次「连接」，
+                    // 看起来仍然像"连不上"（这正是用户反复遇到的观感问题）。
+                    if (!_ws.IsRunning)
+                    {
+                        _log.Info("已自动切换目标：立即发起连接");
+                        Connect();
+                    }
+                }
+            }
+
             // 打开就该有东西看：在线只有一台时直接接上去（软件列表和画面都是"接上才有"，
             // 否则左侧永远空着，用户只会以为坏了）。多台在线不自动选——那是用户要自己决定的。
             if (!_autoConnectTried && !_ws.IsRunning && ids.Count == 1)
@@ -378,6 +574,89 @@ public partial class MainWindow : Window
             _log.Error($"获取被控端列表失败：{ex.Message}");
             _log.Warn($"查询 /api/agents 失败：{ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 把列表里这个已打开的程序搬到被控端的虚拟外屏（主控端不用去画面上找窗口，
+    /// 列表里点一下就行 —— 现场反馈的"我想把它切到副屏显示，但没有这个功能"）。
+    /// </summary>
+    private void MoveSelectedToVirtualScreen()
+    {
+        if (SoftwareList.SelectedItem is not RemoteSoftware item || item.Pid <= 0)
+        {
+            ConnInfo.Text = "这个程序当前没有运行，无法搬到副屏（先「打开」它）";
+            return;
+        }
+        var payload = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(payload, item.Pid);
+        SendInputMessage(MessageType.MoveAppWindowHint, payload);
+        _log.Info($"请求被控端把 {item.Name}（pid={item.Pid}）的窗口搬到副屏");
+        ConnInfo.Text = $"已请求把 {item.Name} 搬到副屏";
+        Screen.SetLayoutNotice($"已请求把 {item.Name} 的窗口搬到副屏…");
+        _pullNoticeTick = Environment.TickCount64;
+    }
+
+    /// <summary>
+    /// 自动把这个远程文件收下来，并放进**本机剪贴板**（文件拖放格式），
+    /// 让用户在自己电脑的资源管理器里直接 Ctrl+V 粘出来。
+    /// 失败时明确写在界面上 —— 文件这条链路上静默失败最让人抓瞎（现场反馈过）。
+    /// </summary>
+    private async Task AutoReceiveRemoteFileAsync(ClipboardFileInfo info)
+    {
+        try
+        {
+            Dispatcher.Invoke(() =>
+            {
+                ClipboardHint.Text = $"⬇ 正在接收 {info.FileName}…";
+                _pendingFiles.RemoveAll(f => f.FileId == info.FileId);
+                _pendingFiles.Add(info);
+            });
+            var path = await _downloader.DownloadAsync(_cfg.ResolveFileServerUrl(), info, _cfg.DownloadDir,
+                null, ct: default, token: _cfg.AgentToken);
+            if (string.IsNullOrEmpty(path))
+            {
+                _log.Warn($"接收远程文件失败：{info.FileName}");
+                Dispatcher.Invoke(() => ClipboardHint.Text = $"✗ 接收 {info.FileName} 失败（网络或服务器不可用）");
+                return;
+            }
+            _log.Info($"远程文件已接收：{path} → 放进本机剪贴板（可在资源管理器里 Ctrl+V 粘贴）");
+            bool ok = Dispatcher.Invoke(() => SetLocalClipboardFile(path));
+            Dispatcher.Invoke(() =>
+            {
+                _pendingFiles.RemoveAll(f => f.FileId == info.FileId);
+                ClipboardHint.Text = ok
+                    ? $"📋 {info.FileName} 已在本机剪贴板 — 到资源管理器里 Ctrl+V 粘贴"
+                    : $"✗ 文件已下载到 {path}，但写本机剪贴板失败（剪贴板被别的程序占用），可直接用这个文件";
+                if (ok) _fileClipboardUntil = Environment.TickCount64 + 8000;
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"接收远程文件异常：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 把文件放进本机剪贴板（文件拖放格式），失败时重试几次。
+    /// 为什么要重试：剪贴板是全局独占资源，别的程序（输入法、剪贴板管理器）随时可能占着它，
+    /// 一次性写入经常撞上 CLIPBRD_E_CANT_OPEN（现场日志里就出现过）——重试几次基本都能成。
+    /// </summary>
+    private bool SetLocalClipboardFile(string path)
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            try
+            {
+                System.Windows.Clipboard.SetData(DataFormats.FileDrop, new[] { path });
+                if (System.Windows.Clipboard.ContainsFileDropList()) return true;
+            }
+            catch (Exception ex)
+            {
+                if (i == 5) _log.Warn($"写本机剪贴板失败（重试 6 次）：{ex.Message}");
+                Thread.Sleep(150);
+            }
+        }
+        return false;
     }
 
     private void SendInputMessage(MessageType type, byte[] payload)
@@ -414,8 +693,29 @@ public partial class MainWindow : Window
                 if (mi == null) break;
                 Dispatcher.Invoke(() =>
                 {
-                    ResolutionText.Text = $"分辨率: {mi.Width}×{mi.Height}";
+                    ResolutionText.Text = $"分辨率: {mi.Width}×{mi.Height}" +
+                        (mi.AllScreens ? "（全部屏幕）" : "");
                     Screen.ShowPlaceholder($"{mi.Width}×{mi.Height} 等待画面…");
+                    // 屏幕布局：全部屏幕模式下，物理屏那几块画成"只读"（看得见、点不到）
+                    Screen.SetScreenLayout(mi.Screens, mi.AllScreens);
+
+                    // 请求了"全部屏幕"却被控端仍按"仅副屏"在传图 → 说明那边是旧版本（老包不认识这条指令）。
+                    // 这类"界面点了没反应"最容易让人以为是软件坏了，所以直接写在画面上。
+                    bool wantAll = SelectedCaptureMode() == "all";
+                    if (wantAll && !mi.AllScreens)
+                    {
+                        _log.Warn($"已请求「全部屏幕」，但被控端上报的仍是「仅副屏」" +
+                                  $"（被控端版本 {_agentStatus?.AgentVersion ?? "未知"}）：它多半还是旧安装包，" +
+                                  "请在被控机上重新安装最新的被控端安装程序");
+                        Screen.SetLayoutNotice("已选择「全部屏幕」，但被控端仍在只传副屏 —— " +
+                                               "被控机上的被控端多半还是旧版本，请用最新的被控端安装程序覆盖安装一次");
+                    }
+                    else
+                    {
+                        Screen.SetLayoutNotice(null);
+                    }
+                    // 一次新会话的开始：从这里重新计"多久没出画面"
+                    _lastFrameTick = Environment.TickCount64;
                 });
                 EnsureDecoder();
                 if (!_decoder!.Configure(mi.Width, mi.Height))
@@ -487,11 +787,21 @@ public partial class MainWindow : Window
                     if (!string.IsNullOrEmpty(ws.HostName))
                         HostText.Text = $"{ws.HostName}（{ws.UserName}）{ws.OsVersion}";
                     UpdateLinkModeText();
+                    UpdateAgentStateText(ws);
                 });
                 break;
             }
             case MessageType.ClipboardText:
             {
+                // 复制文件时，Windows 会在剪贴板里同时放一份"文件路径文本" ——
+                // 如果我们此时把本机剪贴板覆盖成这段文本，刚放进去的"文件"就被挤掉了，
+                // 用户表现就是"复制过来了但粘不出文件"（现场反馈）。
+                // 所以：刚收过文件的一段时间内，文本同步让路。
+                if (Environment.TickCount64 < _fileClipboardUntil)
+                {
+                    _log.Debug("刚接收过远程文件，本轮剪贴板文本同步跳过（避免把文件挤掉）");
+                    break;
+                }
                 var text = PayloadCodec.DecodeText(msg.Payload);
                 _log.Info($"收到远程剪贴板文本（{text.Length} 字符）→ 写入本机剪贴板");
                 Dispatcher.Invoke(() => SetLocalClipboard(text));
@@ -502,12 +812,11 @@ public partial class MainWindow : Window
                 var info = JsonCodec.Decode<ClipboardFileInfo>(msg.Payload);
                 if (info == null) break;
                 _log.Info($"远程剪贴板文件：{info.FileName}（{info.FileSize} 字节）");
-                Dispatcher.Invoke(() =>
-                {
-                    _pendingFiles.RemoveAll(f => f.FileId == info.FileId);
-                    _pendingFiles.Add(info);
-                    UpdateClipboardHint();
-                });
+                // 【自动收下来并放进本机剪贴板】用户要的是"被控端 Ctrl+C 复制文件 → 在我自己电脑
+                // 资源管理器里 Ctrl+V 直接粘出来"（ToDesk/向日葵那种原生体验），
+                // 而不是"上传到中继、再在画面里按 Ctrl+V 下载到固定目录"。
+                // 所以这里一收到通知就自动下载，下载完把文件放进 Windows 剪贴板（CF_HDROP）。
+                _ = AutoReceiveRemoteFileAsync(info);
                 break;
             }
             case MessageType.Error:
@@ -540,15 +849,178 @@ public partial class MainWindow : Window
 
     // ---------------------------------------------------------------- 画面渲染
 
+    /// <summary>最近一次真正渲染出画面的时刻（用来判断"为什么一直没画面"）</summary>
+    private long _lastFrameTick;
+    /// <summary>上一份被控端状态里的丢块计数，用来算"每秒丢多少"</summary>
+    private long _lastRingDropped, _lastRelayDropped;
+    /// <summary>链路是否处于拥塞状态（被控端丢块 / 中继丢弃 / 已降档）</summary>
+    private bool _congested;
+    /// <summary>上一次上报的"光标被抢/采集屏是虚拟外屏"状态（只在翻转时记日志）</summary>
+    private bool _cursorContested, _captureIsVirtual = true;
+    private static readonly System.Windows.Media.Brush AgentStateWarn =
+        new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFF, 0xD2, 0x4A));
+    private static readonly System.Windows.Media.Brush AgentStateOk = System.Windows.Media.Brushes.White;
+
+    /// <summary>
+    /// 把被控端上报的健康状态显示出来（它一直在发，以前只在 Debug 日志里打了一行）。
+    /// 目的：画面不动的时候，用户能一眼看出是"被控端没采到""链路在丢块"还是"在等关键帧"，
+    /// 而不是对着黑屏猜是不是软件坏了。
+    /// </summary>
+    /// <summary>取第一个"同类软件"名字（状态栏只放得下一个）</summary>
+    private static string FirstBlocker(string hint)
+    {
+        var first = hint.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? hint;
+        return first.Trim();
+    }
+
+    private void UpdateAgentStateText(WorkerStatusInfo ws)
+    {
+        long ringDelta = Math.Max(0, ws.RingDropped - _lastRingDropped);
+        long relayDelta = Math.Max(0, ws.RelayDropped - _lastRelayDropped);
+        _lastRingDropped = ws.RingDropped;
+        _lastRelayDropped = ws.RelayDropped;
+        _congested = ringDelta > 0 || relayDelta > 0 || ws.AdaptiveLevel > 0;
+
+        // 状态栏宽度有限（窗口 1280 宽），这里只放最关键的一行；完整细节进悬停提示
+        var brief = new System.Text.StringBuilder();
+        brief.Append($"被控端 {ws.CaptureFps:F0}fps");
+        if (ws.AdaptiveLevel > 0) brief.Append($" / {ws.BitrateKbps}k×{ws.AdaptiveLevel}档");
+        if (ringDelta > 0 || relayDelta > 0) brief.Append($" ⚠丢 {Math.Max(ringDelta, relayDelta)} 块/s");
+
+        // 输入落在哪块屏、走的哪条路 —— 现场"看着副屏点、结果点到主屏"就是靠这一行定位的。
+        // 被控端每秒上报一次；正常时显示"副屏(1920,0)"，异常时明确写出来。
+        if (!ws.CaptureIsVirtual)
+            brief.Append(" ⚠输入在主屏(无虚拟外屏)");
+        else if (ws.CursorContested)
+            brief.Append(string.IsNullOrEmpty(ws.CursorBlockerHint)
+                ? " 输入 后台注入⚠"
+                : $" 输入 后台注入⚠[{ws.CursorBlockerHint}]");
+        else if (string.Equals(ws.InputPath, "background", StringComparison.OrdinalIgnoreCase))
+            brief.Append(" 输入 后台注入");
+        else if (!string.IsNullOrEmpty(ws.CursorBlockerHint))
+            brief.Append($" 输入 {(ws.AllScreens ? "全部" : "副屏")}({ws.InputBaseX},{ws.InputBaseY})·与{FirstBlocker(ws.CursorBlockerHint)}共用光标");
+        else
+            brief.Append($" 输入 {(ws.AllScreens ? "全部" : "副屏")}({ws.InputBaseX},{ws.InputBaseY})");
+
+        AgentStateText.Text = brief.ToString();
+        AgentStateText.Foreground = (_congested || ws.CursorContested || !ws.CaptureIsVirtual)
+            ? AgentStateWarn : AgentStateOk;
+
+        var detail = new System.Text.StringBuilder();
+        if (!string.IsNullOrEmpty(ws.AgentVersion))
+            detail.AppendLine($"被控端程序版本：{ws.AgentVersion}（1.0.1 起支持「画面」切换）");
+        detail.AppendLine($"被控端采集：{ws.CaptureFps:F1}fps（编码 {ws.EncodeFps:F1}fps）");
+        if (!string.IsNullOrEmpty(ws.Backend)) detail.AppendLine($"采集后端：{ws.Backend}");
+        detail.AppendLine($"当前码率：{ws.BitrateKbps}kbps / {ws.FrameRate}fps（自适应档位 {ws.AdaptiveLevel}）");
+        detail.AppendLine($"累计发送：{ws.FramesSent} 帧 / {ws.BytesSent / 1048576}MB");
+        detail.AppendLine($"链路：帧环丢块 {ws.RingDropped}，中继积压 {ws.RelayQueued}，中继丢弃 {ws.RelayDropped}");
+        detail.AppendLine($"输入换算基准：({ws.InputBaseX},{ws.InputBaseY})" +
+                          (ws.CaptureIsVirtual ? "（虚拟外屏）" : "（⚠ 物理屏：虚拟外屏没装上或被关掉了）"));
+        detail.AppendLine($"远端鼠标路径：{(string.Equals(ws.InputPath, "background", StringComparison.OrdinalIgnoreCase) ? "后台定向注入" : "真实光标")}" +
+                          (ws.CursorContested ? "（⚠ 本机光标被别的程序控制，已自动改走后台注入）" : ""));
+        if (ws.CursorContested)
+        {
+            detail.AppendLine(string.IsNullOrEmpty(ws.CursorBlockerHint)
+                ? "⚠ 被控机上还有别的程序在抢系统光标（另一个远控软件、或装了两份被控端）。"
+                : $"⚠ 被控机上检测到这些程序在运行，可能在抢光标：{ws.CursorBlockerHint}");
+            detail.AppendLine("   关掉它们之后远端会自动恢复原生鼠标（点击/拖拽/右键菜单全部原生）。");
+            detail.AppendLine("   后台注入对滚动有效，但部分应用（微信、Chromium 系）不吃合成点击。");
+        }
+        else if (!string.IsNullOrEmpty(ws.CursorBlockerHint))
+        {
+            detail.AppendLine($"被控机上还有其它远控在运行：{ws.CursorBlockerHint}");
+            detail.AppendLine("  为不互相抢那只唯一的系统光标，被控端已停用「光标仲裁」，");
+            detail.AppendLine("  远端与它共用同一套光标（关掉那个软件即恢复「本机用户独占光标」的保护）。");
+        }
+        if (_congested) detail.AppendLine("⚠ 链路拥塞中：被控端会自动降码率保画面，恢复后自动升回");
+        AgentStateText.ToolTip = detail.ToString();
+
+        // 只在状态翻转时记一条日志：这两件事出现时，用户对"点不动/点到别处"的描述就能对上号
+        if (ws.CursorContested != _cursorContested)
+        {
+            _cursorContested = ws.CursorContested;
+            if (ws.CursorContested)
+                _log.Warn("被控端报告：本机光标被别的程序控制住了，远端鼠标已自动改走后台定向注入" +
+                          "（点击不会再落到主屏；被控端日志会写明实际停在哪、期望在哪）");
+            else
+                _log.Info("被控端报告：本机光标已恢复可控，远端鼠标回到真实光标路径");
+        }
+        if (ws.CaptureIsVirtual != _captureIsVirtual)
+        {
+            _captureIsVirtual = ws.CaptureIsVirtual;
+            if (!ws.CaptureIsVirtual)
+                _log.Warn("被控端上报的采集屏不是虚拟外屏：远端此刻只能操作物理主屏（检查被控端有没有装好/启用虚拟外屏）");
+        }
+    }
+
+    /// <summary>
+    /// 画面长时间出不来时，把**原因**叠在画面上。
+    /// 注意不能用 ShowPlaceholder —— 它只在"从来没有过画面"时才会被画出来；
+    /// 一旦有了一帧（哪怕是黑帧），提示就没了，用户还是只能看黑屏。
+    /// </summary>
+    private void UpdateNoPictureNotice()
+    {
+        if (!_ws.IsConnected || _decoder == null)
+        {
+            Screen.SetNotice(null);
+            return;
+        }
+        // 先判断"链路带宽 vs 画面尺寸"。为什么把它放最前：链路只有几十 kbps 而画面是 4480×1440 时，
+        // 连一个关键帧都要传十几秒到几十秒 —— 用户看到的就是"黑屏"，而旧版的提示只会说
+        // "可能在等关键帧"，等于什么都没说（现场就卡在这儿）。这条能直接告诉他该做什么。
+        int px = Screen.RemoteWidth * Screen.RemoteHeight;
+        int needKbps = px / 1000;                       // 粗判：1080p≈2073、4480×1440≈6451
+        int haveKbps = _agentStatus?.BitrateKbps ?? 0;
+        if (px > 0 && needKbps > 0 && haveKbps > 0 && haveKbps < needKbps / 4)
+        {
+            Screen.SetLayoutNotice(
+                $"链路带宽不够：现在只有 {haveKbps}kbps，而这幅画面是 {Screen.RemoteWidth}×{Screen.RemoteHeight}" +
+                $"（大致需要 {needKbps}kbps 才能动起来）—— 关键帧都传不过来，所以看着是黑的。" +
+                "先看网络/退掉被控机上其它远控软件；只想快点用起来就把「画面」切回「副屏（省流量）」。");
+            return;
+        }
+        Screen.SetLayoutNotice(null);
+
+        long since = _lastFrameTick != 0 ? _lastFrameTick : Environment.TickCount64;
+        if (Environment.TickCount64 - since < 3000)
+        {
+            Screen.SetNotice(null);
+            return;
+        }
+
+        string reason;
+        if (_agentStatus is { SecureDesktop: true })
+            reason = "被控端正在显示 UAC 提权窗口或锁屏（安全桌面），画面与操作暂时不可用，等它消失会自动恢复";
+        else if (_congested)
+            reason = $"网络拥塞：被控端码率已自动降到 {_agentStatus?.BitrateKbps ?? 0}kbps，正在恢复（丢块 {_agentStatus?.RingDropped ?? 0}）";
+        else if (_agentStatus is { CaptureFps: < 3 })
+            reason = $"被控端采集只有 {_agentStatus.CaptureFps:F1}fps：卡在被控端那边（可能是显示模式变化或编码器重启）";
+        else
+            reason = "已连接但迟迟没有解出画面：可能在等关键帧，或网络在抖动，稍等几秒";
+        Screen.SetNotice(reason);
+    }
+
     private void OnRenderTick(object? sender, EventArgs e)
     {
+        // "已请求把那个窗口搬到副屏"这种一次性提示，显示 4 秒就撤掉，别一直贴在画面上
+        if (_pullNoticeTick != 0 && Environment.TickCount64 - _pullNoticeTick > 4000)
+        {
+            _pullNoticeTick = 0;
+            Screen.SetLayoutNotice(null);
+        }
         var dec = _decoder;
         if (dec == null) return;
-        if (!dec.TryTakeFrame(out var buf, out int len)) return;
+        if (!dec.TryTakeFrame(out var buf, out int len))
+        {
+            UpdateNoPictureNotice();
+            return;
+        }
         try
         {
             Screen.UpdateFrame(buf, dec.Width, dec.Height);
             _framesRendered++;
+            _lastFrameTick = Environment.TickCount64;
+            Screen.SetNotice(null);
         }
         finally
         {

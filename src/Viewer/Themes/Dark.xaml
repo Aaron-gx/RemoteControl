@@ -143,7 +143,9 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="{x:Type ToggleButton}">
-                    <Border x:Name="Bd" Background="{StaticResource BgInput}" CornerRadius="3">
+                    <!-- 底色交给外层的 Border（见 ComboBox 模板）：这里透明才不会盖住"选中项文字"，
+                         悬停时给一层高亮，箭头永远看得见 -->
+                    <Border x:Name="Bd" Background="Transparent" CornerRadius="3">
                         <Path x:Name="Arrow" HorizontalAlignment="Right" VerticalAlignment="Center"
                               Margin="0,0,8,0" Data="M 0 0 L 4 4 L 8 0 Z" Fill="{StaticResource FgMuted}"/>
                     </Border>
@@ -189,16 +191,29 @@
             <Setter.Value>
                 <ControlTemplate TargetType="{x:Type ComboBox}">
                     <Grid>
-                        <ToggleButton x:Name="ToggleButton" Style="{StaticResource ComboBoxToggleStyle}"
-                                      IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"/>
-                        <ContentPresenter x:Name="ContentSite" Margin="{TemplateBinding Padding}"
-                                          Content="{TemplateBinding SelectionBoxItem}"
-                                          ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
-                                          IsHitTestVisible="False" VerticalAlignment="Center"/>
-                        <TextBox x:Name="PART_EditableTextBox" Visibility="Hidden" Margin="{TemplateBinding Padding}"
-                                 Background="Transparent" Foreground="{StaticResource FgText}"
-                                 CaretBrush="{StaticResource FgText}" VerticalContentAlignment="Center"
-                                 BorderThickness="0" Padding="0"/>
+                        <!-- 分两列：左边内容/输入框，右边箭头（箭头永远可见、可点）。
+                             以前的写法是"箭头 ToggleButton 铺满整格 + 可编辑输入框盖在它上面"，
+                             于是一旦 IsEditable=True（被控端那个下拉框就是），TextBox 就把箭头整个盖住 ——
+                             界面上看不到箭头、也点不开，用户没法选在线的那台机器（实测踩到）。 -->
+                        <Border Background="{StaticResource BgInput}" CornerRadius="3"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="22"/>
+                            </Grid.ColumnDefinitions>
+                            <ContentPresenter x:Name="ContentSite" Grid.Column="0" Margin="{TemplateBinding Padding}"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              IsHitTestVisible="False" VerticalAlignment="Center"/>
+                            <TextBox x:Name="PART_EditableTextBox" Grid.Column="0" Visibility="Hidden"
+                                     Margin="{TemplateBinding Padding}"
+                                     Background="Transparent" Foreground="{StaticResource FgText}"
+                                     CaretBrush="{StaticResource FgText}" VerticalContentAlignment="Center"
+                                     BorderThickness="0" Padding="0"/>
+                            <ToggleButton x:Name="ToggleButton" Grid.Column="1" Grid.ColumnSpan="2"
+                                          Style="{StaticResource ComboBoxToggleStyle}"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"/>
+                        </Grid>
                         <Popup x:Name="PART_Popup" AllowsTransparency="True" Placement="Bottom"
                                IsOpen="{TemplateBinding IsDropDownOpen}" Focusable="False" PopupAnimation="Slide">
                             <Border Background="{StaticResource BgPanel}" BorderBrush="#FF3E3E42" BorderThickness="1"
@@ -214,6 +229,8 @@
                         <Trigger Property="IsEditable" Value="True">
                             <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible"/>
                             <Setter TargetName="ContentSite" Property="Visibility" Value="Hidden"/>
+                            <!-- 可编辑：箭头退回右列（输入框独占左侧，箭头不再被盖住） -->
+                            <Setter TargetName="ToggleButton" Property="Grid.ColumnSpan" Value="1"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>

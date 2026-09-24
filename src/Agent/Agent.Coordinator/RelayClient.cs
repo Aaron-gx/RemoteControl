@@ -15,17 +15,30 @@ public sealed class RelayClient : IDisposable
 {
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
-    private readonly Channel<ProtocolMessage> _sendQueue =
+
+    // 控制类消息（心跳回声/授权/软件列表/剪贴板/键鼠指令）走这条队列 —— 发送时永远优先。
+    // 为什么要单独一条：见 QueueVideo 的注释（实测踩过的坑）。
+    private readonly Channel<ProtocolMessage> _ctrlQueue =
         Channel.CreateBounded<ProtocolMessage>(new BoundedChannelOptions(512)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
         });
 
+    /// <summary>视频队列深度：只留最近约 1 秒的帧量，满了丢最旧的</summary>
+    private const int VideoQueueDepth = 24;
+    private readonly Channel<ProtocolMessage> _videoQueue =
+        Channel.CreateBounded<ProtocolMessage>(new BoundedChannelOptions(VideoQueueDepth)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+        });
+    private long _videoDropped;
+    private long _videoQueued;
+
     private ClientWebSocket? _ws;
     private CancellationTokenSource? _cts;
     private Task? _runTask;
-    private readonly SemaphoreSlim _sendSignal = new(0);
 
     public event Action? Connected;
     public event Action<string>? Disconnected;
@@ -37,10 +50,27 @@ public sealed class RelayClient : IDisposable
     /// <summary>最近一次收到入站消息的时间</summary>
     public DateTime LastInboundUtc { get; private set; } = DateTime.MinValue;
 
+    /// <summary>
+    /// 服务器因为**连接口令不对/没填**拒绝了握手（HTTP 401）。
+    ///
+    /// 【为什么要单独识别出来】这条路上出的问题在现场最难查：被控端只是"未连接服务器、
+    /// 会自动重试"，没有别的线索；用户看到的是"被控端已经运行了但主控端列表里没有它"，
+    /// 只能靠猜。401 是唯一能把"口令不一致"和"网络不通"分开的信号 —— 识别出来就能
+    /// 在托盘和日志里直接说明原因，省掉一轮来回排查。
+    /// </summary>
+    public bool AuthRejected { get; private set; }
+    /// <summary>最近一次连接失败的原因（面向人的一句话）</summary>
+    public string LastFailure { get; private set; } = "";
+    private long _lastAuthLogTick;
+
     public bool IsConnected => _ws?.State == WebSocketState.Open;
 
-    /// <summary>待发送队列深度（用于诊断链路是否被网络拖住）</summary>
-    public int PendingSends => _sendQueue.Reader.Count;
+    /// <summary>待发送队列深度（控制 + 视频）</summary>
+    public int PendingSends => _ctrlQueue.Reader.Count + _videoQueue.Reader.Count;
+    /// <summary>视频队列当前积压：持续 &gt; 0 说明链路发不出去（拥塞判定的依据）</summary>
+    public int VideoPending => _videoQueue.Reader.Count;
+    /// <summary>被挤掉的视频块数（含 DropOldest 静默丢弃的，单调递增）</summary>
+    public long VideoDropped => Interlocked.Read(ref _videoDropped);
     public long QueuedCount;
     public long DroppedCount;
 
@@ -135,7 +165,11 @@ public sealed class RelayClient : IDisposable
                     try
                     {
                         _ws = new ClientWebSocket();
-                        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+                        // 关掉 WebSocket 自带的保活：它的 pong 宽限默认跟着 KeepAliveInterval（20s），
+                        // 而弱网下"被控端→香港"的往返动辄十几秒，一到点客户端就把连接自己掐了 ——
+                        // 表现是"连服务器也不行"、反复断线重连（实测：心跳往返 19.8 秒）。
+                        // 改成关掉它，靠 TCP 自身超时 + 应用层心跳（主控端心跳回声）判断链路。
+                        _ws.Options.KeepAliveInterval = Timeout.InfiniteTimeSpan;
                         _ws.Options.SetBuffer(256 * 1024, 256 * 1024);
                         using var one = CancellationTokenSource.CreateLinkedTokenSource(ct);
                         one.CancelAfter(TimeSpan.FromSeconds(8));
@@ -156,6 +190,8 @@ public sealed class RelayClient : IDisposable
                 }
                 if (!connected) throw lastEx ?? new IOException("所有端点都连不上");
                 attempt = 0;
+                AuthRejected = false;
+                LastFailure = "";
                 _log.Info($"已连接中继服务器（{_lastGoodBase}）");
                 Connected?.Invoke();
                 // 心跳必须跟着"这一条会话"结束，否则 ReceiveLoop 返回后 await hb 会永远等下去：
@@ -169,7 +205,31 @@ public sealed class RelayClient : IDisposable
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
-                _log.Warn($"中继连接中断：{ex.GetType().Name}: {ex.Message}");
+                // 把"口令不对"和"网络不通"分开说：前者用户自己就能改（重装填口令），
+                // 后者只能等网络/服务器。混在一句"中继连接中断"里，现场只能靠猜（实测踩到）。
+                var msg = $"{ex.GetType().Name}: {ex.Message}";
+                bool auth = msg.Contains("401", StringComparison.Ordinal) ||
+                            msg.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase);
+                AuthRejected = auth;
+                LastFailure = auth
+                    ? "连接口令不一致或未填（服务器返回 401）"
+                    : (string.IsNullOrWhiteSpace(_cfg.AgentToken) ? "连接不上服务器（本机也没配置连接口令）" : "连接不上服务器（网络或服务器不可用）");
+                if (auth)
+                {
+                    long now = Environment.TickCount64;
+                    if (now - _lastAuthLogTick > 30000)
+                    {
+                        _lastAuthLogTick = now;
+                        _log.Error("服务器拒绝了连接（HTTP 401）：连接口令（config\\agent.json 的 AgentToken）" +
+                                   "与服务端 RC_TOKEN 不一致或未填写 —— 在被控端列表里会显示为「不在线」。\n" +
+                                   "  改法：重新运行安装程序并在「连接设置」里填入口令，或直接改 agent.json 的 AgentToken 后重启被控端。");
+                    }
+                }
+                else
+                {
+                    _log.Warn($"中继连接中断：{msg}"
+                              + (string.IsNullOrWhiteSpace(_cfg.AgentToken) ? "（提示：本机没有配置连接口令，服务器若启用了鉴权会拒绝连接）" : ""));
+                }
             }
             finally
             {
@@ -270,19 +330,34 @@ public sealed class RelayClient : IDisposable
         MessageReceived?.Invoke(msg);
     }
 
-    /// <summary>排队发送（线程安全，非阻塞）</summary>
+    /// <summary>排队发送控制类消息（线程安全，非阻塞）</summary>
     public void Queue(ProtocolMessage msg)
     {
         Interlocked.Increment(ref QueuedCount);
-        if (!_sendQueue.Writer.TryWrite(msg))
+        if (!_ctrlQueue.Writer.TryWrite(msg))
         {
             Interlocked.Increment(ref DroppedCount);
             _log.Warn($"发送队列已满，丢弃 {msg.Type}");
         }
-        else
-        {
-            _sendSignal.Release();
-        }
+    }
+
+    /// <summary>
+    /// 排队发送视频块。**必须和控制消息分开排队** —— 实测踩过的坑：
+    /// 两者混在一条 512 深、DropOldest 的队列里，而被控端上行只有 100~250kbps、编码却在 4Mbps，
+    /// 队列瞬间被视频灌满，于是三件事同时发生：
+    ///   ① 心跳回声被压在 20 秒的视频后面 → 主控端判定"服务器无响应"→ 反复断开重连（日志里一分钟连了 5 次）；
+    ///   ② DropOldest 丢的是**最旧的**，控制消息也会被静默丢掉；
+    ///   ③ DroppedCount 只统计 TryWrite 失败，而 DropOldest 永不失败 → 丢弃数一直显示 0，看着像没丢包。
+    /// 拆开后：控制永远优先发；视频只留最近约 1 秒，丢最旧的 —— 拥塞时画面会卡，
+    /// 但控制通道不再被拖死，主控端也不会再自己断开。
+    /// </summary>
+    public void QueueVideo(ProtocolMessage msg)
+    {
+        Interlocked.Increment(ref QueuedCount);
+        Interlocked.Increment(ref _videoQueued);
+        // DropOldest 不会失败；按"写入时已满"近似统计被挤掉的帧数（只作指标与拥塞信号）
+        if (_videoQueue.Reader.Count >= VideoQueueDepth) Interlocked.Increment(ref _videoDropped);
+        _videoQueue.Writer.TryWrite(msg);
     }
 
     private async Task SendPumpAsync()
@@ -290,7 +365,20 @@ public sealed class RelayClient : IDisposable
         while (true)
         {
             ProtocolMessage msg;
-            try { msg = await _sendQueue.Reader.ReadAsync(); }
+            try
+            {
+                // 控制优先：控制队列里还有东西，就先把它送完，视频才轮得到
+                if (_ctrlQueue.Reader.TryRead(out var c)) msg = c;
+                else if (_videoQueue.Reader.TryRead(out var v)) msg = v;
+                else
+                {
+                    // 两条都空：等任意一条来数据（未完成的那条等待会在下次有数据时自然结束）
+                    await Task.WhenAny(
+                        _ctrlQueue.Reader.WaitToReadAsync().AsTask(),
+                        _videoQueue.Reader.WaitToReadAsync().AsTask());
+                    continue;
+                }
+            }
             catch { return; }
             try
             {
@@ -402,8 +490,8 @@ public sealed class RelayClient : IDisposable
     {
         Stop();
         try { _runTask?.Wait(TimeSpan.FromSeconds(2)); } catch { }
-        _sendQueue.Writer.TryComplete();
-        _sendSignal.Dispose();
+        _ctrlQueue.Writer.TryComplete();
+        _videoQueue.Writer.TryComplete();
         _cts?.Dispose();
     }
 }
