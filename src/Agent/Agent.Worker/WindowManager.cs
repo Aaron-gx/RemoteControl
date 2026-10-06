@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using Agent.Common;
 
 namespace Agent.Worker;
@@ -15,11 +17,75 @@ public sealed class WindowManager
 
     public void SetCaptureTarget(DisplayInfo target) => _captureTarget = target;
 
-    /// <summary>远端开始操作之前**就已经存在**的窗口（这些一律不动）</summary>
-    private readonly HashSet<IntPtr> _baseline = new();
+    /// <summary>
+    /// 主控端软件列表里「此电脑」专用项的标记（打开指令的 exePath 字段用它，被控端认出后开资源管理器）。
+    /// 用 ASCII 哨兵值而不是真实 exe 路径：被控端自己解析系统目录下的 explorer 路径，主控端不用知道。
+    /// </summary>
+    public const string ThisPcMarker = SoftwareListMarkers.ThisPc;
+
+    /// <summary>「此电脑」的 shell 目录 CLSID（explorer.exe 加它作参数 = 直接打开"此电脑"）</summary>
+    private const string ThisPcClsid = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+
+    /// <summary>
+    /// 打开「此电脑」（主控端软件列表置顶项，2026-10 新增）。窗口必须出现在**外屏**上：
+    /// ① `/separate`：Win11 的资源管理器默认把新窗口**并成已有窗口里的标签页** —— 桌面上已有
+    ///    资源管理器窗口时，"此电脑"会塞进主屏那个旧窗口里，根本没有新窗口出现，
+    ///    钩子/快扫/轮询全都无处下手（客户反馈"有时候到不了副屏"）。/separate 强制独立进程开
+    ///    独立窗口，这套搬窗机制才有东西可搬；新窗口属于新起的 explorer 进程，认领也更干净。
+    /// ② 打开前先拍基线快照 —— 只认"快照之后新出现"的窗口，绝不碰本机用户已开着的资源管理器窗口；
+    /// ③ 桌面/任务栏窗口由 IsShellWindow 一票否决（详见其注释）。
+    /// </summary>
+    public int OpenThisPC()
+    {
+        var exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+        if (!File.Exists(exe))
+        {
+            _log.Error($"找不到 explorer.exe：{exe}");
+            return -1;
+        }
+        SnapshotBaseline();
+        _log.Info("主控端请求打开「此电脑」（/separate 独立窗口，将摆到外屏）");
+        return Open(exe, "/separate " + ThisPcClsid);
+    }
+
+    /// <summary>
+    /// 是不是"外壳"窗口（桌面 Progman/WorkerW、任务栏、桌面图标视图）。
+    /// 这些窗口属于 explorer 进程、尺寸又"正常"（桌面就是全屏大小），按 pid/进程名找窗口时
+    /// 一定会撞上 —— 把它们挪走等于把用户的整个桌面/任务栏搬走，必须一票否决。
+    /// </summary>
+    private static bool IsShellWindow(IntPtr h)
+    {
+        try
+        {
+            var cls = NativeApi.GetClassName(h);
+            return cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd"
+                or "SHELLDLL_DefView" or "SysListView32";
+        }
+        catch { return true; }   // 拿不到类名时按"是外壳"处理（宁可不搬，不可搬错）
+    }
+
+    /// <summary>远端开始操作之前**就已经存在**的窗口（这些一律不动）。
+    /// 永远通过 TakeBaselineSnapshot() 拿快照副本读 —— 集合在写入时整体换新实例，副本读是线程安全的。</summary>
+    private HashSet<IntPtr> _baseline = new();
+    /// <summary>快照时**已经在运行**的进程：Win+R 会话期只搬"新起来的进程"的窗口，
+    /// 这样本机用户自己开着的程序（浏览器/微信…）不会被搬到外屏（现场反馈"打开任何东西都闪到副屏"）</summary>
+    private HashSet<int> _baselinePids = new();
+    private readonly object _baselineWriteLock = new();
     /// <summary>已经搬过的窗口（同一个窗口只搬一次）</summary>
     private readonly HashSet<IntPtr> _swept = new();
+    /// <summary>上次打印"按名兜底被闸门拦下"日志的时刻（限流：5 秒一条，别刷屏）</summary>
+    private long _lastByNameSkipLog;
+    /// <summary>最近一次"打开指令"的时刻（ArmShowCatcher 时更新）：头几秒内出现的同名窗口与指令强相关，视为确定认领</summary>
+    private long _armTick;
+    /// <summary>本轮武装期预定位的窗口计数（explorer 连开十几个辅助窗，日志限流用）</summary>
+    private long _prePosLogCount;
     private bool _baselineBuilt;
+
+    /// <summary>拿一份基线窗口快照（副本）。写入方整体换新集合，读副本永远安全。</summary>
+    private HashSet<IntPtr> TakeBaselineSnapshot()
+    {
+        lock (_baselineWriteLock) return _baseline;
+    }
 
     /// <summary>
     /// 把"新出现的窗口"从物理屏搬到虚拟外屏。
@@ -49,13 +115,15 @@ public sealed class WindowManager
         if (!_baselineBuilt) RebuildBaseline();
         if (_swept.Count > 400) _swept.Clear();
 
+        var baseline = TakeBaselineSnapshot();
+        var baselinePids = TakeBaselinePidsSnapshot();
         int moved = 0;
         NativeApi.EnumWindows((h, _) =>
         {
             try
             {
                 if (h == IntPtr.Zero) return true;
-                if (_baseline.Contains(h) || _swept.Contains(h)) return true;   // 老窗口 / 已处理过
+                if (baseline.Contains(h) || _swept.Contains(h)) return true;   // 老窗口 / 已处理过
                 if (!NativeApi.IsWindowVisible(h)) return true;
                 // 控制台窗口（cmd/powershell）的窗口属于 conhost，IsSaneWindow 会把它过滤掉 ——
                 // 但 Win+R 输入 cmd 正是最常见的用法，所以这里单独放行（现场日志：cmd 窗口没被搬）
@@ -66,6 +134,8 @@ public sealed class WindowManager
                 if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd") return true;
                 NativeApi.GetWindowThreadProcessId(h, out int pid);
                 if (pid == 0 || pid == Environment.ProcessId) return true;
+                // 只搬"快照之后新起来的进程"的窗口：本机用户原来开着的程序一个都不动
+                if (baselinePids.Count > 0 && baselinePids.Contains(pid)) return true;
                 if (!NativeApi.GetWindowRect(h, out var r)) return true;
                 if (r.Right - r.Left < 80 || r.Bottom - r.Top < 40) return true;   // 忽略小提示条
 
@@ -85,16 +155,80 @@ public sealed class WindowManager
         return moved;
     }
 
+    /// <summary>
+    /// 副屏孤儿窗口回收（2026-10-05，客户反馈"Telegram 第一次打开不回主屏"）：
+    /// 主控端离线（10 秒无远端输入）时，把所有**整块落在虚拟外屏上**的可见应用窗口搬回主屏。
+    /// Telegram 从托盘恢复不触发 EVENT_OBJECT_SHOW（窗口一直是"可见"的），SHOW 路径抓不到。
+    /// </summary>
+    public void ReclaimOrphanWindowsFromVirtual()
+    {
+        try
+        {
+            var virt = VirtualScreenProvider?.Invoke();
+            if (virt is not { IsVirtual: true }) return;
+            var primary = DisplayHelper.GetMonitors().FirstOrDefault(m => m.IsPrimary);
+            if (primary == null) return;
+
+            NativeApi.EnumWindows((h, _) =>
+            {
+                try
+                {
+                    if (!NativeApi.IsWindow(h) || !NativeApi.IsWindowVisible(h)) return true;
+                    if (NativeApi.GetAncestor(h, NativeApi.GA_ROOT) != h) return true;
+                    if (IsShellWindow(h)) return true;
+                    if (!IsSaneWindow(h)) return true;
+                    NativeApi.GetWindowThreadProcessId(h, out int pid);
+                    if (pid == 0 || pid == Environment.ProcessId) return true;
+                    if (!NativeApi.GetWindowRect(h, out var r)) return true;
+                    int w = r.Right - r.Left, hgt = r.Bottom - r.Top;
+                    if (w < 300 || hgt < 200) return true;
+                    if (!(r.Left >= virt.Left && r.Right <= virt.Right && r.Top >= virt.Top && r.Bottom <= virt.Bottom)) return true;
+
+                    int x = primary.Left + Math.Max(0, (primary.Width - Math.Min(w, primary.Width)) / 2);
+                    int y = primary.Top + Math.Max(0, (primary.Height - Math.Min(hgt, primary.Height)) / 2);
+                    if (NativeApi.IsZoomed(h)) NativeApi.ShowWindow(h, NativeApi.SW_RESTORE);
+                    if (NativeApi.SetWindowPos(h, IntPtr.Zero, x, y, 0, 0,
+                            NativeApi.SWP_NOSIZE | NativeApi.SWP_NOZORDER | NativeApi.SWP_NOACTIVATE))
+                    {
+                        _log.Info($"副屏孤儿窗口回收（{ProcessNameOf(pid)} {w}x{hgt}）→ 搬回主屏 ({x},{y})");
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
     /// <summary>现在屏幕上有哪些窗口 = 基线。远端按 Win+R 之前拍一张，之后新出现的才算"它带出来的"</summary>
     public void SnapshotBaseline()
     {
         try
         {
-            _baseline.Clear();
-            NativeApi.EnumWindows((h, _) => { if (h != IntPtr.Zero) _baseline.Add(h); return true; }, IntPtr.Zero);
-            _baselineBuilt = true;
+            var windows = new HashSet<IntPtr>();
+            var pids = new HashSet<int>();
+            NativeApi.EnumWindows((h, _) =>
+            {
+                if (h == IntPtr.Zero) return true;
+                windows.Add(h);
+                NativeApi.GetWindowThreadProcessId(h, out int pid);
+                if (pid > 0) pids.Add(pid);
+                return true;
+            }, IntPtr.Zero);
+            lock (_baselineWriteLock)
+            {
+                _baseline = windows;      // 整体换新实例：正在用旧快照的读者不受影响（见 TakeBaselineSnapshot）
+                _baselinePids = pids;
+                _baselineBuilt = true;
+            }
         }
         catch { }
+    }
+
+    /// <summary>拿一份基线进程快照（副本）</summary>
+    private HashSet<int> TakeBaselinePidsSnapshot()
+    {
+        lock (_baselineWriteLock) return _baselinePids;
     }
 
     /// <summary>把当前所有可见顶层窗口记为基线（远端空闲时刷新）</summary>
@@ -102,11 +236,15 @@ public sealed class WindowManager
     {
         try
         {
-            NativeApi.EnumWindows((h, _) => { if (h != IntPtr.Zero) _baseline.Add(h); return true; }, IntPtr.Zero);
-            _baselineBuilt = true;
+            var windows = new HashSet<IntPtr>();
+            NativeApi.EnumWindows((h, _) => { if (h != IntPtr.Zero) windows.Add(h); return true; }, IntPtr.Zero);
+            lock (_baselineWriteLock)
+            {
+                _baseline = windows;      // 写入方整体换新集合（线程安全模型见 _baseline 注释）
+                _baselineBuilt = true;
+            }
         }
         catch { }
-        return;
     }
 
     /// <summary>
@@ -268,15 +406,36 @@ public sealed class WindowManager
             // 而 AttachConsole+GetConsoleWindow 会拿到退化的小窗口（实测 16x16）。
             // 最稳的办法：记录启动前的控制台窗口集合，启动后取差集就是新窗口。
             var before = ListConsoleWindows();
-            var psi = new ProcessStartInfo(exePath)
+
+            // 第一优先：**出生即外屏** —— CreateProcess 的 STARTUPINFO 把初始窗口位置直接定在虚拟外屏。
+            // Windows 的规则：程序 CreateWindow 时 x/y 给 CW_USEDEFAULT（绝大多数程序就是这么开主窗口的），
+            // 系统会采用 STARTUPINFO 的 dwX/dwY —— 窗口生下来就在外屏，主屏上**根本不出现**（零闪烁）。
+            int pid = StartOnVirtualScreen(exePath, arguments, out bool positioned);
+            Process? p = null;
+            if (pid > 0)
             {
-                UseShellExecute = true,
-                WorkingDirectory = Path.GetDirectoryName(exePath) ?? "",
-                Arguments = arguments ?? "",
-            };
-            var p = Process.Start(psi);
-            int pid = p?.Id ?? -1;
-            _log.Info($"已启动 {Path.GetFileName(exePath)} pid={pid}");
+                try { p = Process.GetProcessById(pid); } catch { /* 单实例程序：启动进程可能瞬间退出 */ }
+            }
+            if (pid <= 0)
+            {
+                // 回落老路径（ShellExecute）：要求提权的程序（ERROR_ELEVATION_REQUIRED）、
+                // lnk/协议等非可执行文件、以及 CreateProcess 因任何原因没成的情况。
+                var psi = new ProcessStartInfo(exePath)
+                {
+                    UseShellExecute = true,
+                    WorkingDirectory = Path.GetDirectoryName(exePath) ?? "",
+                    Arguments = arguments ?? "",
+                };
+                p = Process.Start(psi);
+                pid = p?.Id ?? -1;
+            }
+            _log.Info($"已启动 {Path.GetFileName(exePath)} pid={pid}{(positioned ? "（初始位置=外屏）" : "")}");
+
+            // 第二优先：**显示即捕获** —— 自己定位/记住上次位置的程序（Chromium 系、微信…）不理会
+            // STARTUPINFO，仍会先在主屏出现。用 SetWinEventHook(EVENT_OBJECT_SHOW) 在它们**第一帧
+            // 画出来之前**（毫秒级）搬走。老的 200ms 轮询是兜底，仍保留在 EnsureWindowOnTarget 里。
+            ArmShowCatcher(pid, Path.GetFileNameWithoutExtension(exePath));
+
             if (p != null) _ = Task.Run(() => EnsureWindowOnTarget(p, before));
             return pid;
         }
@@ -285,6 +444,431 @@ public sealed class WindowManager
             _log.Error($"启动 {exePath} 失败：{ex.Message}");
             return -1;
         }
+    }
+
+    /// <summary>窗口出生位置的层叠序号：连开几个程序不至于完全叠死</summary>
+    private int _spawnCascade;
+
+    /// <summary>
+    /// 用 CreateProcess + STARTF_USEPOSITION 把新进程的**初始窗口位置**直接定在虚拟外屏。
+    /// 失败（提权程序 ERROR_ELEVATION_REQUIRED、非可执行文件…）返回 -1，调用方回落 ShellExecute 老路径。
+    /// </summary>
+    private int StartOnVirtualScreen(string exePath, string? arguments, out bool positioned)
+    {
+        positioned = false;
+        var target = _captureTarget;
+        if (target == null) return -1;
+        try
+        {
+            int x = target.Left + 24 + (_spawnCascade++ % 8) * 32;
+            int y = target.Top + 24 + (_spawnCascade % 8) * 24;
+            var si = new NativeApi.STARTUPINFO
+            {
+                dwFlags = (int)(NativeApi.STARTF_USEPOSITION | NativeApi.STARTF_USESHOWWINDOW),
+                wShowWindow = NativeApi.SW_SHOWNORMAL,
+                dwX = x,
+                dwY = y,
+            };
+            si.cb = Marshal.SizeOf<NativeApi.STARTUPINFO>();
+            var cmd = new StringBuilder("\"" + exePath + "\""
+                + (string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments));
+            string? dir = Path.GetDirectoryName(exePath);
+            if (NativeApi.CreateProcessW(exePath, cmd, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero,
+                    string.IsNullOrEmpty(dir) ? null : dir, ref si, out var pi))
+            {
+                NativeApi.CloseHandle(pi.hProcess);
+                NativeApi.CloseHandle(pi.hThread);
+                positioned = true;
+                return (int)pi.dwProcessId;
+            }
+            _log.Info($"带初始位置启动未成（Win32Error={Marshal.GetLastWin32Error()}），回落标准启动：{Path.GetFileName(exePath)}");
+            return -1;
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"带初始位置启动异常（回落标准启动）：{ex.Message}");
+            return -1;
+        }
+    }
+
+    // ---------------------------------------------------------------- 显示即捕获（EVENT_OBJECT_SHOW）
+
+    /// <summary>WinEvent 回调委托。必须是字段保活的强引用：委托被 GC 回收后本机回调会崩掉</summary>
+    private NativeApi.WinEventProc? _showCatchProc;
+    /// <summary>钩子/旋转线程已处理过的窗口。锁保护：钩子线程和热旋转线程并发调用 TryCatchWindow</summary>
+    private readonly HashSet<IntPtr> _caught = new();
+    private readonly object _caughtLock = new();
+    private readonly object _catchGate = new();
+    private long _catchUntil;
+    private int _catchPid = -1;
+    private string _catchName = "";
+    private HashSet<int> _catchPidsAtArm = new();
+    private Thread? _catchThread;
+
+    /// <summary>
+    /// 武装"一显示就搬走"的捕获器：SetWinEventHook(EVENT_OBJECT_SHOW)。
+    /// 客户反馈"主控端右键打开软件，窗口先在主屏闪一下才到副屏，很打扰主屏工作"——
+    /// 老做法是 200ms 轮询，主屏会看见新窗口闪 0.2~1 秒；钩子在窗口显示的**那一刻**（第一帧
+    /// 被画出来之前）就把它挪到外屏，闪烁收敛到肉眼基本不可见。
+    /// 监听**全部**进程（不只启动的那个 pid）：单实例程序（微信/Edge 二次启动）的新窗口
+    /// 属于**早已在跑**的进程，按 pid 过滤会漏。
+    /// 只武装一段时间（远程每次"打开"续 25 秒），平时不挂钩子。
+    /// </summary>
+    private void ArmShowCatcher(int pid, string processName)
+    {
+        if (_captureTarget == null) return;
+        // 先拍基线（此刻已存在的窗口一律不属于"这次打开带出来的"—— 快扫和按名找窗都靠它防误抢），
+        // 再进锁续期。钩子是常驻的（见 CatchLoop），续期即刻生效；进程快照慢一点没关系。
+        SnapshotBaseline();
+        lock (_catchGate)
+        {
+            _catchUntil = Environment.TickCount64 + 25_000;
+            _armTick = Environment.TickCount64;   // "打开指令刚发生"的锚点：头几秒内的同名窗口视为确定认领
+            Interlocked.Exchange(ref _prePosLogCount, 0);
+            _catchPid = pid;
+            _catchName = processName ?? "";
+            try { _catchPidsAtArm = Process.GetProcesses().Select(pr => pr.Id).ToHashSet(); }
+            catch { _catchPidsAtArm = new HashSet<int>(); }
+            if (_catchThread == null || !_catchThread.IsAlive)
+            {
+                _showCatchProc = OnWindowShown;
+                _catchThread = new Thread(CatchLoop) { IsBackground = true, Name = "show-catcher" };
+                _catchThread.Start();
+            }
+        }
+        // 热旋转：**专用线程 + 1ms 间隔**，跑 2 秒 —— 独立于 WinEvent 钩子（钩子靠异步消息，
+        // 投递延迟 10-30ms 偶尔跑不赢 DWM 的 16.7ms 帧边界，主屏就会看到 1 帧）。
+        //
+        // 【为什么不能用 Task.Delay(3)】Windows 计时器默认精度 15.6ms —— Task.Delay(3) 实际等 ~15ms，
+        // 窗口在这个空档里已经在主屏画了 3~4 帧（v1.2.5 真机帧级实测踩到）。
+        // 正确做法：专用线程 + timeBeginPeriod(1) 提高系统计时器精度 + Thread.Sleep(1)。
+        // 1ms 旋转 + DWM cloak 保证在合成器**下一帧之前**把窗口隐身 → 主屏零帧。
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                NativeApi.timeBeginPeriod(1);   // 系统计时器精度提到 1ms（离开时恢复）
+                long spinUntil = Environment.TickCount64 + 2000;
+                var baseline = TakeBaselineSnapshot();
+                while (Environment.TickCount64 < spinUntil &&
+                       Environment.TickCount64 < Interlocked.Read(ref _catchUntil))
+                {
+                    try { FastCatchSweepWithBaseline(baseline); }
+                    catch { }
+                    Thread.Sleep(1);            // timeBeginPeriod(1) 下 ≈1ms（不用 Task.Delay，那个是 ~15ms）
+                }
+            }
+            finally
+            {
+                try { NativeApi.timeEndPeriod(1); } catch { }
+            }
+        });
+    }
+
+    /// <summary>热旋转用的快扫（带**打开时的基线**而不是实时基线——热旋转期间基线不该被别处刷新）。
+    /// 调 PrePositionNewWindow 而不是 TryCatchWindow：它同时处理**隐藏窗口**（CreateWindow→ShowWindow
+    /// 间隙的窗口，IsWindowVisible=false——预定位到外屏，SHOW 时直接在外屏出现）和**已显示窗口**
+    /// （fallthrough 到 cloak+hide+搬走）。v1.2.6 只查可见窗口，主窗口在创建→显示的间隙被漏掉。 </summary>
+    private void FastCatchSweepWithBaseline(HashSet<IntPtr> baseline)
+    {
+        try
+        {
+            if (baseline.Count == 0) return;
+            NativeApi.EnumWindows((h, _) =>
+            {
+                if (!baseline.Contains(h)) PrePositionNewWindow(h);
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 钩子线程：**常驻**安装 EVENT_OBJECT_SHOW 钩子并泵消息（带外回调靠消息循环触发）；
+    /// 武装期内每 60ms 额外做一轮全窗口快扫（FastCatchSweep）。
+    ///
+    /// 为什么改成常驻、不再"到期卸钩 → 下次再装"：explorer 这类由**常驻进程代开窗口**的程序，
+    /// 从启动到窗口 SHOW 只有 ~100ms，而重新装钩要经过 500ms 空闲轮询 + 进程快照（几十 ms）的延迟，
+    /// 钩子还没装好窗口已经在主屏闪过了（客户反馈"『此电脑』在主屏闪一下才到副屏"就是这个竞态）。
+    /// 常驻钩平时在回调里按捕获期（_catchUntil）判定，未武装时零动作，开销可忽略。
+    /// </summary>
+    private void CatchLoop()
+    {
+        // Peek 一下强制创建本线程的消息队列（SetWinEventHook 的注册线程必须有队列）
+        NativeApi.PeekMessage(out _, IntPtr.Zero, 0, 0, 0);
+        IntPtr hook = IntPtr.Zero;
+        try
+        {
+            // 钩 CREATE + SHOW 两个事件（0x8001~0x8002 恰好相邻，作为区间一次挂上）：
+            //  · CREATE：窗口刚创建、**还没显示** —— 趁它看不见先挪到外屏（隐藏窗口的挪动不可见，
+            //    显示时直接就在外屏，主屏零动作 —— 这是"零闪烁"的关键一步，见 PrePositionNewWindow）；
+            //  · SHOW：显示那一刻的兜底（预定位被应用自己覆盖/漏掉时，第一帧前后搬走）。
+            hook = NativeApi.SetWinEventHook(NativeApi.EVENT_OBJECT_CREATE, NativeApi.EVENT_OBJECT_SHOW,
+                IntPtr.Zero, _showCatchProc!, 0, 0, NativeApi.WINEVENT_OUTOFCONTEXT);
+            if (hook == IntPtr.Zero)
+                _log.Warn("SetWinEventHook 失败：退回快扫 + 轮询搬窗（主屏可能闪一下）");
+            while (true)
+            {
+                bool armed = Environment.TickCount64 < Interlocked.Read(ref _catchUntil);
+                // 消息泵的等待超时只做兜底——消息到达时 MsgWait **立即**唤醒，不等超时
+                NativeApi.MsgWaitForMultipleObjects(0, IntPtr.Zero, false, (uint)(armed ? 60 : 500), NativeApi.QS_ALLINPUT);
+                while (NativeApi.PeekMessage(out _, IntPtr.Zero, 0, 0, NativeApi.PM_REMOVE)) { }
+                if (armed) FastCatchSweep();
+            }
+        }
+        finally
+        {
+            if (hook != IntPtr.Zero) NativeApi.UnhookWinEvent(hook);
+        }
+    }
+
+    /// <summary>武装期快扫：枚举顶层窗口，与钩子回调同一套判据（TryCatchWindow）。
+    /// 与钩子的关键差别：快扫看到的是**全部**窗口（含本机用户早已开着的），
+    /// 所以必须再用**基线快照**滤一道 —— 只碰"这次打开指令之后才出现的窗口"，
+    /// 否则按"同名进程"认领会把用户开着的资源管理器/微信整窝端走。</summary>
+    private void FastCatchSweep()
+    {
+        try
+        {
+            var baseline = TakeBaselineSnapshot();
+            if (baseline.Count == 0) return;   // 还没有基线（理论到不了这，武装时刚拍过）：宁可不抓也不误抢
+            NativeApi.EnumWindows((h, _) =>
+            {
+                if (!baseline.Contains(h)) TryCatchWindow(h);
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    /// <summary>WinEvent 回调（只在钩子线程上触发）：CREATE → 预定位（趁窗口还没显示挪到外屏）；SHOW → 常规抓取 + 反向抓取；其它（DESTROY 等）忽略</summary>
+    private void OnWindowShown(IntPtr hook, uint eventCode, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        try
+        {
+            if (hwnd == IntPtr.Zero || idObject != NativeApi.OBJID_WINDOW) return;   // 只要窗口本身，不要子控件
+            if (eventCode == NativeApi.EVENT_OBJECT_CREATE)
+                PrePositionNewWindow(hwnd);
+            else if (eventCode == NativeApi.EVENT_OBJECT_SHOW)
+            {
+                TryCatchWindow(hwnd);
+                ReversePullToPrimaryIfLocalUser(hwnd);
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 反向抓取（2026-10-05，客户反馈"副屏关过软件后，主屏开的软件跑到副屏不回来"）：
+    /// Windows 会记住每个程序**上次关闭时所在的屏**——软件在副屏被关过，本机用户下次从主屏
+    /// （开始菜单/任务栏/双击）打开它时，窗口直接出生在副屏。而本机用户根本看不见副屏，
+    /// 表现就是"打开没反应/窗口失踪"。
+    /// 处置：常驻 SHOW 监听（不依赖武装期）——新窗口显示时若**整块落在虚拟外屏**、且最近 15 秒
+    /// 只有本机用户动过键鼠（远端注入不计入物理时间戳）、且不在远端"打开"的武装期内（那多半是
+    /// 远端自己开的，别去抢），就把它搬回**物理主屏**。
+    /// </summary>
+    private void ReversePullToPrimaryIfLocalUser(IntPtr hwnd)
+    {
+        try
+        {
+            var virt = VirtualScreenProvider?.Invoke();
+            if (virt is not { IsVirtual: true }) return;                            // 没开虚拟外屏：无"副屏"可言
+            if (Environment.TickCount64 < Interlocked.Read(ref _catchUntil)) return;  // 远端刚发起过打开：那窗口多半是远端的
+            if (!NativeApi.IsWindow(hwnd) || !NativeApi.IsWindowVisible(hwnd)) return;
+            if (NativeApi.GetAncestor(hwnd, NativeApi.GA_ROOT) != hwnd) return;
+            if (IsShellWindow(hwnd)) return;
+            var cls = NativeApi.GetClassName(hwnd);
+            bool console = cls.Contains("ConsoleWindow") || cls.Contains("CASCADIA_HOSTING");
+            if (!console && !IsSaneWindow(hwnd)) return;
+            if (!NativeApi.GetWindowRect(hwnd, out var r)) return;
+            int w = r.Right - r.Left, h = r.Bottom - r.Top;
+            if (w < 300 || h < 200) return;                                         // 浮条/小控件不算
+            // 必须整块落在虚拟外屏里（跨屏的不动——可能是远端正在拖拽）
+            if (!(r.Left >= virt.Left && r.Right <= virt.Right && r.Top >= virt.Top && r.Bottom <= virt.Bottom)) return;
+
+            // 最近 15 秒内本机用户动过键鼠（而他看不见副屏）→ 这个窗口多半是他开的、却去了他看不见的地方
+            if (!LocalUserTouchedRecently(15_000)) return;
+
+            NativeApi.GetWindowThreadProcessId(hwnd, out int pid);
+            if (pid == 0 || pid == Environment.ProcessId) return;
+
+            var primary = DisplayHelper.GetMonitors().FirstOrDefault(m => m.IsPrimary);
+            if (primary == null) return;
+            if (NativeApi.IsZoomed(hwnd)) NativeApi.ShowWindow(hwnd, NativeApi.SW_RESTORE);
+            int x = primary.Left + Math.Max(0, (primary.Width - Math.Min(w, primary.Width)) / 2);
+            int y = primary.Top + Math.Max(0, (primary.Height - Math.Min(h, primary.Height)) / 2);
+            if (NativeApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0,
+                    NativeApi.SWP_NOSIZE | NativeApi.SWP_NOZORDER | NativeApi.SWP_NOACTIVATE))
+            {
+                long now = Environment.TickCount64;
+                if (_reversePullLog == 0 || now - _reversePullLog > 3000)
+                {
+                    _reversePullLog = now;
+                    _log.Info($"本机用户刚开的窗口落在了外屏（{ProcessNameOf(pid)} {w}x{h}）→ 已搬回主屏 ({x},{y})");
+                }
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>虚拟外屏信息提供者（由 WorkerContext 注入：副屏判定跟随采集拓扑，而非仅捕获目标）</summary>
+    public Func<DisplayInfo?>? VirtualScreenProvider;
+    private long _reversePullLog;
+
+    /// <summary>
+    /// CREATE 事件的**预定位**（零闪烁的关键）：窗口刚创建、还没显示 —— explorer 这类程序创建窗口时
+    /// 带着它记住的上次位置（在主屏），等 SHOW 再搬主屏已经闪过一帧了（客户视频里"还是要闪一下"）。
+    /// 在它显示之前就挪到外屏：隐藏窗口的挪动在屏幕上没有任何表现，显示出来就直接在副屏。
+    /// 程序若在显示时又自己摆位置，SHOW 钩子/快扫会再抓一次（退化为 1 帧，不会更糟）。
+    /// 只碰"像主窗口"的（有标题栏、非工具窗），隐藏的辅助小窗一个不动。
+    /// </summary>
+    private void PrePositionNewWindow(IntPtr hwnd)
+    {
+        try
+        {
+            var target = _captureTarget;
+            if (target == null) return;
+            // 注意：不做武装期检查 —— 热旋转线程以**打开时刻的基线**过滤，基线里没有的窗口就是
+            // 这次打开带出来的，不需要再验证武装期（避免武装期刚过期时漏掉最后几个窗口）
+            if (!NativeApi.IsWindow(hwnd)) return;
+            if (NativeApi.IsWindowVisible(hwnd))
+            {
+                // CREATE 事件迟到（投递是异步的）：窗口其实已经显示了 —— 不放弃，直接按 SHOW 路径
+                // cloak 捕获（否则要再等 SHOW 事件，多闪几帧）
+                TryCatchWindow(hwnd);
+                return;
+            }
+            if (NativeApi.GetAncestor(hwnd, NativeApi.GA_ROOT) != hwnd) return;         // 只看顶层窗口
+            if (IsShellWindow(hwnd)) return;
+
+            // 只预定位"像主窗口"的：带标题栏且不是工具窗/无边框弹泡 —— 隐藏的辅助窗口
+            // （托盘窗/消息中转窗等）位置可能被程序依赖，不动它们
+            int style = NativeApi.GetWindowStyle(hwnd);
+            const int WS_CAPTION = 0x00C00000;
+            const int WS_TOOLWINDOW = 0x00000080;
+            if ((style & WS_CAPTION) == 0 || (style & WS_TOOLWINDOW) != 0) return;
+
+            NativeApi.GetWindowThreadProcessId(hwnd, out int pid);
+            if (pid == 0 || pid == Environment.ProcessId) return;
+            bool oursByPid, oursByName, oursByNewPid;
+            lock (_catchGate)
+            {
+                oursByPid = pid == _catchPid;
+                oursByName = !string.IsNullOrEmpty(_catchName)
+                             && string.Equals(ProcessNameOf(pid), _catchName, StringComparison.OrdinalIgnoreCase);
+                oursByNewPid = _catchPidsAtArm.Count == 0 || !_catchPidsAtArm.Contains(pid);
+            }
+            if (!(oursByPid || oursByName || oursByNewPid)) return;
+
+            // 分级闸门（与 TryCatchWindow 同一套：①精确认领不设防 / ②同名只防正在动 / ③猜测全套）。
+            // 注意预定位是**隐藏窗口**的搬动，本机毫无视觉影响，但仍要防"把他将要看的东西悄悄挪走"。
+            var arb = Arbiter;
+            bool justOpened = Environment.TickCount64 - _armTick < 4000;   // 打开指令后头 4 秒：同名窗口与指令强相关，按确定认领处理
+            if (!oursByPid && !justOpened && arb != null && arb.LocalActiveRecently) return;
+            if (!oursByPid && !oursByName && LocalUserTouchedRecently()) return;
+
+            if (!NativeApi.GetWindowRect(hwnd, out var r)) return;
+            bool onVirtual = r.Left >= target.Left && r.Left < target.Right &&
+                             r.Top >= target.Top && r.Top < target.Bottom;
+            if (onVirtual) return;   // 创建位置本来就在外屏：不用管
+
+            if (NativeApi.SetWindowPos(hwnd, IntPtr.Zero, target.Left + 24, target.Top + 24, 0, 0,
+                    NativeApi.SWP_NOSIZE | NativeApi.SWP_NOZORDER | NativeApi.SWP_NOACTIVATE))
+            {
+                // explorer 一次打开会连开十来个隐藏辅助窗，全都预定位——日志只记第一条防刷屏
+                long n = Interlocked.Increment(ref _prePosLogCount);
+                if (n <= 2 || n % 20 == 0)
+                    _log.Info($"新窗口显示前已预定位到外屏（{ProcessNameOf(pid)}，创建于主屏 ({r.Left},{r.Top})，本次第 {n} 个）");
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 共用的"抓走它"判据（钩子回调与武装期快扫同走这一条路，保证行为一致）：
+    /// 是这次远程打开带出来的、正落在物理屏 → 立刻搬往外屏。
+    /// </summary>
+    private void TryCatchWindow(IntPtr hwnd)
+    {
+        try
+        {
+            var target = _captureTarget;
+            if (target == null) return;
+            if (Environment.TickCount64 >= Interlocked.Read(ref _catchUntil)) return; // 未武装/已过期就不再动手
+            if (!NativeApi.IsWindow(hwnd) || !NativeApi.IsWindowVisible(hwnd)) return;
+            if (NativeApi.GetAncestor(hwnd, NativeApi.GA_ROOT) != hwnd) return;      // 只看顶层窗口
+            lock (_caughtLock) { if (_caught.Contains(hwnd)) return; }
+
+            // 桌面/任务栏等外壳窗口一票否决（explorer 的桌面窗口尺寸"正常"，混在它的窗口里）
+            if (IsShellWindow(hwnd)) return;
+            var cls = NativeApi.GetClassName(hwnd);
+            // 控制台窗口（cmd/powershell，含 Windows Terminal 宿主）尺寸判据放行，与 Sweep 一致
+            bool console = cls.Contains("ConsoleWindow") || cls.Contains("CASCADIA_HOSTING");
+            if (!console && !IsSaneWindow(hwnd)) return;
+            if (!NativeApi.GetWindowRect(hwnd, out var r)) return;
+            if (r.Right - r.Left < 80 || r.Bottom - r.Top < 40) return;
+            bool onVirtual = r.Left >= target.Left && r.Left < target.Right &&
+                             r.Top >= target.Top && r.Top < target.Bottom;
+            if (onVirtual)
+            {
+                // 已经在外屏（预定位/STARTUPINFO 生效的多数情况）：记账，之后不再反复处理它
+                lock (_caughtLock) { if (_caught.Count > 400) _caught.Clear(); _caught.Add(hwnd); }
+                return;
+            }
+
+            NativeApi.GetWindowThreadProcessId(hwnd, out int pid);
+            if (pid == 0 || pid == Environment.ProcessId) return;
+
+            // 三级认领（认得越准，闸门越松）：
+            //  ① 就是刚启动的那个 pid —— 远程**明确**打开的，毫无疑问；
+            //  ② 同名老进程接管的窗口（单实例程序 / "此电脑"→explorer）—— 很可能是远程的；
+            //  ③ 武装之后才新出现的进程 —— 纯猜测，最可能是本机用户自己开的。
+            bool oursByPid, oursByName, oursByNewPid;
+            lock (_catchGate)
+            {
+                oursByPid = pid == _catchPid;
+                oursByName = !string.IsNullOrEmpty(_catchName)
+                             && string.Equals(ProcessNameOf(pid), _catchName, StringComparison.OrdinalIgnoreCase);
+                oursByNewPid = _catchPidsAtArm.Count == 0 || !_catchPidsAtArm.Contains(pid);
+            }
+            if (!(oursByPid || oursByName || oursByNewPid)) return;
+
+            // 分级闸门（现场教训两头都踩过：不设防→主屏开 Telegram 被搬走；一刀切→远程开的
+            // 「此电脑」因为旁边有人动过鼠标也被扣在主屏）：
+            //  ① 精确认领 → 不设防：远程打开的东西必须去外屏；
+            //  ② 同名认领 → 只防"正在动键鼠"（本机用户双击开同名程序，窗口一般 1.2s 内出来）；
+            //  ③ 猜测认领 → 全套闸门（1.2s + 12 秒内动过即拒）。
+            var arb = Arbiter;
+            bool justOpened = Environment.TickCount64 - _armTick < 4000;   // 打开指令后头 4 秒：同名窗口与指令强相关，按确定认领处理
+            if (!oursByPid && !justOpened && arb != null && arb.LocalActiveRecently) return;
+            if (!oursByPid && !oursByName && LocalUserTouchedRecently()) return;
+
+            // 同名/猜测认领的尺寸护栏（精确认领不受限）：只搬"像正常应用/文件夹窗口"的 ——
+            // 现场抓到过 406x82 的浮条和 2560x1392 的全屏大窗被同名规则搬走，那些是系统/用户的东西。
+            // 正常窗口在 300x200 以上、且不超过主屏的九成（比主屏还大的十有八九是桌面/覆盖层）。
+            if (!oursByPid)
+            {
+                int w = r.Right - r.Left, h = r.Bottom - r.Top;
+                var primary = DisplayHelper.GetMonitors().FirstOrDefault(m => m.IsPrimary);
+                if (primary != null && (w > primary.Width * 0.9 || h > primary.Height * 0.9)) return;
+                if (w < 300 || h < 200) return;
+            }
+
+            lock (_caughtLock) { if (_caught.Count > 400) _caught.Clear(); _caught.Add(hwnd); }
+            string name = ProcessNameOf(pid);
+            _log.Info($"新窗口刚显示就捕获（{name}，类名 {cls}，主屏 ({r.Left},{r.Top}) {r.Right - r.Left}x{r.Bottom - r.Top}，认领={(oursByPid ? "pid" : oursByName ? "同名" : "新进程")}）→ 即刻搬往外屏");
+            // 双保险隐身：SW_HIDE 从屏幕上彻底移除（不依赖 DWMWA_CLOAK 是否生效）+ DWM cloak。
+            // 搬完在副屏恢复显示。v1.2.5 真机帧级实测：仅靠 cloak 仍有 2 帧可见（cloak 可能被系统忽略）。
+            NativeApi.ShowWindow(hwnd, NativeApi.SW_HIDE);
+            NativeApi.CloakWindow(hwnd);
+            try { MoveToTargetCore(hwnd, name, force: true); }
+            finally
+            {
+                NativeApi.UncloakWindow(hwnd);
+                NativeApi.ShowWindow(hwnd, NativeApi.SW_SHOWNOACTIVATE);  // 在副屏恢复显示（不抢焦点）
+            }
+        }
+        catch { }
     }
 
     /// <summary>关闭进程（直接杀，策划 §3.1 右键菜单「关闭(退出)」）</summary>
@@ -369,17 +953,31 @@ public sealed class WindowManager
                 }
 
                 // 3) 单实例应用（微信/Edge 二次点击）常常是"已有进程接管"，启动的 pid 立刻退出 →
-                //    按进程名找窗口，这样也照样能把它摆到副屏。
+                //    按进程名找窗口，这样也照样能把它摆到副屏（同名认领：只防"正在动键鼠"，
+                //    与捕获链的分级闸门一致；基线过滤仍生效 —— 只认新出现的窗口）。
                 if (p.HasExited || i % 5 == 0)
                 {
-                    var byName = FindWindowsByName(p.ProcessName);
-                    if (byName.Count > 0)
+                    var arb = Arbiter;
+                    bool justOpened = Environment.TickCount64 - _armTick < 4000;
+                    if (!justOpened && arb != null && arb.LocalActiveRecently)
                     {
-                        var h = byName.OrderByDescending(WindowWidth).First();
-                        _log.Info($"找到 {p.ProcessName} 的窗口 {h}（按进程名匹配）");
-                        MoveToTargetCore(h, p.ProcessName, force: true);
-                        moved = h; movedAt = i;
-                        continue;
+                        if (_lastByNameSkipLog == 0 || Environment.TickCount64 - _lastByNameSkipLog > 5000)
+                        {
+                            _lastByNameSkipLog = Environment.TickCount64;
+                            _log.Info("本机用户正在操作：按进程名找窗的兜底本轮跳过（不抢他刚开的窗口）");
+                        }
+                    }
+                    else
+                    {
+                        var byName = FindWindowsByName(p.ProcessName);
+                        if (byName.Count > 0)
+                        {
+                            var h = byName.OrderByDescending(WindowWidth).First();
+                            _log.Info($"找到 {p.ProcessName} 的窗口 {h}（按进程名匹配）");
+                            MoveToTargetCore(h, p.ProcessName, force: true);
+                            moved = h; movedAt = i;
+                            continue;
+                        }
                     }
                 }
 
@@ -431,7 +1029,7 @@ public sealed class WindowManager
         }
     }
 
-    /// <summary>枚举某个进程的可见顶层窗口（排除退化小窗）</summary>
+    /// <summary>枚举某个进程的可见顶层窗口（排除退化小窗与桌面/任务栏等外壳窗口 —— explorer 的桌面窗口就混在它的窗口里）</summary>
     private static List<IntPtr> FindWindowsByPid(int pid)
     {
         var list = new List<IntPtr>();
@@ -441,7 +1039,7 @@ public sealed class WindowManager
             NativeApi.EnumWindows((h, _) =>
             {
                 NativeApi.GetWindowThreadProcessId(h, out int wpid);
-                if (wpid == pid && NativeApi.IsWindowVisible(h) && IsSaneWindow(h)) list.Add(h);
+                if (wpid == pid && NativeApi.IsWindowVisible(h) && !IsShellWindow(h) && IsSaneWindow(h)) list.Add(h);
                 return true;
             }, IntPtr.Zero);
         }
@@ -449,15 +1047,20 @@ public sealed class WindowManager
         return list;
     }
 
-    /// <summary>按进程名枚举可见顶层窗口（单实例应用：启动进程立刻退出时用）</summary>
-    private static List<IntPtr> FindWindowsByName(string procName)
+    /// <summary>按进程名枚举可见顶层应用窗口（单实例应用：启动进程立刻退出时用）。
+    /// 只认"基线快照之后才出现的"窗口（基线没拍过就不过滤）—— explorer 这类常驻程序
+    /// 按名字能找到本机用户早已开着的十几个窗口，不过滤就会把别人的窗口搬走。
+    /// 外壳窗口（桌面/任务栏，同属 explorer 进程）一律排除。</summary>
+    private List<IntPtr> FindWindowsByName(string procName)
     {
         var list = new List<IntPtr>();
+        var baseline = TakeBaselineSnapshot();
         try
         {
             NativeApi.EnumWindows((h, _) =>
             {
-                if (!NativeApi.IsWindowVisible(h) || !IsSaneWindow(h)) return true;
+                if (!NativeApi.IsWindowVisible(h) || !IsSaneWindow(h) || IsShellWindow(h)) return true;
+                if (baseline.Count > 0 && baseline.Contains(h)) return true;   // 老窗口：不是这次打开带出来的
                 NativeApi.GetWindowThreadProcessId(h, out int wpid);
                 if (wpid <= 0) return true;
                 try
@@ -526,6 +1129,23 @@ public sealed class WindowManager
     public CursorArbiter? Arbiter { get; set; }
 
     /// <summary>
+    /// 本机用户最近 windowMs 毫秒内是否有过**任何物理输入**（鼠标/键盘，远端注入不算）。
+    /// 用于所有"把新窗口搬到外屏"的路径：本机用户刚动过（哪怕已停手几秒 —— 双击开程序到窗口
+    /// 真正显示就是这种"动一下、等几秒"的形态）→ 新窗口多半是他开的，一个不碰。
+    ///
+    /// 【为什么不比较"最近输入是本机还是远端"】上一版试过（v1.1.2）：远端用户看画面时鼠标
+    /// 一直在动，远端输入时间戳被持续刷新、几乎永远比本机新，判据形同虚设 —— 客户视频里
+    /// "主屏开任何软件都被传到副屏"就是这么漏的。改成只看本机：本机 12 秒内动过就拒绝，
+    /// 远端在不在动无关紧要（远端要搬的东西本来就只在副屏内部，不需要跟本机比先后）。
+    /// </summary>
+    private bool LocalUserTouchedRecently(int windowMs = 12_000)
+    {
+        var arb = Arbiter;
+        if (arb == null) return false;
+        return Environment.TickCount64 - arb.LastPhysicalInputTick < windowMs;
+    }
+
+    /// <summary>
     /// 把窗口摆到采集屏（副屏）。
     ///
     /// force=true：**不管窗口现在在哪，一律挪过去**。被控端自己启动的（也就是远程打开的）窗口走这条 ——
@@ -540,6 +1160,13 @@ public sealed class WindowManager
     {
         var target = _captureTarget;
         if (target == null) return;
+        // 外壳窗口（桌面/任务栏）无条件拒绝：它们跟着 explorer 进程混进各种"找窗口"的路径，
+        // 被挪走 = 用户的整个桌面/任务栏消失。这是所有搬移动作的最后一道闸。
+        if (IsShellWindow(hwnd))
+        {
+            _log.Warn($"拒绝搬动外壳窗口 {hwnd}（桌面/任务栏）：{name}");
+            return;
+        }
         if (!NativeApi.GetWindowRect(hwnd, out var r)) return;
 
         bool overlaps = r.Right > target.Left && r.Left < target.Right

@@ -3,7 +3,7 @@
   一键构建远程控制软件全部产物到 build\ 目录。
 
 .DESCRIPTION
-  - Agent.Common / Agent.Coordinator / Agent.Worker （C# .NET 8）
+  - Agent.Common / Agent.Coordinator（内置采集引擎，2026-10 起单进程）（C# .NET 8）
   - Viewer （C# WPF .NET 8）
   - Server （Go）
   - 单元测试
@@ -63,8 +63,8 @@ function Publish($proj, $outDir) {
     if ($LASTEXITCODE -ne 0) { Fail "发布失败：$proj" }
 }
 
+# 2026-10 进程合并：Agent.Worker 是 Coordinator 的类库依赖，随 Coordinator 的 publish 一起输出（不再单独发布）
 Publish (Join-Path $RepoRoot "src\Agent\Agent.Coordinator\Agent.Coordinator.csproj") (Join-Path $build "agent")
-Publish (Join-Path $RepoRoot "src\Agent\Agent.Worker\Agent.Worker.csproj")           (Join-Path $build "agent")
 Publish (Join-Path $RepoRoot "src\Viewer\Viewer.csproj")                             (Join-Path $build "viewer")
 Publish (Join-Path $RepoRoot "src\Tests\E2E\E2E.csproj")                            (Join-Path $build "tests")
 Publish (Join-Path $RepoRoot "src\Tools\LicenseKeygen\LicenseKeygen.csproj")        (Join-Path $build "tools")
@@ -73,29 +73,34 @@ Publish (Join-Path $RepoRoot "src\Tools\LicenseKeygen\LicenseKeygen.csproj")    
 # 分发出去的主控端就是"双击即用"的（令牌不该让客户去改配置文件）。
 # 要出分发包请跑 scripts\build-viewer-package.py（顺带打出 build\主控端安装包.zip）。
 Step "写入主控端预置值（viewer-defaults.txt）"
+# 【总会写】本机没有 E:\RemoteControl\viewer\config 时也必须写（2026-10-05 三次踩坑：打包清空 build\viewer
+# 后没回写，裸目录的主控端落回 127.0.0.1 默认值，表现为"打不开"）。令牌从仓库 config\relay-token.txt 读
+# （gitignore 已排除，不入版本库）；文件不存在则只写服务器地址。
 $viewerDefaults = Join-Path $build "viewer\viewer-defaults.txt"
-$srcCfg = "E:\RemoteControl\viewer\config\viewer.json"
-if (Test-Path $srcCfg) {
-    try {
-        $vj = Get-Content $srcCfg -Raw | ConvertFrom-Json
-        if ($vj.ServerUrl -and $vj.AgentToken) {
-            Set-Content -Path $viewerDefaults -Encoding UTF8 -Value @(
-                "# 主控端预置值（打包时写入）。config\viewer.json 里为空的项会用这里的值补齐。",
-                "ServerUrl=$($vj.ServerUrl)",
-                "Token=$($vj.AgentToken)"
-            )
-            Write-Host "  已写入（令牌长度 $($vj.AgentToken.Length)）" -ForegroundColor Green
-        } else {
-            Write-Host "  警告：$srcCfg 里缺 ServerUrl/AgentToken，跳过" -ForegroundColor Yellow
-        }
-    } catch { Write-Host "  警告：读 $srcCfg 失败：$_" -ForegroundColor Yellow }
-} else {
-    Write-Host "  警告：找不到 $srcCfg，跳过（分发前请跑 scripts\build-viewer-package.py）" -ForegroundColor Yellow
-}
+$relayTokenFile = Join-Path $RepoRoot "config\relay-token.txt"
+$relayToken = if (Test-Path -LiteralPath $relayTokenFile) { (Get-Content $relayTokenFile -Raw).Trim() } else { "" }
+$defaultsLines = @(
+    "# 主控端预置值（打包时自动生成）。config\viewer.json 里为空的项会用这里的值补齐。",
+    "ServerUrl=ws://__RELAY_HOST__:18080/ws"
+)
+if ($relayToken) { $defaultsLines += "Token=$relayToken" }
+Set-Content -Path $viewerDefaults -Encoding UTF8 -Value $defaultsLines
+Write-Host "viewer-defaults.txt 已写入（server=__RELAY_HOST__:18080 hasToken=$([bool]$relayToken)）"
 
 Step "构建 Go 中继服务器"
+if (-not (Test-Path $go)) {
+    # 没装 Go 工具链的机器（例如纯打包机）跳过服务器构建：被控端/主控端安装包都不含服务器二进制，
+    # 要部署/更新中继时再在有 Go 的机器上跑（或直接用 build\server 里已编译好的产物）。
+    Write-Host "  跳过：找不到 $go（不影响被控端/主控端安装包）" -ForegroundColor Yellow
+} else {
 New-Item -ItemType Directory -Force -Path (Join-Path $build "server") | Out-Null
 Push-Location (Join-Path $RepoRoot "src\Server")
+    # 用本机 Go、国内代理：不自动下载新工具链（离线/慢网下会卡死打包）
+    $env:GOTOOLCHAIN = "local"
+    $env:GOPROXY = "https://goproxy.cn,direct"
+    # PowerShell 会把会话里的 http(s)_proxy 传给 go（Clash 掉线时 7897 连不上就卡死打包），构建期显式清掉
+    Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
+    Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
 try {
     & $go build -trimpath -ldflags "-s -w" -o (Join-Path $build "server\rcserver.exe") .
     if ($LASTEXITCODE -ne 0) { Fail "Go 构建失败" }
@@ -112,6 +117,7 @@ try {
     Remove-Item Env:GOOS -ErrorAction SilentlyContinue
     Remove-Item Env:GOARCH -ErrorAction SilentlyContinue
 } finally { Pop-Location }
+}
 
 if (-not $SkipTests) {
     Step "运行单元测试"
@@ -145,12 +151,16 @@ foreach ($target in @("viewer", "agent")) {
     # 以前这里拷的是 docs\*.md 全量，等于把内部资料一起发给客户。
     Copy-Item (Join-Path $RepoRoot "docs\使用说明.md") $d -Force -ErrorAction SilentlyContinue
 }
-Write-Host "docs 已拷贝到 buildiewer\docs 与 buildgent\docs"
+Write-Host "docs 已拷贝到 buildiewer\docs 与 buildgent\docs"
 
 $drv = Join-Path $RepoRoot "drivers"
 if (Test-Path $drv) {
+    # RDPWrap 不进产物（2026-10）：多会话方案已删除，且 RDPW 安装器会被 Windows Defender
+    # 当作"潜在垃圾软件"隔离 —— 拷进去会让 Inno 打包在压缩阶段直接失败。
     Copy-Item $drv (Join-Path $build "agent\drivers") -Recurse -Force
-    Write-Host "drivers 已拷贝到 build\agent\drivers"
+    $strayRdp = Join-Path $build "agent\drivers\RDPWrap"
+    if (Test-Path -LiteralPath $strayRdp) { Remove-Item -LiteralPath $strayRdp -Recurse -Force }
+    Write-Host "drivers 已拷贝到 build\agent\drivers（RDPWrap 除外）"
 }
 
 Step "构建完成"

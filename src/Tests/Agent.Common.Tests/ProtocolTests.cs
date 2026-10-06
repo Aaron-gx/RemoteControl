@@ -98,7 +98,7 @@ public class ProtocolTests
     public void 一帧拆成多段也能解析()
     {
         var frame = new ProtocolMessage(MessageType.VideoFrame, new byte[5000]).ToFrame();
-        var acc = new FrameAccumulator(ipcFraming: false);
+        var acc = new FrameAccumulator();
         var results = new List<ProtocolMessage>();
         foreach (var b in frame)
         {
@@ -116,7 +116,7 @@ public class ProtocolTests
         for (int i = 0; i < 10; i++)
             new ProtocolMessage(MessageType.KeyEvent, PayloadCodec.EncodeKey((ushort)i, false)).WriteTo(ms);
         var data = ms.ToArray();
-        var acc = new FrameAccumulator(ipcFraming: false);
+        var acc = new FrameAccumulator();
         acc.Append(data, 0, data.Length);
         var results = new List<ProtocolMessage>();
         acc.Drain(results);
@@ -208,47 +208,7 @@ public class PayloadCodecTests
     }
 }
 
-public class IpcProtocolTests
-{
-    [Fact]
-    public void IPC帧_往返一致()
-    {
-        var msg = new ProtocolMessage(MessageType.MouseButton, PayloadCodec.EncodeMouseButton(10, 20, 0, false));
-        var wrapped = IpcProtocol.Wrap(msg);
-        var parsed = IpcProtocol.TryParse(wrapped, out int consumed);
-        Assert.NotNull(parsed);
-        Assert.Equal(msg.Type, parsed!.Type);
-        Assert.Equal(msg.Payload, parsed.Payload);
-        Assert.Equal(wrapped.Length, consumed);
-    }
 
-    [Fact]
-    public void IPC_多条消息依次解析()
-    {
-        using var ms = new MemoryStream();
-        var sent = new List<ProtocolMessage>();
-        for (int i = 0; i < 5; i++)
-        {
-            var m = new ProtocolMessage(MessageType.KeyEvent, PayloadCodec.EncodeKey((ushort)(i + 65), i % 2 == 0, 0));
-            sent.Add(m);
-            IpcProtocol.WriteTo(ms, m);
-        }
-        ms.Position = 0;
-        var got = new List<ProtocolMessage>();
-        ProtocolMessage? m2;
-        while ((m2 = IpcProtocol.ReadFrom(ms)) != null) got.Add(m2);
-        Assert.Equal(sent.Count, got.Count);
-        for (int i = 0; i < sent.Count; i++)
-            Assert.Equal(sent[i].Payload, got[i].Payload);
-    }
-
-    [Fact]
-    public void IPC_半包返回null()
-    {
-        var wrapped = IpcProtocol.Wrap(new ProtocolMessage(MessageType.Error, new byte[50]));
-        Assert.Null(IpcProtocol.TryParse(wrapped.AsSpan(0, wrapped.Length - 1), out _));
-    }
-}
 
 public class JsonCodecTests
 {
@@ -346,7 +306,7 @@ public class DirectLinkTests
         // 直连只是换传输层，帧格式必须与线上协议完全相同（便于主控端复用解析）
         var payload = PayloadCodec.EncodeVideoFrame(12345, new byte[] { 0, 0, 0, 1, 0x65 });
         var frame = new ProtocolMessage(MessageType.VideoFrame, payload).ToFrame();
-        var acc = new FrameAccumulator(ipcFraming: false);
+        var acc = new FrameAccumulator();
         acc.Append(frame, 0, frame.Length);
         var list = new List<ProtocolMessage>();
         acc.Drain(list);

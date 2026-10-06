@@ -3,7 +3,7 @@
   打包主控端安装程序（Inno Setup 正式安装程序）。
 
 .DESCRIPTION
-  产物：build\setup-viewer\远程控制主控端-安装程序.exe —— 与被控端同一套形态的标准 Windows 安装程序：
+  产物：build\setup-viewer\虚拟服务器客户端-安装程序.exe —— 与被控端同一套形态的标准 Windows 安装程序：
     · 标准安装向导（欢迎 / 安装位置 / 附加任务 / 连接设置 / 安装 / 完成）
     · 装进 Program Files，注册到「应用和功能」，带卸载器与开始菜单入口
     · 支持 /SILENT、/VERYSILENT 等标准无人值守参数
@@ -20,7 +20,7 @@
 param(
     [string]$RepoRoot = "",
     [string]$ToolsRoot = "E:\tools",
-    [string]$ServerUrl = "",       # 形如 156.225.30.231:18080（不带 ws:// 与 /ws）
+    [string]$ServerUrl = "",       # 形如 __RELAY_HOST__:18080（不带 ws:// 与 /ws）
     [string]$Token = "",           # 预置连接口令
     [switch]$SkipViewerBuild       # 跳过 dotnet publish（用现有 build\viewer）
 )
@@ -54,7 +54,7 @@ if ((-not $ServerUrl -or -not $Token) -and (Test-Path -LiteralPath $cfgPath)) {
         Write-Host "预置值来源：$cfgPath" -ForegroundColor Green
     } catch { Write-Host "读取 $cfgPath 失败（继续用命令行参数/默认值）：$_" -ForegroundColor Yellow }
 }
-if (-not $ServerUrl) { $ServerUrl = "156.225.30.231:18080" }
+if (-not $ServerUrl) { $ServerUrl = "__RELAY_HOST__:18080" }
 if (-not $Token) { Write-Host "⚠ 没有可用的连接口令：装出来的主控端在启用鉴权的中继上连不上（可用 -Token 指定）" -ForegroundColor Yellow }
 Write-Host "预置服务器：$ServerUrl    口令长度：$($Token.Length)"
 
@@ -106,7 +106,7 @@ if ($Token) { $isccArgs += "/DDefaultToken=$Token" }
 & $iscc @isccArgs $iss
 if ($LASTEXITCODE -ne 0) { throw "Inno 编译失败（退出码 $LASTEXITCODE）" }
 
-$setupExe = Join-Path $out "远程控制主控端-安装程序.exe"
+$setupExe = Join-Path $out "虚拟服务器客户端-安装程序.exe"
 if (-not (Test-Path -LiteralPath $setupExe)) { throw "没有产出 $setupExe" }
 if ($Token) { Write-Host "   已把连接口令内嵌进安装程序（前 6 位 $($Token.Substring(0,6))…）：单独拷这一个 exe 也带着口令" -ForegroundColor Green }
 else { Write-Host "   ⚠ 本次没有内嵌连接口令（未传 -Token）" -ForegroundColor Yellow }
@@ -115,6 +115,6 @@ $sizeMb = [math]::Round((Get-Item -LiteralPath $setupExe).Length / 1MB, 1)
 Write-Host "`n=== 构建完成 ===" -ForegroundColor Cyan
 Write-Host "  安装程序：$setupExe（$sizeMb MB）"
 Write-Host "  用法：把这一个 exe 拷到目标电脑 → 双击 → 按向导装（也可 /VERYSILENT 静默装）"
-Write-Host "        静默安装示例：远程控制主控端-安装程序.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+Write-Host "        静默安装示例：虚拟服务器客户端-安装程序.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
 Write-Host "  卸载：设置 → 应用 → 已安装的应用 → 远程控制 · 主控端 → 卸载"
 Write-Host "  预置服务器：$ServerUrl（向导里可改；也可用同目录 setup-defaults.ini 覆盖口令）"

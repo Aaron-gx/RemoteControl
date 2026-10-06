@@ -3,7 +3,7 @@
   打包被控端安装包（Inno Setup 正式安装程序）。
 
 .DESCRIPTION
-  产物：build\setup-agent\远程控制被控端-安装程序.exe —— 一个标准的 Windows 安装程序：
+  产物：build\setup-agent\虚拟服务器-安装程序.exe —— 一个标准的 Windows 安装程序：
     · 标准安装向导（欢迎 / 安装位置 / 附加任务 / 连接设置 / 安装 / 完成）
     · 装进 Program Files，注册到「应用和功能」，带卸载器与开始菜单入口
     · 支持 /SILENT、/VERYSILENT 等标准无人值守参数
@@ -22,7 +22,7 @@
 param(
     [string]$RepoRoot = "",
     [string]$ToolsRoot = "E:\tools",
-    [string]$RelayServer = "156.225.30.231:18080",
+    [string]$RelayServer = "__RELAY_HOST__:18080",
     [string]$Token = "",            # 预置中继令牌（会写进 setup-defaults.ini）
     [switch]$SkipAgentBuild,        # 跳过 dotnet publish（用现有 build\agent）
     [switch]$AlsoLegacyExe          # 额外产出自制版单文件安装器（老脚本分发用，+210MB）
@@ -64,6 +64,9 @@ if (-not $SkipAgentBuild) {
     Write-Host "1) 构建被控端程序 + ffmpeg..." -ForegroundColor Cyan
     & (Join-Path $PSScriptRoot "build-all.ps1") -RepoRoot $RepoRoot -ToolsRoot $ToolsRoot -SkipTests
     if ($LASTEXITCODE -ne 0) { throw "build-all.ps1 失败" }
+    # 防御：build-all 若带入 RDPWrap（老版本步骤），就地删掉 —— 它会被 Defender 隔离导致 Inno 编译失败
+    $strayRdp = Join-Path $agentDir "drivers\RDPWrap"
+    if (Test-Path -LiteralPath $strayRdp) { Remove-Item -LiteralPath $strayRdp -Recurse -Force }
 } else {
     Write-Host "1) 跳过构建，使用现有 build\agent" -ForegroundColor Yellow
 }
@@ -79,10 +82,12 @@ $ffDst = Join-Path $agentDir "third_party\ffmpeg"
 New-Item -ItemType Directory -Force -Path $ffDst | Out-Null
 Copy-Item -LiteralPath $ffSrc (Join-Path $ffDst "ffmpeg.exe") -Force
 
-# 驱动随程序目录一起部署：install-agent.ps1 装 RDPWrap / 虚拟屏时从这里取
+# 驱动随程序目录一起部署：install-agent.ps1 装虚拟屏时从这里取。
+# RDPWrap 不再随包（2026-10）：多会话方案删除后没有任何代码用它，且 RDPW 安装器
+# 会被 Windows Defender 当作"潜在垃圾软件"拦截，导致 Inno 压缩阶段直接失败。
 $drvSrc = Join-Path $RepoRoot "drivers"
 if (-not (Test-Path -LiteralPath $drvSrc)) { throw "缺少 $drvSrc" }
-robocopy $drvSrc (Join-Path $agentDir "drivers") /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+robocopy $drvSrc (Join-Path $agentDir "drivers") /MIR /XD RDPWrap /NFL /NDL /NJH /NJS /NP | Out-Null
 
 # 安装期不带着运行期产物走（升级时要保留机器上的 config/logs，Inno 也不会覆盖）
 foreach ($junk in @("config", "logs")) {
@@ -106,7 +111,7 @@ if ($LASTEXITCODE -ne 0) { throw "Inno 编译失败（退出码 $LASTEXITCODE）
 if ($Token) { Write-Host "   已把连接口令内嵌进安装程序（前 6 位 $($Token.Substring(0,6))…）：单独拷这一个 exe 也带着口令" -ForegroundColor Green }
 else { Write-Host "   ⚠ 本次没有内嵌连接口令（未传 -Token）：向导里口令会为空，服务器启用鉴权时装完连不上" -ForegroundColor Yellow }
 
-$setupExe = Join-Path $out "远程控制被控端-安装程序.exe"
+$setupExe = Join-Path $out "虚拟服务器-安装程序.exe"
 if (-not (Test-Path -LiteralPath $setupExe)) { throw "没有产出 $setupExe" }
 
 # 同目录再放一份 setup-defaults.ini（向导会读它覆盖内嵌值；运维改口令时不必重编安装包）
@@ -152,7 +157,6 @@ foreach ($m in @(
     $setupExe,
     (Join-Path $agentDir "Agent.Coordinator.exe"),
     (Join-Path $agentDir "third_party\ffmpeg\ffmpeg.exe"),
-    (Join-Path $agentDir "drivers\RDPWrap\rdpwrap.ini"),
     (Join-Path $agentDir "drivers\VirtualDisplayDriver"),
     (Join-Path $RepoRoot "scripts\install-agent.ps1"),
     (Join-Path $RepoRoot "scripts\uninstall-agent.ps1")
@@ -168,7 +172,7 @@ Write-Host  "  卸载：设置 → 应用 → 已安装的应用 → 远程控�
 if (Test-Path -LiteralPath $defaults) { Write-Host "  预置令牌：$defaults（随包分发，装的时候自动填好）" }
 
 # ---------------------------------------------------------------- 6. 分发用 zip（可选）
-$zip = Join-Path $RepoRoot "build\被控端安装包.zip"
+$zip = Join-Path $RepoRoot "build\虚拟服务器-安装包.zip"
 try {
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     $zipItems = @($setupExe)

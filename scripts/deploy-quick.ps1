@@ -23,14 +23,12 @@ $env:NUGET_PACKAGES = Join-Path $ToolsRoot "nuget-packages"
 $dotnet = Join-Path $env:DOTNET_ROOT "dotnet.exe"
 $out = Join-Path $RepoRoot "build\agent"
 
-Write-Host "1) 发布 Agent（Coordinator + Worker）..." -ForegroundColor Cyan
-foreach ($proj in @("src\Agent\Agent.Coordinator\Agent.Coordinator.csproj", "src\Agent\Agent.Worker\Agent.Worker.csproj")) {
-    $full = Join-Path $RepoRoot $proj
-    & $dotnet publish $full -c Release -r win-x64 --self-contained true -o $out --nologo -v minimal
-    if ($LASTEXITCODE -ne 0) { Write-Host "发布失败：$proj" -ForegroundColor Red; exit 1 }
-}
+Write-Host "1) 发布 Agent（Coordinator，内置采集引擎；Agent.Worker 是它的类库依赖，随包一起出）..." -ForegroundColor Cyan
+$full = Join-Path $RepoRoot "src\Agent\Agent.Coordinator\Agent.Coordinator.csproj"
+& $dotnet publish $full -c Release -r win-x64 --self-contained true -o $out --nologo -v minimal
+if ($LASTEXITCODE -ne 0) { Write-Host "发布失败：$full" -ForegroundColor Red; exit 1 }
 
-Write-Host "2) 停止旧进程（协调器也持有 Agent.Common.dll，必须先停，否则 robocopy 会静默跳过被锁文件）..." -ForegroundColor Cyan
+Write-Host "2) 停止旧进程（协调器持有 Agent.*.dll，必须先停，否则 robocopy 会静默跳过被锁文件；Agent.Worker 是旧版残留进程，顺手清掉）..." -ForegroundColor Cyan
 Get-Process -Name 'Agent.Coordinator', 'Agent.Worker', 'ffmpeg' -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 3
 
@@ -41,20 +39,19 @@ robocopy $out $InstallDir /MIR `
         (Join-Path $InstallDir "third_party") (Join-Path $InstallDir "drivers") `
         (Join-Path $InstallDir "docs") `
     /NFL /NDL /NJH /NJS /NP | Out-Null
-# 注意：third_party（ffmpeg）与 drivers 不在 buildgent 里（由 build-all.ps1 额外拷贝），
+# 注意：third_party（ffmpeg）与 drivers 不在build\agent 里（由 build-all.ps1 额外拷贝），
 # 必须从 /MIR 的删除范围里排除，否则每次部署都会把它们从运行目录删掉 → 被控端找不到 ffmpeg 直接不起画面。
 
-Write-Host "4) 重新启动协调器（它会复用已有 RDP 会话并拉起 Worker）..." -ForegroundColor Cyan
+Write-Host "4) 重新启动协调器（采集引擎是它内部的线程，看 coordinator-*.log 里"采集引擎启动"即为就绪）..." -ForegroundColor Cyan
 Start-Process -FilePath (Join-Path $InstallDir 'Agent.Coordinator.exe') -WorkingDirectory $InstallDir
 for ($i = 0; $i -lt 24; $i++) {
     Start-Sleep -Seconds 5
-    $w = Get-Process -Name 'Agent.Worker' -ErrorAction SilentlyContinue
     $c = Get-Process -Name 'Agent.Coordinator' -ErrorAction SilentlyContinue
-    if ($w -and $c) {
-        Write-Host ("   Worker 已运行 pid=" + $w.Id + " session=" + $w.SessionId) -ForegroundColor Green
+    if ($c) {
+        Write-Host ("   协调器已运行 pid=" + $c.Id) -ForegroundColor Green
         exit 0
     }
     Write-Host "   等待中（$($i*5+5)s）..."
 }
-Write-Host "警告：Worker 尚未启动，请查看协调器日志" -ForegroundColor Yellow
+Write-Host "警告：协调器尚未启动，请查看协调器日志" -ForegroundColor Yellow
 exit 0

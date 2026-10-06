@@ -252,9 +252,9 @@ public sealed class RemoteScreenControl : Image
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
         SetCursor(x, y);
-        // 物理屏区域：不直接把点击送过去（那会打扰本机用户），而是"把这里点的那个窗口搬到副屏"。
-        // 这样主控端看到主屏上有什么，就能把它拉过来操作 —— 而不是让被控端自动乱搬窗口。
-        if (InReadOnlyRegion(x, y)) { RemotePullWindow?.Invoke(x, y); return; }
+        // 物理屏区域：**纯监视**（2026-10-05 客户要求"取消所有鼠标操作，只监视"）
+        // 不转发点击（不打扰本机用户）、也不拉窗口（想搬窗口用软件列表右键「搬到副屏」）
+        if (InReadOnlyRegion(x, y)) return;
         RemoteMouseButton?.Invoke(x, y, ButtonIndex(e.ChangedButton), false);
         e.Handled = true;
     }

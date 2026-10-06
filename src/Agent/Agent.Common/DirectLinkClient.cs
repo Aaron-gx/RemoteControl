@@ -162,7 +162,7 @@ public sealed class DirectLinkClient : IDisposable
 
     private void ReadLoop()
     {
-        var acc = new FrameAccumulator(ipcFraming: false);
+        var acc = new FrameAccumulator();
         var buf = new byte[64 * 1024];
         var pending = new List<ProtocolMessage>(64);
         try

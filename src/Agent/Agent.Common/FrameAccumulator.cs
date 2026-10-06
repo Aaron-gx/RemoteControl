@@ -1,20 +1,17 @@
 namespace Agent.Common;
 
 /// <summary>
-/// 流式分帧缓冲：往里面喂任意字节，按帧格式吐完整消息。
-/// 用于 Named Pipe / WebSocket 等"可能被拆包"的通道。
+/// 流式分帧缓冲：往里面喂任意字节，按线上协议帧格式吐完整消息。
+/// 用于 WebSocket / TCP 这类"可能被拆包"的通道。
+/// （旧版还有一个 ipcFraming 长度前缀模式，仅供跨进程 Named Pipe 使用 —— 进程合并后已随 IPC 一起删除。）
 /// </summary>
 public sealed class FrameAccumulator
 {
     private byte[] _buf;
     private int _len;
 
-    /// <summary>IPC 帧（4 字节长度前缀 + 协议帧）还是裸协议帧</summary>
-    public bool IpcFraming { get; }
-
-    public FrameAccumulator(bool ipcFraming, int initialCapacity = 64 * 1024)
+    public FrameAccumulator(int initialCapacity = 64 * 1024)
     {
-        IpcFraming = ipcFraming;
         _buf = new byte[initialCapacity];
         _len = 0;
     }
@@ -32,12 +29,7 @@ public sealed class FrameAccumulator
         int pos = 0;
         while (pos < _len)
         {
-            ProtocolMessage? msg;
-            int consumed;
-            if (IpcFraming)
-                msg = IpcProtocol.TryParse(_buf.AsSpan(pos, _len - pos), out consumed);
-            else
-                msg = ProtocolMessage.TryParse(_buf.AsSpan(pos, _len - pos), out consumed);
+            var msg = ProtocolMessage.TryParse(_buf.AsSpan(pos, _len - pos), out int consumed);
             if (msg == null) break;
             output.Add(msg);
             pos += consumed;

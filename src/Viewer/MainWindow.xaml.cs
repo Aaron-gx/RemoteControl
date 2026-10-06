@@ -1,9 +1,11 @@
 using System.Diagnostics;
+using System.IO;
 using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Documents;
 using System.Windows.Media;
 using Agent.Common;
 using Viewer.Models;
@@ -153,6 +155,7 @@ public partial class MainWindow : Window
             _ws.Queue(new ProtocolMessage(MessageType.RequestSoftwareList, PayloadCodec.Empty()));
             SendInputMode();       // 每次连上都重新告知鼠标模式（被控端可能刚重启）
             SendCaptureMode();     // 画面范围同理
+            _ = CheckUpdateAsync();   // 顺带查一次更新（清单没有/验签不过=安静无事）
         });
 
         _ws.Disconnected += reason => Dispatcher.Invoke(() =>
@@ -287,10 +290,12 @@ public partial class MainWindow : Window
         SoftwareList.MouseRightButtonUp += (_, _) =>
         {
             var item = SoftwareList.SelectedItem as RemoteSoftware;
-            MenuOpen.IsEnabled = item != null && !item.IsRunning;
-            MenuClose.IsEnabled = item != null && item.IsRunning && item.Pid > 0;
+            bool isPc = item?.IsThisPc == true;
+            // 「此电脑」始终可打开（explorer 常驻谈不上"运行中"）；关闭/搬动需要 pid，它没有 —— 禁用
+            MenuOpen.IsEnabled = isPc || (item != null && !item.IsRunning);
+            MenuClose.IsEnabled = !isPc && item != null && item.IsRunning && item.Pid > 0;
             // "搬到副屏"：已经打开、而且知道 pid 才可用（被控端靠 pid 找它的窗口）
-            MenuMove.IsEnabled = item != null && item.IsRunning && item.Pid > 0;
+            MenuMove.IsEnabled = !isPc && item != null && item.IsRunning && item.Pid > 0;
         };
         MenuOpen.Click += (_, _) => OpenSelectedSoftware();
         MenuClose.Click += (_, _) => CloseSelectedSoftware();
@@ -599,6 +604,8 @@ public partial class MainWindow : Window
     /// <summary>
     /// 自动把这个远程文件收下来，并放进**本机剪贴板**（文件拖放格式），
     /// 让用户在自己电脑的资源管理器里直接 Ctrl+V 粘出来。
+    /// 文件夹（2026-10 新增）：下载到的是 zip → 解压成目录 → 把**目录**放进本机剪贴板，
+    /// 粘贴出来的就是一个文件夹（体验与单文件一致）。
     /// 失败时明确写在界面上 —— 文件这条链路上静默失败最让人抓瞎（现场反馈过）。
     /// </summary>
     private async Task AutoReceiveRemoteFileAsync(ClipboardFileInfo info)
@@ -607,7 +614,7 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() =>
             {
-                ClipboardHint.Text = $"⬇ 正在接收 {info.FileName}…";
+                ClipboardHint.Text = info.IsFolder ? $"⬇ 正在接收文件夹 {info.FolderName}…" : $"⬇ 正在接收 {info.FileName}…";
                 _pendingFiles.RemoveAll(f => f.FileId == info.FileId);
                 _pendingFiles.Add(info);
             });
@@ -619,14 +626,35 @@ public partial class MainWindow : Window
                 Dispatcher.Invoke(() => ClipboardHint.Text = $"✗ 接收 {info.FileName} 失败（网络或服务器不可用）");
                 return;
             }
-            _log.Info($"远程文件已接收：{path} → 放进本机剪贴板（可在资源管理器里 Ctrl+V 粘贴）");
-            bool ok = Dispatcher.Invoke(() => SetLocalClipboardFile(path));
+            if (info.IsFolder)
+            {
+                // 文件夹：解压到下载目录（重名自动加 (2)），zip 本体用完即删
+                var dir = FolderTransfer.ExtractToUniqueDir(path, _cfg.DownloadDir,
+                    string.IsNullOrEmpty(info.FolderName) ? info.FileName : info.FolderName);
+                try { File.Delete(path); } catch { }
+                if (dir == null)
+                {
+                    _log.Warn($"解压远程文件夹失败：{info.FileName}");
+                    Dispatcher.Invoke(() => ClipboardHint.Text = $"✗ 解压 {info.FileName} 失败（zip 已下载，可手动解压）");
+                    return;
+                }
+                _log.Info($"远程文件夹已解压：{dir} → 放进本机剪贴板（资源管理器里 Ctrl+V 粘贴）");
+                path = dir;
+            }
+            else
+            {
+                _log.Info($"远程文件已接收：{path} → 放进本机剪贴板（可在资源管理器里 Ctrl+V 粘贴）");
+            }
+            string finalPath = path;
+            bool ok = Dispatcher.Invoke(() => SetLocalClipboardFile(finalPath));
             Dispatcher.Invoke(() =>
             {
                 _pendingFiles.RemoveAll(f => f.FileId == info.FileId);
                 ClipboardHint.Text = ok
-                    ? $"📋 {info.FileName} 已在本机剪贴板 — 到资源管理器里 Ctrl+V 粘贴"
-                    : $"✗ 文件已下载到 {path}，但写本机剪贴板失败（剪贴板被别的程序占用），可直接用这个文件";
+                    ? (info.IsFolder
+                        ? $"📁 {info.FolderName} 已解压并放入本机剪贴板 — 到资源管理器里 Ctrl+V 粘贴"
+                        : $"📋 {info.FileName} 已在本机剪贴板 — 到资源管理器里 Ctrl+V 粘贴")
+                    : $"✗ 已下载到 {finalPath}，但写本机剪贴板失败（剪贴板被别的程序占用），可直接用这个文件";
                 if (ok) _fileClipboardUntil = Environment.TickCount64 + 8000;
             });
         }
@@ -643,7 +671,9 @@ public partial class MainWindow : Window
     /// </summary>
     private bool SetLocalClipboardFile(string path)
     {
-        for (int i = 0; i < 6; i++)
+        // 重试次数与间隔都收紧：这段是在**UI 线程**上跑的（剪贴板需要 STA），
+        // 每次 Thread.Sleep 都会让界面卡一下 —— 6×150ms 最坏要卡近 1 秒（现场反馈"卡死"的一部分）。
+        for (int i = 0; i < 3; i++)
         {
             try
             {
@@ -652,12 +682,71 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                if (i == 5) _log.Warn($"写本机剪贴板失败（重试 6 次）：{ex.Message}");
-                Thread.Sleep(150);
+                if (i == 2) _log.Warn($"写本机剪贴板失败（重试 3 次）：{ex.Message}");
+                Thread.Sleep(80);
             }
         }
         return false;
     }
+
+    /// <summary>主控端自身版本（热更新提示用，2026-10 新增；主控端不做自动应用——数量少、用户是厂商自己人，提示下载即可）</summary>
+    public const string ViewerVersion = "1.2.0";
+
+    /// <summary>
+    /// 查更新清单：验签通过且版本比自己新 → 状态栏提示"有新版本"，点一下用浏览器打开下载页。
+    /// 主控端只提示不自动更（与被控端策略不同：被控端散在客户机器上才需要全自动）。
+    /// </summary>
+    private async Task CheckUpdateAsync()
+    {
+        try
+        {
+            if (_updatePromptShown) return;
+            var baseUri = _cfg.ResolveFileServerUrl();
+            var q = string.IsNullOrWhiteSpace(_cfg.AgentToken) ? "" : $"?token={Uri.EscapeDataString(_cfg.AgentToken)}";
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            using var resp = await http.GetAsync($"{baseUri}/api/update/manifest{q}");
+            if (!resp.IsSuccessStatusCode) return;                     // 服务器没配更新=安静
+            var body = await resp.Content.ReadAsStringAsync();
+            var manifest = JsonSerializer.Deserialize<UpdateManifest>(body,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            var entry = manifest?.Viewer;
+            if (entry == null || string.IsNullOrEmpty(entry.Code)) return;
+            var v = UpdateCodec.Verify(entry.Code);
+            if (!v.Ok)
+            {
+                _log.Warn($"主控端更新清单验签未通过，忽略：{v.Error}");
+                return;
+            }
+            if (!string.Equals(v.Payload!.Kind, "viewer", StringComparison.OrdinalIgnoreCase)) return;
+            if (UpdateCodec.CompareVersions(v.Payload.Ver, ViewerVersion) <= 0) return;
+
+            var url = $"{baseUri.TrimEnd('/')}/{entry.PackageUrl.TrimStart('/')}" +
+                      (string.IsNullOrWhiteSpace(_cfg.AgentToken) ? "" : $"?token={Uri.EscapeDataString(_cfg.AgentToken)}");
+            _updatePromptShown = true;
+            Dispatcher.Invoke(() =>
+            {
+                var link = new Hyperlink(new Run($"⬆ 有新版本 v{v.Payload.Ver}（{v.Payload.Notes}），点击下载"))
+                {
+                    Foreground = Brushes.Orange, FontWeight = FontWeights.Bold,
+                };
+                link.Click += (_, _) =>
+                {
+                    try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+                    catch (Exception ex) { _log.Warn($"打开下载地址失败：{ex.Message}"); }
+                };
+                ConnInfo.Text = "";
+                ConnInfo.Inlines.Clear();
+                ConnInfo.Inlines.Add(link);
+                _log.Info($"发现主控端新版本 v{v.Payload.Ver}：{url}");
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"主控端更新检查失败（忽略）：{ex.Message}");
+        }
+    }
+
+    private bool _updatePromptShown;
 
     private void SendInputMessage(MessageType type, byte[] payload)
     {
@@ -733,6 +822,8 @@ public partial class MainWindow : Window
                 Dispatcher.Invoke(() =>
                 {
                     _vm.SoftwareList.Clear();
+                    // 置顶固定项「此电脑」（2026-10 新增）：不属于被控端枚举结果，也不参与运行状态同步
+                    _vm.SoftwareList.Add(RemoteSoftware.CreateThisPc());
                     foreach (var s in list) _vm.SoftwareList.Add(RemoteSoftware.From(s));
                     SwCount.Text = $"{list.Count} 项";
                     ShowEmptyHint(list.Count == 0 ? "被控端没有返回软件列表" : null);

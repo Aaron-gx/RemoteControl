@@ -72,6 +72,9 @@ public sealed unsafe class WgcFrameSource : FrameSource
             // 这样本机用户的屏幕上永远不会出现远端的光标，而远端在任何模式下都能看见自己的指针
             // （后台定向注入模式下，系统光标压根不在外屏上）。
             _session.IsCursorCaptureEnabled = false;
+            // 去掉系统在**被采集的物理屏**四周画的黄色"正在被捕获"指示框（客户反馈"主屏有黄框"）。
+            // 只影响系统叠加层、不影响画面内容；老系统（build<20348）没有这个 API，抛异常就地吞掉。
+            _session.IsBorderRequired = false;
         }
         catch (Exception ex)
         {

@@ -67,6 +67,11 @@ public partial class MainWindow : Window
         DeleteBtn.Click += (_, _) => DeleteSelected();
         RestoreBtn.Click += (_, _) => RestoreSelected();
         ExportCsvBtn.Click += (_, _) => ExportCsv();
+        // 更新签名页
+        UpdBrowse.Click += (_, _) => PickUpdateZip();
+        UpdSign.Click += (_, _) => SignUpdate();
+        UpdCopy.Click += (_, _) => CopyUpdateManifest();
+        UpdPublish.Click += async (_, _) => await PublishUpdateAsync();
         ShowRevokedChk.Checked += (_, _) => RefreshGrid();
         ShowRevokedChk.Unchecked += (_, _) => RefreshGrid();
         // 令牌框默认明文（看得见才好核对）；勾「隐藏」才打码。
@@ -746,6 +751,112 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             StatusText.Text = "生成密钥对失败：" + ex.Message;
+        }
+    }
+
+    // ---------------------------------------------------------------- 更新签名（热更新发布）
+
+    /// <summary>更新签名页的目标类型（与清单 kind 字段一致）</summary>
+    private string UpdKindValue => (UpdKind.SelectedItem as ComboBoxItem)?.Tag as string is "viewer" ? "viewer" : "agent";
+
+    private void PickUpdateZip()
+    {
+        var dlg = new OpenFileDialog { Filter = "更新包 zip|*.zip|所有文件|*.*", Title = "选择更新包（zip）" };
+        if (dlg.ShowDialog() == true) UpdZip.Text = dlg.FileName;
+    }
+
+    /// <summary>计算 zip 的 sha256 + 用厂商私钥签更新码 → 组装成完整清单 JSON。</summary>
+    private (string Manifest, string Sha256, string Error)? BuildUpdateManifest()
+    {
+        var zip = UpdZip.Text.Trim();
+        var ver = UpdVer.Text.Trim();
+        if (!File.Exists(zip)) { UpdResult.Text = "✗ 找不到包文件：" + zip; return null; }
+        if (string.IsNullOrWhiteSpace(ver) || !ver.Contains('.')) { UpdResult.Text = "✗ 版本号格式应如 1.2.0"; return null; }
+        if (!File.Exists(KeyPath)) { UpdResult.Text = "✗ 找不到私钥（先在「签发」页选好厂商私钥）"; return null; }
+        var kind = UpdKindValue;
+        var sha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(zip))).ToLowerInvariant();
+        var payload = new UpdatePayload
+        {
+            Kind = kind,
+            Ver = ver,
+            Sha256 = sha,
+            Size = new FileInfo(zip).Length,
+            Notes = UpdNotes.Text.Trim(),
+        };
+        var code = UpdateCodec.Sign(payload, File.ReadAllText(KeyPath));
+        int.TryParse(UpdRollout.Text.Trim(), out var rollout);
+        if (rollout <= 0) rollout = 100;
+        var manifest = JsonSerializer.Serialize(new UpdateManifest
+        {
+            Agent = kind == "agent" ? new UpdateEntry { Code = code, PackageUrl = $"/api/update/file/agent-{ver}.zip" } : null,
+            Viewer = kind == "viewer" ? new UpdateEntry { Code = code, PackageUrl = $"/api/update/file/viewer-{ver}.zip" } : null,
+            RolloutPercent = rollout,
+        }, new JsonSerializerOptions { WriteIndented = true });
+        return (manifest, sha, "");
+    }
+
+    private void SignUpdate()
+    {
+        var r = BuildUpdateManifest();
+        if (r == null) return;
+        UpdManifest.Text = r.Value.Manifest;
+        UpdResult.Text = $"✓ 已签名：sha256={r.Value.Sha256[..16]}…（发布前可先在「管理」页确认服务器可达）";
+    }
+
+    private void CopyUpdateManifest()
+    {
+        if (UpdManifest.Text.Length == 0) { UpdResult.Text = "✗ 还没有生成清单"; return; }
+        try { Clipboard.SetText(UpdManifest.Text); UpdResult.Text = "✓ 清单已复制"; }
+        catch (Exception ex) { UpdResult.Text = "✗ 复制失败：" + ex.Message; }
+    }
+
+    /// <summary>一键发布：传包（目标-版本.zip）→ 存清单。灰度比例直接来自本页输入。</summary>
+    private async Task PublishUpdateAsync()
+    {
+        var baseUrl = ServerBase();
+        if (baseUrl.Length == 0) { UpdResult.Text = "✗ 未填中继服务器（在「管理」页填）"; return; }
+        if (!EnsureToken()) { UpdResult.Text = "✗ 未配置管理令牌（在「管理」页读取或填写）"; return; }
+        var zip = UpdZip.Text.Trim();
+        var ver = UpdVer.Text.Trim();
+        var kind = UpdKindValue;
+        var r = BuildUpdateManifest();
+        if (r == null) return;
+        var token = Token();
+        try
+        {
+            UpdResult.Text = "上传包中…";
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            await using var fs = File.OpenRead(zip);
+            using var form = new MultipartFormDataContent();
+            var content = new StreamContent(fs);
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+            form.Add(content, "file", $"{kind}-{ver}.zip");
+            using var up = await http.PostAsync($"{baseUrl}/admin/update/package?token={Uri.EscapeDataString(token)}", form);
+            var upBody = await up.Content.ReadAsStringAsync();
+            if (!up.IsSuccessStatusCode)
+            {
+                UpdResult.Text = $"✗ 传包失败 HTTP {(int)up.StatusCode}：{upBody}";
+                return;
+            }
+            using var doc = JsonDocument.Parse(upBody);
+            var remoteSha = doc.RootElement.GetProperty("sha256").GetString();
+            if (!string.Equals(remoteSha, r.Value.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                UpdResult.Text = "✗ 服务器侧 sha256 与本地不一致（传输损坏？），已中止发布";
+                return;
+            }
+            UpdResult.Text = "包已上传（sha256 一致），保存清单…";
+            using var mf = new StringContent(r.Value.Manifest, Encoding.UTF8, "application/json");
+            using var sm = await http.PostAsync($"{baseUrl}/admin/update/manifest?token={Uri.EscapeDataString(token)}", mf);
+            var smBody = await sm.Content.ReadAsStringAsync();
+            UpdResult.Text = sm.IsSuccessStatusCode
+                ? $"✓ 已发布 v{ver}（{kind}）：包 + 清单都已上服务器，灰度 {UpdRollout.Text}% 立即生效"
+                : $"✗ 保存清单失败 HTTP {(int)sm.StatusCode}：{smBody}";
+            UpdManifest.Text = r.Value.Manifest;
+        }
+        catch (Exception ex)
+        {
+            UpdResult.Text = "✗ 发布异常：" + ex.Message;
         }
     }
 

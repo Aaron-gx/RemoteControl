@@ -2,10 +2,6 @@ using System.Diagnostics;
 using System.Text;
 using Agent.Common;
 
-// 兼容旧多会话逃生门：本文件仍引用已废弃的独立会话配置字段(见 AppConfig.cs [Obsolete])，
-// 抑制 CS0618 警告，保留 AllowLegacyRdpSession 逃生能力。产品定稿为共享模式。
-#pragma warning disable CS0618
-
 namespace Agent.Coordinator;
 
 internal static class Program
@@ -54,42 +50,43 @@ internal static class Program
 }
 
 /// <summary>
-/// Coordinator 主逻辑（Session 0）：
-/// 托盘 → 虚拟副屏 → RDP 会话 → 启动 Worker → 中继 WebSocket ↔ IPC 双向桥接
+/// Coordinator 主逻辑（被控端单进程）：
+/// 托盘 → 虚拟副屏 → 采集引擎（WorkerHost 线程）→ 中继 WebSocket ↔ 进程内桥 双向桥接。
+/// 2026-10 进程合并：原 Agent.Worker.exe 并入本进程（见 WorkerHost），
+/// 旧的"Named Pipe + 共享内存"跨会话 IPC 换成进程内 WorkerBridge；多会话（RDPWrap/RemoteWorker）代码已删除。
 /// </summary>
 public sealed class CoordinatorApp : IDisposable
 {
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
-    private readonly IpcServer _ipc;
+    private readonly WorkerBridge _bus;
+    private readonly WorkerHost _host;
     private readonly RelayClient _relay;
-    private readonly RdpSessionManager _rdp;
     private readonly VirtualDisplayManager _vdd;
     private readonly SoftwareEnumerator _sw;
     private readonly FileUploader _uploader;
     private readonly DirectLinkServer _direct;
     private readonly LicenseGate _license;
+    private readonly Updater _updater;
     private TrayIcon? _tray;
     private readonly CancellationTokenSource _cts = new();
     private readonly string[] _args;
+    private Thread? _framePump;
 
     private int _workerSessionId = -1;
-    private int _workerPid = -1;
     /// <summary>经中继发出的视频块数（直连生效后应停止增长；上报给主控端用于显示与验收）</summary>
     private long _relayVideoChunks;
     /// <summary>上一份状态里"被挤掉的视频块数"，用来判断这一秒有没有真丢</summary>
     private long _lastVideoDropped;
     /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
     private int _viewerCount;
-    /// <summary>上次拉起 Worker 的时间：防止"看护 + 掉线重试"同时拉起两个 Worker 打架（会 0 帧）</summary>
+    /// <summary>上次拉起采集引擎的时间：防止"看护 + 掉线重试"同时拉起两个引擎线程打架（会 0 帧）</summary>
     private DateTime _lastWorkerLaunchUtc = DateTime.MinValue;
     /// <summary>操作系统描述（缓存，避免每秒都查注册表）</summary>
     private string? _osVersion;
     private MonitorInfo? _monitor;
     private WorkerReadyInfo? _workerReady;
     private DateTime _lastViewerActivity = DateTime.MinValue;
-    /// <summary>最近一次确认会话可用的时间（看护宽限期用）</summary>
-    private DateTime _lastSessionOkUtc = DateTime.MinValue;
     private DateTime _lastInputWarn = DateTime.MinValue;
     private readonly object _workerLock = new();
     /// <summary>单实例互斥体（持有到进程退出；两个被控端同时跑会各装一个全局鼠标钩子互相打架）</summary>
@@ -99,16 +96,15 @@ public sealed class CoordinatorApp : IDisposable
     {
         _args = args;
         _cfg = AgentConfig.Load();
-        if (args.Contains("--no-rdp")) _cfg.UseRdpSession = false;
-        if (args.Contains("--no-vdd")) _cfg.EnableVirtualDisplay = false;
+        if (_args.Contains("--no-vdd")) _cfg.EnableVirtualDisplay = false;
 
         _log = new Logger("coordinator", minLevel: _cfg.MinLogLevel, echoConsole: false);
-        _log.Info("========== Agent Coordinator 启动 ==========");
+        _log.Info("========== Agent Coordinator 启动（单进程：采集引擎已内置）==========");
 
         // 单实例保护：同一台机器只允许一个被控端在跑。
         // 为什么必须有：两个实例会各装一个全局鼠标钩子（光标仲裁）、各自注入输入 ——
         // 实测症状就是"在副屏点击，主屏的鼠标也跟着点、按钮点不到、拖不动"，
-        // 而且互相抢窗口与共享帧环，极难排查（升级时装到了另一个目录就会有这种局面）。
+        // 而且互相抢窗口与帧通道，极难排查（升级时装到了另一个目录就会有这种局面）。
         // 用 Global 前缀覆盖所有会话；WaitOne(0) 拿不到说明已有活着的实例。
         _singleInstance = new Mutex(false, @"Global\RemoteControlCoordinator");
         bool firstInstance;
@@ -120,38 +116,32 @@ public sealed class CoordinatorApp : IDisposable
             Console.Error.WriteLine("已有被控端在运行，本次启动退出（单实例保护）。");
             Environment.Exit(0);
         }
-        _log.Info($"版本 1.0.0 / AgentId={_cfg.AgentId} / 进程会话={SessionLauncher.CurrentSessionId} / 管理员={SessionLauncher.IsElevated}");
-        _log.Info($"配置：UseRdpSession={_cfg.UseRdpSession} EnableVirtualDisplay={_cfg.EnableVirtualDisplay} " +
-                  $"Server={_cfg.ServerUrl} WorkerUser={_cfg.WorkerUser} FPS={_cfg.FrameRate} 编码器={_cfg.Encoder}");
-        if (!string.IsNullOrEmpty(_cfg.ModeCorrection))
-            _log.Warn(_cfg.ModeCorrection);
-        if (_cfg.UseRdpSession)
-            _log.Warn($"正在运行**旧的多会话方案**（AllowLegacyRdpSession=true）：会新建/使用本地用户 {_cfg.WorkerUser} " +
-                      "和 RDP 回环会话，该账户与本机管理员的桌面、微信、文件都不共享。产品本意是共享模式。");
+        _log.Info($"版本 1.1.0 / AgentId={_cfg.AgentId} / 进程会话={SessionInfo.CurrentId} / 管理员={SessionInfo.IsElevated}");
+        _log.Info($"配置：EnableVirtualDisplay={_cfg.EnableVirtualDisplay} Server={_cfg.ServerUrl} " +
+                  $"FPS={_cfg.FrameRate} 编码器={_cfg.Encoder}");
+        if (!string.IsNullOrEmpty(_cfg.ConfigNotice))
+            _log.Warn(_cfg.ConfigNotice);
 
-        KillStrayWorkers();   // 先清理上一轮残留的 Worker（否则新旧两个会抢管道与共享帧环 → 0 帧）
-        _ipc = new IpcServer(_log, _cfg.FrameBufferSizeBytes);
-        _ipc.RingCreated += usedLabel =>
-            _log.Info(usedLabel
-                ? "跨会话 IPC 安全描述符已带低完整性标签（普通用户可访问）"
-                : "警告：跨会话 IPC 未带低完整性标签（缺 SeSecurityPrivilege），RDP 会话内的 Worker 可能被拒绝");
+        KillStrayWorkers();   // 清理"旧版本残留"的独立 Worker 进程（见方法注释）
+        _bus = new WorkerBridge(_cfg.FrameBufferSizeBytes);
+        _host = new WorkerHost(_cfg, _log, _bus);
         _relay = new RelayClient(_cfg, _log);
-        _rdp = new RdpSessionManager(_cfg, _log);
         _vdd = new VirtualDisplayManager(_cfg, _log);
         _sw = new SoftwareEnumerator(_log, _cfg.ReportSoftwareIcons);
         _uploader = new FileUploader(_cfg, _log);
         _direct = new DirectLinkServer(_cfg, _log);
         _license = new LicenseGate(Path.Combine(AppContext.BaseDirectory, "config", "license.cache.json"), _log);
+        _updater = new Updater(_cfg, _log, () => HasViewer);
         // 直连握手先过授权闸门：授权不可用时不允许任何人通过 P2P 接进来
         _direct.LicenseCheck = () => _license.IsUsable && _cfg.DirectLinkEnabled;
     }
 
 
     /// <summary>
-    /// 清理"上一次运行残留"的 Agent.Worker（同一个安装目录里的）。
-    /// 为什么需要：重启协调器时，旧 Worker 可能还活着并抢先连上命名管道，
-    /// 协调器随后又拉起一个新的 → 两个 Worker 抢同一个共享帧环，表现为画面 0 帧（实测缺陷）。
-    /// 只杀自己安装目录里的 Worker，绝不动别人的进程。
+    /// 清理"旧版本残留"的独立 Agent.Worker 进程（同一个安装目录里的）。
+    /// 2026-10 进程合并后 Worker 已并入本进程，正常不会再有这个进程；但**升级场景**里
+    /// （新版 Coordinator 起来时，上一版拉起的 Worker.exe 可能还活着）它还会抢输入钩子、
+    /// 干扰光标仲裁 —— 所以启动时兜这一刀。只杀自己安装目录里的，绝不动别人的进程。
     /// </summary>
     /// <summary>操作系统一句话描述（形如 Windows 11 Pro 24H2 build 26100）</summary>
     private static string DescribeOs()
@@ -180,7 +170,7 @@ public sealed class CoordinatorApp : IDisposable
                     var path = p.MainModule?.FileName;
                     if (string.IsNullOrEmpty(path) ||
                         !Path.GetFullPath(path).StartsWith(mine, StringComparison.OrdinalIgnoreCase)) continue;
-                    _log.Warn($"清理残留 Worker：pid={p.Id}（{path}）");
+                    _log.Warn($"清理旧版残留 Worker 进程：pid={p.Id}（{path}）");
                     p.Kill(entireProcessTree: true);
                 }
                 catch { }
@@ -192,27 +182,36 @@ public sealed class CoordinatorApp : IDisposable
 
     public void Start()
     {
-        // 设置包含 SACL（完整性标签）的安全描述符需要该特权，否则 CreateFileMapping/CreateEvent 会失败
-        SessionLauncher.EnablePrivilege("SeSecurityPrivilege", _log);
-
-        _tray = new TrayIcon(_log, $"远程控制 Agent\n{_cfg.AgentId}", new TrayHooks
+        // 托盘按配置开关（默认**隐藏**：客户要求装完右下角不出现任何显示，2026-10-04）。
+        // 隐藏时没有"托盘右键 → 退出"，退出 = 任务管理器结束进程（README §8 有命令）。
+        if (_cfg.ShowTrayIcon)
         {
-            DirectStatusText = DirectStatusText,
-            DirectEnabled = () => _cfg.DirectLinkEnabled,
-            SetDirectEnabled = SetDirectEnabled,
-            DirectAddressText = () => string.IsNullOrEmpty(_cfg.DirectLinkPublicAddress)
-                ? (_direct.PublicAddress ?? "") : _cfg.DirectLinkPublicAddress,
-            SetDirectPublicAddress = SetDirectPublicAddress,
-        });
-        _tray.ExitRequested += () => Shutdown();
+            _tray = new TrayIcon(_log, $"远程控制 Agent\n{_cfg.AgentId}", new TrayHooks
+            {
+                DirectStatusText = DirectStatusText,
+                DirectEnabled = () => _cfg.DirectLinkEnabled,
+                SetDirectEnabled = SetDirectEnabled,
+                DirectAddressText = () => string.IsNullOrEmpty(_cfg.DirectLinkPublicAddress)
+                    ? (_direct.PublicAddress ?? "") : _cfg.DirectLinkPublicAddress,
+                SetDirectPublicAddress = SetDirectPublicAddress,
+            });
+            _tray.ExitRequested += () => Shutdown();
+        }
+        else
+        {
+            _log.Info("托盘图标按配置隐藏（agent.json 的 ShowTrayIcon=false）：右下角不显示任何图标与气泡。" +
+                      "需要托盘菜单（直连开关/退出）时把它改回 true 并重启被控端。");
+        }
 
         EnsureBootAutostart();
 
-        _ipc.WorkerConnected += OnWorkerConnected;
-        _ipc.WorkerDisconnected += OnWorkerDisconnected;
-        _ipc.WorkerMessage += OnWorkerMessage;
-        _ipc.FrameReceived += OnFrame;
-        _ipc.Start();
+        _bus.WorkerConnected += OnWorkerConnected;
+        _bus.WorkerDisconnected += OnWorkerDisconnected;
+        _bus.MessageFromWorker += OnWorkerMessage;
+
+        // 帧泵：把采集引擎写进帧通道的码流块搬到发送出口（原 IpcServer.FramePump 的活）
+        _framePump = new Thread(FramePump) { IsBackground = true, Name = "FramePump" };
+        _framePump.Start();
 
         _relay.Connected += OnRelayConnected;
         _relay.Disconnected += OnRelayDisconnected;
@@ -222,7 +221,7 @@ public sealed class CoordinatorApp : IDisposable
         _relay.LicenseRejected += reason =>
         {
             _log.Error($"服务器校验未通过，暂停服务：{reason}");
-            _license.LockFromServer(reason);      // 触发 LockDown（停直连/停 Worker/拒新握手）
+            _license.LockFromServer(reason);      // 触发 LockDown（停直连/停引擎/拒新握手）
         };
         _relay.LicenseVerified += code => _license.UpdateFromServer(code);
         _relay.ViewerCountChanged += n =>
@@ -238,6 +237,9 @@ public sealed class CoordinatorApp : IDisposable
         _license.LockedOut += LockDown;
         _license.Tick();
         StartLicenseWatch();
+        _updater.Start();
+        // 热更新自检：进程活过 45 秒即写"报平安"标记（更新脚本据此决定是否回滚）
+        _ = Task.Run(async () => { try { await Task.Delay(TimeSpan.FromSeconds(45), _cts.Token); _updater.ReportAlive(); } catch { } });
         _ = Task.Run(() => WatchSoftwareStatesAsync(_cts.Token));   // 软件运行状态实时监测（3 秒一轮）
         _relay.InboundTraffic += OnViewerTraffic;
         _relay.Start();
@@ -267,14 +269,32 @@ public sealed class CoordinatorApp : IDisposable
 
         _ = Task.Run(BootstrapAsync);
         StartDiagnostics();
-        if (_cfg.UseRdpSession) StartSessionWatchdog();
-        else StartWorkerWatchdog();
+        StartWorkerWatchdog();
+    }
+
+    /// <summary>把帧通道里的码流块搬到发送出口（直连优先/中继兜底，见 OnFrame）</summary>
+    private void FramePump()
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                var chunk = _bus.Frames.Read(200);
+                if (chunk == null) continue;
+                OnFrame(chunk);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"帧泵异常：{ex.Message}");
+                Thread.Sleep(200);
+            }
+        }
     }
 
     /// <summary>
-    /// 共享模式的 Worker 看护：Worker 死掉（崩溃/被结束/被安全软件拦/被前台应用带崩）后必须**一直**
+    /// 采集引擎看护：引擎线程死掉（崩溃/被安全软件拦/无显示器退出）后必须**一直**
     /// 尝试拉起 —— 否则主控端会停在"连上了、但黑屏且点不动"的状态，直到有人去被控端重启程序（实测踩到）。
-    /// 另外 Worker 缺失超过 30 秒就报给主控端，别让人对着黑屏猜。
+    /// 另外引擎缺失超过 30 秒就报给主控端，别让人对着黑屏猜。
     /// </summary>
     private void StartWorkerWatchdog()
     {
@@ -287,7 +307,7 @@ public sealed class CoordinatorApp : IDisposable
                 if (_cts.IsCancellationRequested) return;
                 try
                 {
-                    if (_ipc.IsWorkerConnected)
+                    if (_bus.IsWorkerConnected)
                     {
                         missingSince = DateTime.MinValue;
                         continue;
@@ -295,7 +315,7 @@ public sealed class CoordinatorApp : IDisposable
                     if (missingSince == DateTime.MinValue) missingSince = DateTime.UtcNow;
                     if (!_license.IsUsable)
                     {
-                        _log.Debug($"服务已暂停，暂不启动 Worker：{_license.LockReason}");
+                        _log.Debug($"服务已暂停，暂不启动采集引擎：{_license.LockReason}");
                         continue;
                     }
                     if ((DateTime.UtcNow - missingSince).TotalSeconds >= 30)
@@ -304,66 +324,19 @@ public sealed class CoordinatorApp : IDisposable
                         ReportError("被控端采集进程未运行（正在自动重启），画面与操作暂时不可用");
                         missingSince = DateTime.UtcNow;
                     }
-                    _workerSessionId = SessionLauncher.CurrentSessionId;   // 共享模式永远在本机当前会话
-                    _log.Info("Worker 未连接，自动拉起");
-                    LaunchWorker();
+                    _workerSessionId = SessionInfo.CurrentId;   // 引擎永远跑在本机当前会话（共享模式）
+                    _log.Info("采集引擎未运行，自动拉起");
+                    EnsureWorkerEngineRunning();
                 }
-                catch (Exception ex) { _log.Warn($"Worker 看护异常：{ex.Message}"); }
+                catch (Exception ex) { _log.Warn($"引擎看护异常：{ex.Message}"); }
             }
         });
     }
 
     /// <summary>
-    /// RDP 会话看护（每 20 秒）：mstsc 崩溃/被关掉、会话掉到"已断开"时自动重连，
-    /// 并保证 Worker 在会话里运行（断开的会话没有显示表面，采集必然失败）。
-    /// </summary>
-    private void StartSessionWatchdog()
-    {
-        _ = Task.Run(async () =>
-        {
-            while (!_cts.IsCancellationRequested)
-            {
-                try { await Task.Delay(TimeSpan.FromSeconds(20), _cts.Token); } catch { return; }
-                if (_cts.IsCancellationRequested) return;
-                try
-                {
-                    // mstsc 的"安全警告/证书"对话框会把登录卡住，看护周期内顺手确认一次
-                    _rdp.DismissBlockingDialogs();
-
-                    // 宽限期只在"会话确实还在"时生效：会话消失（注销/掉线）必须尽快重建，
-                    // 否则要白等 3 分钟；而"正在建立中"的判断由 EnsureSessionAlive 内部的
-                    // 观察窗口 + 建会话锁负责，这里不需要再挡。
-                    bool sessionPresent = _rdp.WorkerSessionId > 0 && _rdp.IsSessionActive(_rdp.WorkerSessionId);
-                    if (sessionPresent && DateTime.UtcNow - _lastSessionOkUtc < TimeSpan.FromSeconds(30)) continue;
-
-                    if (!_rdp.EnsureSessionAlive())
-                    {
-                        // 建会话流程进行中不要报错打扰主控端（内部有 150s 观察窗口）
-                        if (!_rdp.IsEstablishing) ReportError("RDP 会话不可用，正在重试");
-                        continue;
-                    }
-                    _lastSessionOkUtc = DateTime.UtcNow;
-                    // 会话可能是看护自己重建的，且**会话号会变**（2 → 3 …），
-                    // 不刷新就会拿旧会话号去启动 Worker，永远失败 → 黑屏。
-                    if (_rdp.WorkerSessionId > 0 && _rdp.WorkerSessionId != _workerSessionId)
-                        _workerSessionId = _rdp.WorkerSessionId;
-                    // 授权停机期间不要拉起 Worker（会话本身可以留着，续期后直接复用）
-                    if (!_license.IsUsable)
-                    {
-                        _log.Debug($"服务已暂停，暂不启动 Worker：{_license.LockReason}");
-                        continue;
-                    }
-                    if (!_ipc.IsWorkerConnected) LaunchWorker();
-                }
-                catch (Exception ex) { _log.Warn($"会话看护异常：{ex.Message}"); }
-            }
-        });
-    }
-
-    /// <summary>
-    /// 授权闸门关闭时的**硬停机**：停直连（含已在连的主控端）、停 Worker、拒绝新的直连握手。
+    /// 授权闸门关闭时的**硬停机**：停直连（含已在连的主控端）、停采集引擎、拒绝新的直连握手。
     /// 这是防"屏蔽中继走 P2P 白嫖"的关键一步 —— 只靠服务器判定的话，P2P 流量不过服务器就管不到。
-    /// 中继连接保持重试，续期后会自动恢复。
+    /// 中继连接保持重试，续期后会自动恢复（引擎由看护重新拉起）。
     /// </summary>
     private void LockDown(string reason)
     {
@@ -371,28 +344,10 @@ public sealed class CoordinatorApp : IDisposable
         {
             _log.Error($"【服务暂停】{reason}");
             _direct.StopServing("服务暂停");       // 清掉已接入的直连主控端并停止监听
-            KillWorker();                            // 没有授权就不采集、不编码
-            // 不弹托盘气泡、不向主控端报错：界面上不暴露原因
-            // 不弹托盘气泡、不向主控端报错：界面上不暴露原因
+            _host.RequestStop();                    // 没有授权就不采集、不编码（引擎走正常收尾：卸钩子、关编码器）
             // 不弹托盘气泡、不向主控端报错：界面上不暴露原因
         }
         catch (Exception ex) { _log.Warn($"停机处理异常：{ex.Message}"); }
-    }
-
-    private void KillWorker()
-    {
-        try
-        {
-            if (_workerPid > 0)
-            {
-                using var p = Process.GetProcessById(_workerPid);
-                p.Kill(entireProcessTree: true);
-                _log.Warn($"已结束 Worker（pid={_workerPid}）");
-            }
-        }
-        catch (ArgumentException) { }
-        catch (Exception ex) { _log.Warn($"结束 Worker 失败：{ex.Message}"); }
-        _workerPid = -1;
     }
 
     /// <summary>
@@ -454,10 +409,10 @@ public sealed class CoordinatorApp : IDisposable
                 try { await Task.Delay(5000, _cts.Token); } catch { return; }
                 try
                 {
-                    long f = _ipc.FramesForwarded;
+                    long f = _bus.Frames.DeliveredCount;
                     long q = _relay.QueuedCount, d = _relay.DroppedCount;
                     long vd = _relay.VideoDropped;
-                    double fill = _ipc.Ring?.FillRatio ?? 0;
+                    double fill = _bus.Frames.FillRatio;
                     _log.Info($"[诊断] 转发帧 {f - lastFrames}/5s  发送积压={_relay.PendingSends}（视频 {_relay.VideoPending}）" +
                               $"本周期入队={q - lastQueued} 控制丢弃={d - lastDropped} 视频挤掉={vd - lastVideoDropped}  " +
                               $"环形水位={fill * 100:F1}%  " +
@@ -489,60 +444,22 @@ public sealed class CoordinatorApp : IDisposable
                           "本机会一直显示「未连接服务器」、主控端列表里也看不到本机。\n" +
                           "  改法：重新运行安装程序并在「连接设置」里填入口令，或改 agent.json 的 AgentToken 与服务端 RC_TOKEN 一致后重启被控端。");
 
-            // 1. RDP 服务/防火墙
-            if (_cfg.UseRdpSession)
-            {
-                _log.Info("[1/4] 检查远程桌面服务…");
-                _rdp.EnsureRdpEnabled();
-                bool wrapInstalled = _rdp.IsRdpWrapInstalled();
-                bool wrapWorking = _rdp.IsRdpWrapWorking();
-                var (iniOk, iniDetail) = _rdp.GetRdpWrapIniSupport();
-                _log.Info($"RDPWrap：已安装={wrapInstalled} 已生效={wrapWorking} ini={iniDetail}");
-                if (!wrapInstalled)
-                {
-                    _tray?.SetTooltip("远程控制 Agent（RDPWrap 未安装）");
-                    ReportError("RDPWrap 未安装：无法创建并发会话，请先运行 scripts\\install-agent.ps1");
-                }
-                else if (!wrapWorking)
-                {
-                    ReportError($"RDPWrap 未生效（127.0.0.2:3389 未监听）：{iniDetail}。可能需要更新 rdpwrap.ini");
-                }
-            }
-
-            // 2. 虚拟副屏
-            _log.Info("[2/4] 检查虚拟副屏…");
+            // 1. 虚拟副屏
+            _log.Info("[1/3] 检查虚拟副屏…");
             if (_vdd.Ensure(out var vddMsg))
                 _log.Info($"虚拟副屏：{vddMsg}");
             else
                 _log.Warn($"虚拟副屏不可用：{vddMsg}");
 
-            // 3. Worker 会话
-            _log.Info("[3/4] 准备 Worker 会话…");
-            if (_cfg.UseRdpSession)
-            {
-                if (_rdp.EnsureWorkerSession(TimeSpan.FromSeconds(_cfg.RdpConnectTimeoutSec),
-                        out int sid, out string err))
-                {
-                    _workerSessionId = sid;
-                    _lastSessionOkUtc = DateTime.UtcNow;
-                }
-                else
-                {
-                    _log.Error($"RDP 会话不可用：{err}");
-                    ReportError($"RDP 会话不可用：{err}");
-                }
-            }
-            else
-            {
-                _workerSessionId = SessionLauncher.CurrentSessionId;
-                // 共享模式（默认）：远程操作的就是本机已登录用户这个桌面 + 虚拟外屏，
-                // 软件/文件/微信等跟本机用户是同一份（同一个账户、同一个 profile）。
-                _log.Info($"共享模式：Worker 运行在本机当前会话 {_workerSessionId}（远程 = 本机已登录桌面 + 虚拟外屏）");
-            }
+            // 2. 确认会话（共享模式：远程操作的就是本机已登录用户这个桌面 + 虚拟外屏，
+            //    软件/文件/微信等跟本机用户是同一份 —— 同一个账户、同一个 profile）
+            _log.Info("[2/3] 准备会话…");
+            _workerSessionId = SessionInfo.CurrentId;
+            _log.Info($"共享模式：采集引擎运行在本机当前会话 {_workerSessionId}（远程 = 本机已登录桌面 + 虚拟外屏）");
 
-            // 4. 启动 Worker
-            _log.Info("[4/4] 启动 Worker…");
-            LaunchWorker();
+            // 3. 启动采集引擎
+            _log.Info("[3/3] 启动采集引擎…");
+            EnsureWorkerEngineRunning();
         }
         catch (Exception ex)
         {
@@ -552,73 +469,35 @@ public sealed class CoordinatorApp : IDisposable
         await Task.CompletedTask;
     }
 
-    private void LaunchWorker()
+    /// <summary>
+    /// 拉起采集引擎线程（幂等）。取代旧架构的 LaunchWorker（启动 Agent.Worker.exe 进程）——
+    /// 现在只是让 WorkerHost 开一条 STA 线程，不再有 exe 路径/会话号/进程启动这些事。
+    /// </summary>
+    private void EnsureWorkerEngineRunning()
     {
         if (!_license.IsUsable)
         {
-            _log.Warn($"服务已暂停（{_license.LockReason}）：暂不启动 Worker");
-            return;
-        }
-        string exe = Path.Combine(AppContext.BaseDirectory, _cfg.WorkerExe);
-        if (!File.Exists(exe))
-        {
-            _log.Error($"Worker 不存在：{exe}");
-            ReportError($"Worker 不存在：{exe}");
+            _log.Warn($"服务已暂停（{_license.LockReason}）：暂不启动采集引擎");
             return;
         }
         lock (_workerLock)
         {
-            if (_ipc.IsWorkerConnected)
+            if (_bus.IsWorkerConnected)
             {
-                _log.Info("Worker 已连接，跳过启动");
+                _log.Info("采集引擎已在运行，跳过启动");
                 return;
             }
-            // 刚拉起过就不要重复拉：schtasks 启动到 Worker 连上管道有 1~3 秒延迟，
-            // 这期间另一个调用方（看护 / 掉线重试）会以为没起来 → 拉出第二个 Worker
-            // → 两个 Worker 抢同一个共享帧环，表现为画面 0 帧（实测缺陷）。
+            // 刚拉起过就不要重复拉：引擎线程从启动到 MarkWorkerConnected 有 1~3 秒延迟，
+            // 这期间另一个调用方（看护 / 掉线重试）会以为没起来 → 拉出第二个引擎
+            // → 两个引擎各装一套钩子与采集器（等价于旧架构"两个 Worker 抢帧环"，实测 0 帧）。
             if (DateTime.UtcNow - _lastWorkerLaunchUtc < TimeSpan.FromSeconds(20))
             {
-                _log.Info($"刚拉起过 Worker（{(_lastWorkerLaunchUtc):HH:mm:ss}），跳过重复启动");
+                _log.Info($"刚拉起过采集引擎（{_lastWorkerLaunchUtc:HH:mm:ss}），跳过重复启动");
                 return;
             }
-            // 会话由看护重建时 id 只在 RdpSessionManager 里（而且会话号会变），这里回填
-            if (_rdp.WorkerSessionId > 0 && _rdp.WorkerSessionId != _workerSessionId)
-                _workerSessionId = _rdp.WorkerSessionId;
-            if (_workerSessionId < 0)
-            {
-                _log.Warn("尚未确定 Worker 会话，等待后续重试");
-                return;
-            }
-
-            string args = $"--session={_workerSessionId} --parent={Environment.ProcessId}";
-            if (_workerSessionId == SessionLauncher.CurrentSessionId)
-            {
-                // 同会话：直接启动
-                var psi = new ProcessStartInfo(exe, args)
-                {
-                    WorkingDirectory = AppContext.BaseDirectory,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-                var p = Process.Start(psi);
-                _workerPid = p?.Id ?? -1;
-                _lastWorkerLaunchUtc = DateTime.UtcNow;
-                _log.Info($"已在当前会话启动 Worker，pid={_workerPid}");
-                return;
-            }
-
-            int pid = SessionLauncher.Launch(_workerSessionId, exe, args, _log, out string method);
-            if (pid > 0)
-            {
-                _workerPid = pid;
-                _lastWorkerLaunchUtc = DateTime.UtcNow;
-                _log.Info($"Worker 已启动：session={_workerSessionId} pid={pid} 方式={method}");
-            }
-            else
-            {
-                _log.Error($"在会话 {_workerSessionId} 启动 Worker 失败（所有方式都失败）");
-                ReportError($"启动 Worker 失败（会话 {_workerSessionId}）");
-            }
+            _lastWorkerLaunchUtc = DateTime.UtcNow;
+            _host.Start();
+            _log.Info("已启动采集引擎线程");
         }
     }
 
@@ -710,7 +589,7 @@ public sealed class CoordinatorApp : IDisposable
         _log.Info("检测到主控端接入");
         PushMonitorInfo();
         PushSoftwareListAsync();
-        _ipc.Send(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+        _bus.SendToWorker(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
         _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
     }
 
@@ -749,13 +628,13 @@ public sealed class CoordinatorApp : IDisposable
             case MessageType.MoveWindowHint:
             case MessageType.MoveAppWindowHint:
             case MessageType.Disconnect:
-                if (_ipc.IsWorkerConnected)
+                if (_bus.IsWorkerConnected)
                 {
                     if (msg.Type == MessageType.InputModeHint && msg.Payload.Length > 0)
                         _log.Info($"主控端选择鼠标模式：{(RemoteInputMode)msg.Payload[0]}");
                     if (msg.Type == MessageType.CaptureModeHint && msg.Payload.Length > 0)
                         _log.Info($"主控端选择画面范围：{(CaptureMode)msg.Payload[0]}");
-                    _ipc.Send(msg);
+                    _bus.SendToWorker(msg);
                 }
                 else if (msg.Type is MessageType.OpenSoftware or MessageType.CloseSoftware)
                 {
@@ -775,7 +654,7 @@ public sealed class CoordinatorApp : IDisposable
 
     // ---------------------------------------------------------------- IPC 事件
 
-    private void OnWorkerConnected(int _)
+    private void OnWorkerConnected()
     {
         _log.Info("Worker 连接成功，等待就绪上报");
         // 注意：这里**不要**立刻让 Worker 枚举软件（枚举耗时数秒、且在主控端没接入时毫无意义），
@@ -786,26 +665,18 @@ public sealed class CoordinatorApp : IDisposable
 
     private void OnWorkerDisconnected(string reason)
     {
-        _log.Warn($"Worker 断开：{reason}");
+        _log.Warn($"采集引擎断开：{reason}");
         if (!_cfg.RestartWorkerOnExit || _cts.IsCancellationRequested) return;
         _ = Task.Run(async () =>
         {
             for (int i = 1; i <= 5 && !_cts.IsCancellationRequested; i++)
             {
                 await Task.Delay(TimeSpan.FromSeconds(5 * i));
-                if (_ipc.IsWorkerConnected) return;
-                // RDP 会话不在或正在重建时不要抢：会话没了要重登才有显示表面，
-                // 这里拿旧会话号重试只会刷一串失败日志。交给会话看护，会话好了它会拉起 Worker。
-                if (_cfg.UseRdpSession &&
-                    (_rdp.IsEstablishing || !_rdp.IsSessionActive(_rdp.WorkerSessionId)))
-                {
-                    _log.Info("Worker 已退出但 RDP 会话不可用，交由会话看护重建后再拉起");
-                    return;
-                }
-                _log.Info($"尝试重启 Worker（第 {i} 次）");
-                LaunchWorker();
+                if (_bus.IsWorkerConnected) return;
+                _log.Info($"尝试重启采集引擎（第 {i} 次）");
+                EnsureWorkerEngineRunning();
                 await Task.Delay(TimeSpan.FromSeconds(8));
-                if (_ipc.IsWorkerConnected) return;
+                if (_bus.IsWorkerConnected) return;
             }
         });
     }
@@ -840,8 +711,8 @@ public sealed class CoordinatorApp : IDisposable
 
             case MessageType.ClipboardFile:
             {
-                // Worker 传的是本地文件路径；这里负责上传到服务器再通知主控端
-                var file = JsonCodec.Decode<SingleFilePayload>(msg.Payload);
+                // Worker 传的是本地文件/文件夹路径；这里负责（文件夹→打包 zip →）上传到服务器再通知主控端
+                var file = JsonCodec.Decode<FileDropInfo>(msg.Payload);
                 if (file != null) _ = Task.Run(() => UploadAndNotifyAsync(file));
                 break;
             }
@@ -869,11 +740,13 @@ public sealed class CoordinatorApp : IDisposable
                 // Worker 自己看不到中继这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
                 bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped;
                 _lastVideoDropped = _relay.VideoDropped;
-                _ipc.Send(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
+                _bus.SendToWorker(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
                 {
                     Congested = congested,
                     VideoQueued = _relay.VideoPending,
                     VideoDropped = _relay.VideoDropped,
+                    // 主控端在线状态（协调器是权威判定方）——引擎据此决定是否回收副屏孤儿窗口
+                    ViewerOnline = HasViewer,
                 })));
                 // 授权状态随状态上报一起发出（界面不展示，供厂商侧排障/工具使用）
                 var lp = _license.Payload;
@@ -883,6 +756,9 @@ public sealed class CoordinatorApp : IDisposable
                 st.LicenseDaysLeft = lp != null ? lp.DaysLeft() : 0;
                 st.LicenseLocked = !_license.IsUsable;
                 st.LicenseLockReason = _license.LockReason;
+                // 热更新状态（远程可观测：主控端/_rcp.py 都能看到这台机器的更新进展）
+                st.UpdateState = _updater.State;
+                st.UpdateStaged = _updater.StagedVersion;
                 // 主动上报自身信息，省得主控端只知道一个 ID
                 st.HostName = Environment.MachineName;
                 st.UserName = Environment.UserName;
@@ -908,15 +784,10 @@ public sealed class CoordinatorApp : IDisposable
         }
     }
 
-    /// <summary>丢弃环形缓冲里尚未发送的旧码流残帧（重建码流时用）</summary>
+    /// <summary>丢弃帧通道里尚未发送的旧码流残帧（重建码流时用）</summary>
     private void DrainFrameRing()
     {
-        try
-        {
-            int dropped = 0;
-            while (_ipc.Ring?.Read(0) != null) dropped++;
-            if (dropped > 0) _log.Info($"已丢弃 {dropped} 个旧码流块");
-        }
+        try { _bus.Frames.Reset(); }
         catch (Exception ex) { _log.Debug($"清空残帧失败：{ex.Message}"); }
     }
 
@@ -940,23 +811,51 @@ public sealed class CoordinatorApp : IDisposable
 
     // ---------------------------------------------------------------- 文件上传
 
-    private sealed class SingleFilePayload
+    private async Task UploadAndNotifyAsync(FileDropInfo file)
     {
-        public string LocalPath { get; set; } = "";
-        public string FileName { get; set; } = "";
-        public long FileSize { get; set; }
-    }
-
-    private async Task UploadAndNotifyAsync(SingleFilePayload file)
-    {
-        var info = await _uploader.UploadAsync(file.LocalPath, file.FileName);
-        if (info == null)
+        // 文件夹复制（2026-10 新增）：先压成临时 zip 再上传，主控端收到 IsFolder 标记后解压还原
+        string uploadPath = file.LocalPath;
+        string uploadName = file.FileName;
+        string? tempZip = null;
+        if (file.IsFolder)
         {
-            ReportError($"文件上传失败：{file.FileName}");
-            return;
+            tempZip = FolderTransfer.PackFolder(file.LocalPath, out string packError);
+            if (tempZip == null)
+            {
+                _log.Error($"文件夹打包失败：{packError}");
+                ReportError($"复制文件夹失败：{packError}");
+                return;
+            }
+            // 有跳过的文件不算失败（Telegram/微信等运行时锁文件是正常的），只在日志里提一句
+            if (packError.Length > 0)
+                _log.Info($"文件夹打包提示：{packError}");
+            uploadPath = tempZip;
+            uploadName = file.FileName + ".zip";
+            _log.Info($"文件夹已打包：{file.LocalPath} → {uploadName}（{new FileInfo(tempZip).Length / 1024}KB）");
         }
-        SendToViewer(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(info)));
-        _log.Info($"已通知主控端可下载：{info.FileName}（fileId={info.FileId}）");
+        try
+        {
+            var info = await _uploader.UploadAsync(uploadPath, uploadName);
+            if (info == null)
+            {
+                ReportError($"文件上传失败：{file.FileName}");
+                return;
+            }
+            if (file.IsFolder)
+            {
+                info.IsFolder = true;
+                info.FolderName = file.FileName;
+            }
+            SendToViewer(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(info)));
+            _log.Info($"已通知主控端可下载：{info.FileName}（fileId={info.FileId}）");
+        }
+        finally
+        {
+            if (tempZip != null)
+            {
+                try { Directory.Delete(Path.GetDirectoryName(tempZip)!, recursive: true); } catch { }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 发送
@@ -1124,38 +1023,34 @@ public sealed class CoordinatorApp : IDisposable
         _log.Info("收到退出请求，开始关闭…");
         try { _cts.Cancel(); } catch { }
 
-        // 1. 通知 Worker 退出
+        // 1. 通知采集引擎退出（走正常收尾：卸钩子、关编码器，否则会留下 ffmpeg 进程、拖慢整机输入）
         try
         {
-            if (_ipc.IsWorkerConnected)
+            if (_bus.IsWorkerConnected)
             {
-                _ipc.Send(new ProtocolMessage(MessageType.Stop, PayloadCodec.Empty()));
+                _bus.SendToWorker(new ProtocolMessage(MessageType.Stop, PayloadCodec.Empty()));
                 Thread.Sleep(800);
             }
         }
         catch { }
 
-        // 2. 杀掉 Worker 进程
+        // 2. 清理"旧版本残留"的独立 Worker 进程（升级场景；进程合并后正常没有这个进程）
         try
         {
-            var procs = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(_cfg.WorkerExe));
-            foreach (var p in procs)
+            foreach (var p in Process.GetProcessesByName("Agent.Worker"))
             {
                 try
                 {
                     p.Kill(entireProcessTree: true);
-                    _log.Info($"已结束 Worker pid={p.Id}");
+                    _log.Info($"已结束旧版残留 Worker pid={p.Id}");
                 }
                 catch { }
                 finally { p.Dispose(); }
             }
         }
-        catch (Exception ex) { _log.Warn($"结束 Worker 失败：{ex.Message}"); }
+        catch (Exception ex) { _log.Warn($"结束残留 Worker 失败：{ex.Message}"); }
 
-        // 3. 注销 RDP 会话 + 关掉 mstsc
-        try { _rdp.CloseLoopbackSession(); } catch (Exception ex) { _log.Warn(ex.Message); }
-
-        // 4. 收尾
+        // 3. 收尾
         _log.Info("Agent Coordinator 已退出");
         try { _tray?.Dispose(); } catch { }
         Application.ExitThread();
@@ -1164,7 +1059,8 @@ public sealed class CoordinatorApp : IDisposable
     public void Dispose()
     {
         try { _relay.Dispose(); } catch { }
-        try { _ipc.Dispose(); } catch { }
+        try { _updater.Dispose(); } catch { }
+        try { _bus.Dispose(); } catch { }
         try { _uploader.Dispose(); } catch { }
         try { _direct.Dispose(); } catch { }
         try { _tray?.Dispose(); } catch { }

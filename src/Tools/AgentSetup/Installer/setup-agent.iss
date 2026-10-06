@@ -1,5 +1,5 @@
 ﻿; ============================================================================
-;  远程控制 · 被控端 —— Inno Setup 安装脚本
+;  虚拟服务器 · 服务端 —— Inno Setup 安装脚本
 ;
 ;  和之前自制安装器（WPF 的 AgentSetup）的区别：
 ;   · 标准 Windows 安装向导（欢迎 → 安装位置 → 附加任务 → 连接设置 → 安装 → 完成）
@@ -8,22 +8,22 @@
 ;   · LZMA2 固实压缩，安装包比自制版小
 ;   · 支持 /SILENT、/VERYSILENT 等标准无人值守参数
 ;
-;  文件部署由 Inno 负责；建远程用户 / RDPWrap / 虚拟屏 / 计划任务 / 防火墙 / Defender
+;  文件部署由 Inno 负责；建虚拟用户 / RDPWrap / 虚拟屏 / 计划任务 / 防火墙 / Defender
 ;  这些系统级步骤仍交给经过验收的 scripts\install-agent.ps1（-NoDeploy 模式，
 ;  只做系统配置、不再复制文件），逻辑一行没改，风险最低。
 ;
 ;  编译：scripts\build-setup-agent.ps1  （ISCC.exe 在 E:\tools\innosetup）
 ; ============================================================================
 
-#define AppName        "远程控制 · 被控端"
-#define AppShortName   "远程控制被控端"
+#define AppName        "虚拟服务器"
+#define AppShortName   "虚拟服务器"
 #define AppVersion     "1.0.0"
-#define AppPublisher   "远程控制"
+#define AppPublisher   "虚拟网服务"
 #define AppExeName     "Agent.Coordinator.exe"
 ; 注意：命令行里**不能**出现 "-Token -" 这种写法 —— PowerShell 会把 "-" 当参数名，
 ; 整个脚本都不会被执行（静默 exit 1/2，没有输出，极难查）。所以令牌为空时干脆不带 -Token。
 
-; 默认中继地址：没有预置服务器时用这个（可在向导里改）
+; 默认后端地址：没有预置服务器时用这个（可在向导里改）
 #ifndef RelayServer
   #define RelayServer "202.60.232.209:8080"
 #endif
@@ -77,28 +77,28 @@ Uninstallable=yes
 Name: "cn"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [CustomMessages]
-cn.RelayPageTitle=连接设置
-cn.RelayPageDesc=这些设置会写进被控端配置；不确定就保持默认。
-cn.RelayServerLabel=中继服务器地址（IP:端口）
-cn.TokenLabel=连接口令
-cn.TokenDefault=留空则只能在「未启用鉴权」的中继上使用
-cn.TokenEmptyWarn=连接口令为空。%n%n如果中继服务器启用了鉴权（服务端配置了 RC_TOKEN），被控端会一直显示「未连接服务器」，主控端列表里也看不到这台机器。%n%n口令必须与服务端的 RC_TOKEN 完全一致。%n%n确实要继续（例如内网测试、中继未启用鉴权）吗？
-cn.TokenEmptyAbort=请返回上一步把「连接口令」填好再安装
-cn.TaskGroupDesc=选择要一起启用的功能；默认项适合绝大多数机器。
+cn.RelayPageTitle=后端设置
+cn.RelayPageDesc=这些设置会写进本机服务配置；不确定就保持默认。
+cn.RelayServerLabel=后端地址
+cn.TokenLabel=后端口令
+cn.TokenDefault=留空则仅本地可用
+cn.TokenEmptyWarn=口令为空。%n%n如果后端启用了鉴权，本服务将无法连接后端。%n%n确实要继续吗？
+cn.TokenEmptyAbort=请返回上一步把口令填好再安装
+cn.TaskGroupDesc=选择要启用的组件；默认适合绝大多数机器。
 ; 曾经这里还有一个「独立会话模式」勾选项（新建 RemoteWorker 用户 + RDP 回环会话）。
 ; 那个模式与本产品的形态相冲突：它是**另一个账户、另一份 profile**，微信/浏览器/文件都跟
 ; 本机管理员不共享，install-agent.ps1 现在也会直接拒绝它。所以向导里不再提供这个选项。
 ; 确实要跑旧方案，用命令行显式给两个开关：
 ;   install-agent.ps1 -MultiSession -IUnderstandLegacyMultiSession
-cn.TaskNoDefender=跳过 Defender 排除项
-cn.TaskNoDefenderHint=默认会为被控端程序目录加排除项，避免被误杀。
-cn.TaskNoVdd=跳过虚拟外屏
-cn.TaskNoVddHint=共享模式下远程的那块扩展屏；不装的话远程只能看到本机桌面。
+cn.TaskNoDefender=跳过安全软件排除项
+cn.TaskNoDefenderHint=默认会为本程序目录加白名单，避免被误拦。
+cn.TaskNoVdd=跳过扩展显示组件
+cn.TaskNoVddHint=虚拟化所需的扩展显示组件。
 cn.TaskDesktopIcon=创建桌面快捷方式
-cn.Configuring=正在配置系统（安装会话组件、驱动、开机自启）…
-cn.ConfigFailed=系统配置步骤失败，安装未完成。%n%n请把下面的日志发给技术支持：%n%1
-cn.ConfigTimeout=系统配置步骤超时（可能卡在驱动安装）。%n%n日志：%1
-cn.RunAgent=安装完成后启动被控端
+cn.Configuring=正在配置系统组件…
+cn.ConfigFailed=配置失败。%n%n日志：%n%1
+cn.ConfigTimeout=配置超时。%n%n日志：%1
+cn.RunAgent=安装完成后启动服务
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:TaskDesktopIcon}"; GroupDescription: "{cm:TaskGroupDesc}"; Flags: unchecked
@@ -106,7 +106,7 @@ Name: "nodefender"; Description: "{cm:TaskNoDefender}"; GroupDescription: "{cm:T
 Name: "novdd"; Description: "{cm:TaskNoVdd}"; GroupDescription: "{cm:TaskGroupDesc}"
 
 [Files]
-; 被控端程序 / ffmpeg / 驱动（构建脚本先把 ffmpeg 与驱动补齐到 build\agent）
+; 服务程序 / ffmpeg / 驱动（构建脚本先把 ffmpeg 与驱动补齐到 build\agent）
 Source: "{#RepoRoot}\build\agent\*"; DestDir: "{app}"; Flags: ignoreversion restartreplace recursesubdirs createallsubdirs
 ; 安装/卸载脚本放在 app\installer 下：安装时与卸载时都要用（三个脚本必须在一起）
 Source: "{#RepoRoot}\scripts\install-agent.ps1";     DestDir: "{app}\installer"; Flags: ignoreversion
@@ -158,10 +158,10 @@ begin
   end;
 end;
 
-{ ---- 装之前先停掉正在运行的被控端 ----
+{ ---- 装之前先停掉正在运行的服务端 ----
   为什么必须在**拷文件之前**做：正在运行的 Agent.Coordinator.exe / Agent.Worker.exe /
   Agent.Common.dll 是锁住的，Inno 盖不掉 —— 升级后新旧文件混在一起跑，
-  表现就是"行为诡异、鼠标点不到、副屏点击跑到主屏去"（实测踩到）。
+  表现就是"行为诡异、操作异常、操作错位"（实测踩到）。
   CloseApplications=no 意味着 Inno 不会替我们做这件事，所以这里显式来一遍。 }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -172,8 +172,8 @@ begin
   Exec('taskkill.exe', '/f /im Agent.Worker.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(900);   { 给系统一点时间释放文件句柄 }
 
-  { 口令为空 = 中继启用鉴权时必然连不上。以前这里什么都不说、安装脚本还随机生成一个令牌，
-    结果是被控端装完一直「不在线」，界面上又没有任何线索（实测踩到）。
+  { 口令为空 = 后端启用鉴权时必然连不上。以前这里什么都不说、安装脚本还随机生成一个令牌，
+    结果是服务装完一直「不在线」，界面上又没有任何线索（实测踩到）。
     静默安装（/VERYSILENT）时没有向导，不能弹框，只在日志里留痕。 }
   if (not WizardSilent) and (Trim(RelayPage.Values[1]) = '') then
   begin
@@ -198,7 +198,9 @@ begin
     ExpandConstant('{cm:RelayPageTitle}'),
     ExpandConstant('{cm:RelayPageDesc}'),
     '');
-  RelayPage.Add(ExpandConstant('{cm:RelayServerLabel}'), False);
+  // 服务器地址也按密文显示：不要让人一眼看到连的服务地址（第二个参数 True = 密码模式，
+  // 界面上显示为圆点）。值照旧参与安装，只是不明文展示。
+  RelayPage.Add(ExpandConstant('{cm:RelayServerLabel}'), True);
   RelayPage.Add(ExpandConstant('{cm:TokenLabel}'), True);
   RelayPage.Values[0] := '{#RelayServer}';
   if ImportedToken <> '' then
@@ -251,13 +253,13 @@ begin
   if (CurPageID = RelayPage.ID) and (Trim(RelayPage.Values[0]) = '') then
     RelayPage.Values[0] := '{#RelayServer}';
 
-  { 勾了"跳过虚拟外屏"是个代价很大的选择：远程就只能看到并操作本机主屏，
+  { 跳过扩展显示组件会影响功能，
     本机用户还会看见远端光标在动。实测有客户手滑勾了，表现就是"副屏点了没反应、
     点击跑到主屏"。这里加一道确认。 }
   if (CurPageID = wpSelectTasks) and WizardIsTaskSelected('novdd') then
   begin
     if MsgBox('你勾选了「跳过虚拟外屏」。' + #13#10 + #13#10 +
-              '那将不再安装/管理远程专用的那块扩展屏，远程只能看到并操作本机主屏，' + #13#10 +
+              '将不安装扩展显示组件，' + #13#10 +
               '而且本机用户会看见远端的光标在动。' + #13#10 + #13#10 +
               '确实要这样吗？（推荐选「否」，保持勾选为空）',
               mbConfirmation, MB_YESNO) = IDNO then

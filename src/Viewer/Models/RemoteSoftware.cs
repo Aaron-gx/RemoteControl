@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Agent.Common;
@@ -59,6 +60,35 @@ public sealed class RemoteSoftware : INotifyPropertyChanged
     }
 
     public string ToolTipText => string.IsNullOrEmpty(ExePath) ? Name : $"{Name}\n{ExePath}";
+
+    /// <summary>置顶的「此电脑」固定项（不是被控端枚举出来的软件，2026-10 新增）</summary>
+    public bool IsThisPc { get; private init; }
+
+    /// <summary>构造置顶的「此电脑」项：ExePath 用被控端认识的哨兵值，图标程序内绘制</summary>
+    public static RemoteSoftware CreateThisPc()
+        => new() { Name = "此电脑", ExePath = SoftwareListMarkers.ThisPc, IsThisPc = true, Icon = DrawThisPcIcon() };
+
+    /// <summary>画一个简易显示器图标（不依赖被控端传 icon base64 —— 这一项是主控端自己造的）</summary>
+    private static ImageSource? DrawThisPcIcon()
+    {
+        try
+        {
+            var dv = new DrawingVisual();
+            using (var dc = dv.RenderOpen())
+            {
+                dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromRgb(0x3E, 0x9E, 0xF0)), null,
+                    new Rect(2, 3, 20, 14), 2, 2);
+                dc.DrawRectangle(Brushes.White, null, new Rect(4, 5, 16, 10));
+                dc.DrawRectangle(new SolidColorBrush(Color.FromRgb(0x3E, 0x9E, 0xF0)), null, new Rect(9, 17, 6, 2));
+                dc.DrawRectangle(new SolidColorBrush(Color.FromRgb(0x3E, 0x9E, 0xF0)), null, new Rect(6, 19, 12, 2));
+            }
+            var bmp = new RenderTargetBitmap(24, 24, 96, 96, PixelFormats.Pbgra32);
+            bmp.Render(dv);
+            bmp.Freeze();
+            return bmp;
+        }
+        catch { return null; }
+    }
 
     public static RemoteSoftware From(SoftwareInfo info)
     {

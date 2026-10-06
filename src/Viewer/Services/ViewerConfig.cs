@@ -43,7 +43,7 @@ public sealed class ViewerConfig
     /// all = 全部屏幕合成一幅画面（主屏 + 副屏；物理屏那块只读）。
     /// 被控端按这个下发 CaptureModeHint，连上时会重新告知一次。
     /// </summary>
-    public string CaptureMode { get; set; } = "virtual";
+    public string CaptureMode { get; set; } = "primary";   // 2026-10-05 客户要求：默认看主屏（纯监视）
 
     /// <summary>
     /// "主屏 / 全部屏幕"这两档画面里，物理屏那块是不是**只读**。
@@ -51,7 +51,7 @@ public sealed class ViewerConfig
     /// true = 只读：点它只是"把那个窗口搬到副屏"（本机用户完全不受打扰，早期默认值）。
     /// 注意：真机上如果还有人坐着用这台机器，可操作会让他看见远端光标在动 —— 所以做成开关。
     /// </summary>
-    public bool PhysicalScreenReadOnly { get; set; } = false;
+    public bool PhysicalScreenReadOnly { get; set; } = true;   // 2026-10-05 客户要求：主屏纯监视，鼠标点不了
 
     [JsonPropertyName("LogLevel")]
     public string LogLevelName { get; set; } = "Info";

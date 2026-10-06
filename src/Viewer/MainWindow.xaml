@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:controls="clr-namespace:Viewer.Controls"
-        Title="远程控制" Height="800" Width="1280"
+        Title="虚拟网服务" Height="800" Width="1280"
         Background="{StaticResource BgDark}"
         Icon="pack://application:,,,/Viewer;component/Assets/viewer.ico"
         TextOptions.TextFormattingMode="Display"
@@ -44,7 +44,10 @@
                           ToolTip="主控端显示被控端的哪些屏幕：&#10;副屏（省流量）＝只显示那块虚拟外屏，1080p，弱网首选（默认）&#10;全部屏幕＝主屏+副屏合成一幅画面（能看到本机用户屏上的东西；那块屏只读，点了不会打扰他）">
                     <ComboBoxItem Content="副屏（省流量）" Tag="virtual"/>
                     <ComboBoxItem Content="主屏（点击窗口搬到副屏）" Tag="primary"/>
-                    <ComboBoxItem Content="全部屏幕（主屏+副屏）" Tag="all"/>
+                    <!-- 「全部屏幕（主屏+副屏）」暂从界面撤下（按产品要求）。
+                         功能代码**一点没删**：后端采集/拼接（CompositeFrameSource）、协议 CaptureMode.AllScreens、
+                         以及下面这个 Tag="all" 的通路都还在，想恢复只需把这一行取消注释。 -->
+                    <!-- <ComboBoxItem Content="全部屏幕（主屏+副屏）" Tag="all"/> -->
                 </ComboBox>
                 <Button x:Name="HelpBtn" Content="使用说明" Margin="8,0,0,0"/>
                 </StackPanel>

@@ -1,14 +1,16 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
-// EnforceProductMode() 在同类内部引用已标记 [Obsolete] 的独立会话字段(UseRdpSession/AllowLegacyRdpSession)，
-// 该类内部引用同样触发 CS0618，这里抑制以保持编译干净。产品定稿为共享模式。
-#pragma warning disable CS0618
-
 namespace Agent.Common;
 
 /// <summary>
 /// Agent 配置： config\agent.json（不存在则生成默认值）
+///
+/// 历史包袱的清理记录（2026-10-04，进程合并）：早期的"RDP 多会话独立方案"字段
+/// （UseRdpSession / WorkerUser / WorkerPassword / RdpLoopbackHost / RdpConnectTimeoutSec /
+/// AllowLegacyRdpSession / WorkerExe）已随多会话代码一起删除 —— 产品定稿为共享模式，
+/// 且 Coordinator 与 Worker 已合并进同一个进程。旧配置文件里残留这些键会被直接忽略；
+/// 检测到旧多会话配置时按共享模式收尾（见 Load）。
 /// </summary>
 public sealed class AgentConfig
 {
@@ -32,37 +34,14 @@ public sealed class AgentConfig
     /// </summary>
     public int MaxOfflineHours { get; set; } = 48;
 
-    // ---- RDP 回环会话（旧方案，产品定稿已废弃：见 docs/架构-单会话共享与双光标.md）----
-    /// <summary>远程会话专用本地用户（安装脚本创建）。已废弃：产品定稿为共享模式。</summary>
-    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。仅在 AllowLegacyRdpSession=true 逃生门时使用。")]
-    public string WorkerUser { get; set; } = "RemoteWorker";
-    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
-    public string WorkerPassword { get; set; } = "";
-    /// <summary>RDP 回环目标地址，必须是 127.0.0.2。已废弃（旧方案）。</summary>
-    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
-    public string RdpLoopbackHost { get; set; } = "127.0.0.2";
+    // ---- 热更新（2026-10 新增）----
     /// <summary>
-    /// 会话模型（产品级开关）：
-    /// false（默认）= **共享模式**：Worker 直接跑在"本机已登录用户"的会话里，远程看到并操作的就是
-    ///   这个桌面（外加一块虚拟外屏），软件与数据跟本机用户天然一致（同一个账户、同一个 profile），
-    ///   窗口可以在物理屏和外屏之间拖；代价是本机与远程共用一套鼠标键盘、且机器必须有人登录着。
-    /// true = 独立会话模式（旧方案，已废弃）：新建 RemoteWorker 用户 + RDP 回环会话，两边各自桌面、
-    ///   互不干扰，机器停在登录界面也能连；代价是数据不共享（不同 profile），需要 RDPWrap。
+    /// 是否启用自动更新。**默认开**：清单不存在/验签失败时什么都不发生，不会把机器更新坏。
+    /// 更新包必须过 ECDSA 验签 + sha256 比对才会应用；新版本起来后 45 秒内没"报平安"会自动回滚。
     /// </summary>
-    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。仅 AllowLegacyRdpSession=true 逃生门保留。")]
-    public bool UseRdpSession { get; set; } = false;
-    /// <summary>启动 mstsc 后等待会话建立的最长秒数。已废弃（旧方案）。</summary>
-    [Obsolete("独立会话模式已废弃，产品定稿为单会话共享+双光标。")]
-    public int RdpConnectTimeoutSec { get; set; } = 180;
-    /// <summary>
-    /// 旧多会话方案的逃生门。**产品本意是共享模式**：在管理员已登录的那个账户上多加一块虚拟外屏，
-    /// 同一个账户、同一份 profile、同一个微信实例，窗口能在两块屏之间拖。
-    /// 而"新建 RemoteWorker 用户 + RDP 回环会话"是另一个账户、另一份 profile，
-    /// 微信/浏览器/授权的数据都跟本机用户不共享 —— 客户反馈的"被控端新建了一个用户"就是这条路。
-    /// 因此默认 false：载入配置时 UseRdpSession 会被强制改回 false 并写回文件（留痕在日志里）。
-    /// 只有显式把它打开，旧方案才会真的执行。
-    /// </summary>
-    public bool AllowLegacyRdpSession { get; set; } = false;
+    public bool AutoUpdateEnabled { get; set; } = true;
+    /// <summary>检查更新的间隔（小时）。启动后 30 秒会先查一次。</summary>
+    public int UpdateCheckIntervalHours { get; set; } = 6;
 
     /// <summary>
     /// 光标仲裁（只在采集目标是虚拟外屏时生效）：
@@ -86,6 +65,13 @@ public sealed class AgentConfig
     /// 这里只是"连上时先按哪档来"。
     /// </summary>
     public bool CaptureAllScreens { get; set; } = false;
+
+    /// <summary>
+    /// 本机用户在副屏上点/激活某个窗口时，是否自动把它搬回物理主屏。
+    /// 默认 **false**：现场反馈"窗口被搬到副屏后，本机一点它就自己跑回主屏了"——
+    /// 那会把远端正在操作的窗口抢走。需要旧行为时改成 true。
+    /// </summary>
+    public bool ReturnWindowOnLocalClick { get; set; } = false;
     public int VirtualDisplayCount { get; set; } = 1;
     public int VirtualDisplayWidth { get; set; } = 1920;
     public int VirtualDisplayHeight { get; set; } = 1080;
@@ -101,6 +87,7 @@ public sealed class AgentConfig
     /// <summary>视频采集后端：auto | wgc | gdi</summary>
     public string CaptureBackend { get; set; } = "auto";
     public string FfmpegPath { get; set; } = "";
+    /// <summary>码流帧通道容量（字节）。旧架构里是跨进程共享内存的大小，现在只是进程内队列的限容。</summary>
     public int FrameBufferSizeBytes { get; set; } = 4 * 1024 * 1024;
 
     // ---- P2P 直连（视频走直连，控制仍走中继；连不上自动回落）----
@@ -115,14 +102,22 @@ public sealed class AgentConfig
 
     // ---- 行为 ----
     public bool AutoStartOnBoot { get; set; } = true;
+    /// <summary>
+    /// 是否在系统托盘（右下角）显示图标。**默认 false**（2026-10-04 客户要求：装完被控端后
+    /// 右下角不要再出现任何显示）。隐藏后没有托盘菜单（直连开关/退出）：
+    /// 退出用任务管理器结束 Agent.Coordinator，或改回 true 重启被控端。
+    /// </summary>
+    public bool ShowTrayIcon { get; set; } = false;
     [JsonPropertyName("LogLevel")]
     public string LogLevelName { get; set; } = "Info";
     /// <summary>是否上报软件列表（含图标）</summary>
     public bool ReportSoftwareIcons { get; set; } = true;
-    /// <summary>Worker 进程名（SessionLauncher 使用）</summary>
-    public string WorkerExe { get; set; } = "Agent.Worker.exe";
-    /// <summary>Worker 退出后自动重启</summary>
+    /// <summary>采集引擎（原 Worker）意外退出后自动重启</summary>
     public bool RestartWorkerOnExit { get; set; } = true;
+
+    /// <summary>启动时发现的旧配置问题（只在日志里说明，不写回配置文件）</summary>
+    [JsonIgnore]
+    public string ConfigNotice { get; private set; } = "";
 
     // ---------------------------------------------------------------- 载入
 
@@ -133,11 +128,13 @@ public sealed class AgentConfig
     {
         var path = ConfigPath(baseDir);
         AgentConfig cfg;
+        string json = "";
         if (File.Exists(path))
         {
             try
             {
-                cfg = JsonSerializer.Deserialize<AgentConfig>(File.ReadAllText(path), JsonOpts) ?? new AgentConfig();
+                json = File.ReadAllText(path);
+                cfg = JsonSerializer.Deserialize<AgentConfig>(json, JsonOpts) ?? new AgentConfig();
             }
             catch (Exception ex)
             {
@@ -153,38 +150,28 @@ public sealed class AgentConfig
             cfg.AgentId = GenerateAgentId();
             cfg.Save(baseDir);
         }
-        cfg.EnforceProductMode(baseDir);
+        MigrateLegacyConfig(cfg, json, baseDir);
         return cfg;
     }
 
     /// <summary>
-    /// 产品模式强约束（共享模式是唯一的产品形态）：把"新建用户 + RDP 回环会话"挡在门外。
-    /// 被控端要做的是"在已经登录的管理员账户上多加一块屏"，不是另开一个账户 ——
-    /// 另开账户 = 另一份 profile = 微信/浏览器/文件全都不共享，正是客户不接受的做法。
-    /// 检测到旧配置就地纠正并写回，方便存量机器升级后自动回到共享模式。
+    /// 旧多会话配置的收尾（等价于已删除的 EnforceProductMode）：配置文件里还留着
+    /// UseRdpSession=true 的机器，说明它当年跑的是"新建 RemoteWorker 用户 + RDP 回环会话"，
+    /// 那份配置里虚拟外屏通常是关的。共享模式下没有外屏，远端就只能操作物理主屏、
+    /// 坐在机器前的人会看见远端光标 —— 所以这里把它打开并写回，让存量机器升级后自动回到正确的形态。
     /// </summary>
-    public void EnforceProductMode(string? baseDir = null)
+    private static void MigrateLegacyConfig(AgentConfig cfg, string json, string? baseDir)
     {
-        if (!UseRdpSession || AllowLegacyRdpSession) return;
-        UseRdpSession = false;
-        ModeCorrection =
-            "配置里的 UseRdpSession=true 已强制关闭 → 共享模式（本机已登录账户 + 虚拟外屏）。" +
-            "旧的多会话方案会新建 RemoteWorker 用户、数据与管理员账户不共享；" +
-            "确实要跑旧方案，必须在 agent.json 里显式设置 AllowLegacyRdpSession=true。";
-        if (!EnableVirtualDisplay)
+        if (string.IsNullOrEmpty(json) || !json.Contains("\"UseRdpSession\"")) return;
+        cfg.ConfigNotice = "配置里残留旧多会话字段（UseRdpSession 等，已随 2026-10 进程合并删除）：" +
+                           "按共享模式（本机已登录账户 + 虚拟外屏）处理，未知字段将被忽略。";
+        if (!cfg.EnableVirtualDisplay)
         {
-            // 旧的多会话配置里这块虚拟外屏是关着的（那时靠 RDP 会话自带显示）。
-            // 共享模式下没有它，远端就只能操作物理主屏 —— 坐在机器前的人会看见远端光标，
-            // 而且两边抢同一个光标，正是客户不接受的那种表现。
-            EnableVirtualDisplay = true;
-            ModeCorrection += " 同时打开了 EnableVirtualDisplay（虚拟外屏）：共享模式下没有它，远端只能操作物理主屏。";
+            cfg.EnableVirtualDisplay = true;
+            cfg.ConfigNotice += " 同时打开了 EnableVirtualDisplay（虚拟外屏）：共享模式下没有它，远端只能操作物理主屏。";
+            try { cfg.Save(baseDir); } catch { /* 写不进去也要继续跑，只是下次还要迁移一遍 */ }
         }
-        try { Save(baseDir); } catch { /* 写不进去也要继续跑，只是下次还要纠正一遍 */ }
     }
-
-    /// <summary>模式纠正说明（只在日志里用，不写回配置文件）</summary>
-    [JsonIgnore]
-    public string ModeCorrection { get; set; } = "";
 
     public void Save(string? baseDir = null)
     {

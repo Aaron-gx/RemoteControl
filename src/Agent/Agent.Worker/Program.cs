@@ -3,126 +3,10 @@ using Agent.Common;
 
 namespace Agent.Worker;
 
-internal static class Program
-{
-    // 版本号：改功能时记得+1 —— 主控端会显示它，用来判断现场那台被控端是不是旧包。
-    // 1.0.1 = 支持"画面范围切换（仅副屏/全部屏幕）"+ 远端带出来的新窗口自动搬到外屏
-    public const string Version = "1.0.1";
-
-    /// <summary>单实例互斥体（保持引用，避免被 GC 提前释放）</summary>
-    private static Mutex? _workerMutex;
-
-    [STAThread]
-    private static int Main(string[] args)
-    {
-        DisplayHelper.EnablePerMonitorDpiAwareness();
-
-        var cfg = AgentConfig.Load();
-        int sessionId = ArgInt(args, "--session") ?? SessionLauncherHelper.CurrentSessionId();
-        int parentPid = ArgInt(args, "--parent") ?? 0;
-
-        var log = new Logger("worker", minLevel: cfg.MinLogLevel, echoConsole: false);
-        log.Info("========== Agent Worker 启动 ==========");
-
-        // 单实例保护（同一会话只允许一个 Worker）。
-        // 为什么需要：协调器的"看护"与"掉线重试"可能几乎同时拉起 Worker，
-        // 两个 Worker 抢同一个命名管道与共享帧环时，新连接会把旧连接顶掉 →
-        // 旧 Worker 退出 → 协调器再拉 → 无限循环、画面 0 帧（实测缺陷）。
-        // 这里让"后来的那个"直接退出，先来的那个继续跑。
-        bool createdNew;
-        using var single = new Mutex(true, "Global\\RemoteControlWorker-" + sessionId, out createdNew);
-        if (!createdNew)
-        {
-            log.Warn($"已有 Worker 在会话 {sessionId} 运行，本次启动退出（单实例保护）");
-            return 0;
-        }
-        _workerMutex = single;   // 持有到进程退出
-        log.Info($"版本 {Version} / pid={Environment.ProcessId} / 会话={sessionId} / 用户={Environment.UserName} / " +
-                 $"管理员={SessionLauncherHelper.IsElevated} / 父进程={parentPid}");
-        log.Info($"显示拓扑：{string.Join(" | ", DisplayHelper.GetMonitors())}");
-        log.Info($"窗口站={DesktopHelper.GetWindowStationName()} 当前桌面={DesktopHelper.GetThreadDesktopName()} " +
-                 $"输入桌面={DesktopHelper.GetInputDesktopName()} 在输入桌面上={DesktopHelper.IsOnInputDesktop()}");
-
-        if (args.Contains("--capture-probe"))
-        {
-            RunCaptureProbe(cfg, log);
-            return 0;
-        }
-
-        ApplicationConfiguration.Initialize();
-        using var ctx = new WorkerContext(cfg, log, sessionId, parentPid);
-        ctx.Start();
-        try
-        {
-            Application.Run(ctx);
-        }
-        catch (Exception ex)
-        {
-            log.Error("消息循环异常", ex);
-        }
-        log.Info("Agent Worker 已退出");
-        return 0;
-    }
-
-    /// <summary>
-    /// 采集后端探测：在目标会话里逐个实测可用性并写日志（RDP 会话里 GDI/WGC 行为差异很大）。
-    /// 用法： Agent.Worker.exe --capture-probe
-    /// </summary>
-    private static void RunCaptureProbe(AgentConfig cfg, Logger log)
-    {
-        log.Info("===== 采集后端探测开始 =====");
-        log.Info($"会话={SessionLauncherHelper.CurrentSessionId()} 用户={Environment.UserName} 管理员={SessionLauncherHelper.IsElevated}");
-        foreach (var d in DisplayHelper.GetMonitors()) log.Info($"显示器：{d}");
-
-        var target = DisplayHelper.PickCaptureTarget();
-        if (target == null) { log.Error("没有显示器"); return; }
-        log.Info($"采集目标：{target}");
-
-        foreach (var backend in new[] { "wgc", "gdi", "gdi-noblt" })
-        {
-            FrameSource? src = null;
-            try
-            {
-                src = FrameSourceFactory.Create(backend, target, log);
-                log.Info($"[{backend}] 创建成功：{src.Backend} {src.Width}x{src.Height}");
-                using var ms = new MemoryStream();
-                int okFrames = 0;
-                for (int i = 0; i < 5; i++)
-                {
-                    ms.SetLength(0);
-                    if (src.Capture(ms, out var err))
-                    {
-                        okFrames++;
-                        if (okFrames == 1) log.Info($"[{backend}] 首帧 {ms.Length} 字节");
-                    }
-                    else
-                    {
-                        log.Warn($"[{backend}] 采集失败：{err}");
-                    }
-                    Thread.Sleep(60);
-                }
-                log.Info($"[{backend}] 结果：{(okFrames > 0 ? "可用" : "不可用")}（5 次中成功 {okFrames} 次）");
-            }
-            catch (Exception ex)
-            {
-                log.Error($"[{backend}] 异常：{ex.GetType().Name}: {ex.Message}");
-                log.Error($"   堆栈：{ex.StackTrace}");
-            }
-            finally
-            {
-                try { src?.Dispose(); } catch { }
-            }
-        }
-        log.Info("===== 采集后端探测结束 =====");
-    }
-
-    private static int? ArgInt(string[] args, string name)
-    {
-        var a = args.FirstOrDefault(x => x.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase));
-        if (a == null) return null;
-        return int.TryParse(a[(name.Length + 1)..], out var v) ? v : null;
-    }
-}
+// 2026-10 进程合并：本文件原先的 Main（单实例互斥 / --capture-probe 探测 / --session 参数）
+// 已随"Worker 独立进程"形态一起删除 —— WorkerContext 现在由 Agent.Coordinator 进程里的
+// WorkerHost 以 STA 线程承载，与 Coordinator 用进程内 WorkerBridge 通信。
+// 采集后端探测请用独立的 src\Tests\CaptureProbe 项目。
 
 /// <summary>0x11 的 JSON 兼容形态（纯 UTF-8 路径仍然支持）</summary>
 internal sealed class OpenSoftwareRequest
@@ -131,15 +15,29 @@ internal sealed class OpenSoftwareRequest
     public string? Args { get; set; }
 }
 
-/// <summary>Worker 主上下文：IPC + 采集 + 编码 + 注入 + 剪贴板</summary>
+/// <summary>Worker 主上下文：采集 + 编码 + 注入 + 剪贴板（在 Coordinator 进程内的 STA 线程上运行）</summary>
 public sealed class WorkerContext : ApplicationContext
 {
+    /// <summary>
+    /// 版本号：改功能时记得+1 —— 主控端会显示它，用来判断现场那台被控端是不是旧包。
+    /// 1.0.1 = 支持"画面范围切换（仅副屏/全部屏幕）"+ 远端带出来的新窗口自动搬到外屏
+    /// 1.1.0 = 进程合并（Worker 并入 Coordinator，IPC 换进程内通道）
+    /// 1.1.1 = "此电脑"等常驻进程代开窗口的主屏闪烁修复（钩子常驻 + 武装期 60ms 快扫）
+    /// 1.1.2 = 此电脑 /separate 独立窗口（治"到不了副屏"）+ "最近输入者"判据（治"主屏开软件跳副屏"）
+    /// 1.1.3 = CREATE 事件预定位（窗口显示前就挪到外屏，主屏零动作）；
+    /// 1.1.4 = 修 CREATE 常量错误（0x8001 是 DESTROY，真正的 CREATE 是 0x8000 —— 预定位从未生效过）；
+    ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
+    ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
+    /// </summary>
+    public const string Version = "1.3.0";
+
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
     private readonly int _sessionId;
-    private readonly int _parentPid;
+    /// <summary>引擎 STA 线程号：停止指令来自桥的分发线程，得靠它把 WM_QUIT 投回消息循环所在线程</summary>
+    private readonly uint _staThreadId;
 
-    private readonly IpcClient _ipc;
+    private readonly WorkerBridge _bridge;
     private readonly InputInjector _injector;
     private readonly WindowManager _windows;
     private ClipboardWatcher? _clipboard;
@@ -190,30 +88,30 @@ public sealed class WorkerContext : ApplicationContext
     private long _ringDrops;
     /// <summary>协调器回报的"中继出口拥塞"（IPC 每秒更新一次）</summary>
     private volatile bool _outboundCongested;
+    /// <summary>主控端是否在线（协调器每秒通过 IpcBitrateHint 告知——不能用"远端没动鼠标"代替）</summary>
+    private volatile bool _viewerOnline;
     /// <summary>上一次"因为本机用户在操作所以丢掉了远端按键"的提示时间</summary>
     private long _lastKeyBlockedNotifyTick;
     private readonly Dictionary<string, int> _launched = new(StringComparer.OrdinalIgnoreCase);
 
-    public WorkerContext(AgentConfig cfg, Logger log, int sessionId, int parentPid)
+    public WorkerContext(AgentConfig cfg, Logger log, int sessionId, WorkerBridge bridge)
     {
         _cfg = cfg;
         _log = log;
         _sessionId = sessionId;
-        _parentPid = parentPid;
-        _ipc = new IpcClient(log);
+        _bridge = bridge;
+        _staThreadId = NativeApi.GetCurrentThreadId();   // 构造发生在引擎 STA 线程上（见 WorkerHost）
         _injector = new InputInjector(log);
         _windows = new WindowManager(log);
     }
 
     public void Start()
     {
-        _ipc.MessageReceived += OnMessage;
-        if (!_ipc.Connect(TimeSpan.FromSeconds(45)))
-        {
-            _log.Error("无法连接 Coordinator，Worker 退出");
-            ExitThread();
-            return;
-        }
+        _bridge.MessageFromCoordinator += OnMessage;
+        _log.Info($"========== 采集引擎启动（版本 {Version}，会话 {_sessionId}，用户 {Environment.UserName}）==========");
+        _log.Info($"显示拓扑：{string.Join(" | ", DisplayHelper.GetMonitors())}");
+        _log.Info($"窗口站={DesktopHelper.GetWindowStationName()} 当前桌面={DesktopHelper.GetThreadDesktopName()} " +
+                  $"输入桌面={DesktopHelper.GetInputDesktopName()} 在输入桌面上={DesktopHelper.IsOnInputDesktop()}");
 
         // 采集目标 + 编码器
         // 虚拟副屏默认模式可能是 800x600，先显式切到配置分辨率（必须在挑采集目标之前做）
@@ -240,6 +138,8 @@ public sealed class WorkerContext : ApplicationContext
         _injector.SetCaptureTarget(_target);
         // 窗口摆放始终以虚拟外屏为准：远端打开的应用/对话框要出现在那块屏上，而不是画布中心
         _windows.SetCaptureTarget(_virtualScreen ?? _target);
+        // 反向抓取要用"虚拟外屏在哪"（与采集目标解耦：画布模式下采集的是整个桌面，但外屏矩形另有其人）
+        _windows.VirtualScreenProvider = () => _virtualScreen;
 
         // 光标仲裁：只有"远端那块屏是虚拟屏"时才成立 —— 虚拟屏没有物理输出，
         // 远端光标本来就不会被坐着的人看见，仲裁只需处理"本机用户一动鼠标就把
@@ -316,11 +216,11 @@ public sealed class WorkerContext : ApplicationContext
         // 剪贴板（写入必须回到 STA 主线程，见 SetClipboardOnUiThread）
         _clipboard = new ClipboardWatcher(_log);
         _clipboard.TextCopied += text =>
-            _ipc.Send(new ProtocolMessage(MessageType.ClipboardText, PayloadCodec.EncodeText(text)));
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.ClipboardText, PayloadCodec.EncodeText(text)));
         _clipboard.FilesCopied += files =>
         {
             foreach (var f in files)
-                _ipc.Send(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(f)));
+                _bridge.SendToCoordinator(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(f)));
         };
 
         // 采集线程
@@ -335,9 +235,9 @@ public sealed class WorkerContext : ApplicationContext
             Height = _source.Height,
             Monitor = _target.DeviceName,
             Backend = _source.Backend,
-            Version = Program.Version,
+            Version = Version,
         };
-        _ipc.Send(new ProtocolMessage(MessageType.WorkerReady, JsonCodec.Encode(ready)));
+        _bridge.SendToCoordinator(new ProtocolMessage(MessageType.WorkerReady, JsonCodec.Encode(ready)));
         SendMonitorInfo();
 
         // 同类远控软件看护：机器上还有别的远控在跑时主动**退出光标争夺**（见 CursorArbiter.Disarm）。
@@ -353,9 +253,6 @@ public sealed class WorkerContext : ApplicationContext
         // （CursorArbiter 的 WH_KEYBOARD_LL 在哪个线程装的，回调就在哪个线程跑）。
         // 主线程一旦被枚举窗口这类活儿占住，钩子就会超时 —— 表现是"被控端一连接，整机键盘就发滞、丢键"。
         _ = Task.Run(HousekeepingLoop);
-
-        // 父进程看护
-        if (_parentPid > 0) WatchParent();
     }
 
     /// <summary>
@@ -627,7 +524,7 @@ public sealed class WorkerContext : ApplicationContext
                 Thread.Sleep(500);
             }
             // 通知主控端也重建解码器，避免半帧污染
-            _ipc.Send(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
         }
         catch (Exception ex)
         {
@@ -660,7 +557,7 @@ public sealed class WorkerContext : ApplicationContext
             }
             _encoderRestartFails = 0;
             // 通知主控端也重建解码器，避免半帧污染
-            _ipc.Send(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
         }
         catch (Exception ex)
         {
@@ -679,7 +576,7 @@ public sealed class WorkerContext : ApplicationContext
         if (now - last < 10_000) return;
         if (Interlocked.CompareExchange(ref _lastKeyBlockedNotifyTick, now, last) != last) return;
         _log.Info("本机用户正在操作，本次远端按键已丢弃（避免打进本机用户的前台窗口）");
-        _ipc.Send(new ProtocolMessage(MessageType.Error,
+        _bridge.SendToCoordinator(new ProtocolMessage(MessageType.Error,
             PayloadCodec.EncodeText("被控端有人正在本机键鼠上操作，为避免把字打进他的窗口，远端按键已暂时忽略；对方停手后自动恢复")));
     }
 
@@ -693,7 +590,7 @@ public sealed class WorkerContext : ApplicationContext
             // （实测：被控端一直 23fps 在发，主控端却一帧都解不出来）。这里只丢这一块并计数，
             // 交给 BitrateGovernor 降码率；GOP 已经收到 1 秒，丢块后最多 1 秒就能靠下一个关键帧自愈。
             // 超时也从 800ms 收到 250ms：宁可多丢一块，也别把编码器这条链子卡住那么久。
-            if (!_ipc.Ring.Write(new ReadOnlySpan<byte>(buffer, 0, length), timeoutMs: 250))
+            if (!_bridge.Frames.Write(new ReadOnlySpan<byte>(buffer, 0, length), timeoutMs: 250))
             {
                 long n = Interlocked.Increment(ref _ringDrops);
                 if (n <= 3 || n % 100 == 0)
@@ -838,7 +735,10 @@ public sealed class WorkerContext : ApplicationContext
                     }
                 }
                 _log.Info($"收到打开软件指令：{exe} {args}");
-                int pid = _windows.Open(exe, args);
+                // 「此电脑」（主控端软件列表置顶项）：在资源管理器里打开，窗口摆到外屏
+                int pid = string.Equals(exe, WindowManager.ThisPcMarker, StringComparison.OrdinalIgnoreCase)
+                    ? _windows.OpenThisPC()
+                    : _windows.Open(exe, args);
                 if (pid > 0) _launched[exe] = pid;
                 SendSoftwareState(exe, pid, pid > 0);
                 break;
@@ -882,6 +782,7 @@ public sealed class WorkerContext : ApplicationContext
                 // 协调器看到的中继出口拥塞（Worker 自己看不到那条腿）
                 var hint = JsonCodec.Decode<BitrateHintInfo>(msg.Payload);
                 _outboundCongested = hint?.Congested ?? false;
+                _viewerOnline = hint?.ViewerOnline ?? false;
                 break;
             }
             case MessageType.RequestSoftwareList:
@@ -896,9 +797,12 @@ public sealed class WorkerContext : ApplicationContext
                 break;
             }
             case MessageType.Stop:
-                _log.Info("收到停止指令，Worker 退出");
+                _log.Info("收到停止指令，采集引擎退出");
                 _stop = true;
-                ExitThread();
+                // 注意：本回调跑在**桥的分发线程**上，而消息循环在本引擎的 STA 线程上 ——
+                // 在别的线程上调 ExitThread() 退不了那条循环（原独立进程时代这里就是主线程，没有这问题）。
+                // 正确做法：往引擎线程投递 WM_QUIT，让 Application.Run 自然返回、走 Dispose 收尾。
+                NativeApi.PostThreadMessage(_staThreadId, NativeApi.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
                 break;
             default:
                 _log.Debug($"忽略消息 0x{(byte)msg.Type:X2}");
@@ -993,6 +897,15 @@ public sealed class WorkerContext : ApplicationContext
             {
                 long now = Environment.TickCount64;
 
+                // 副屏孤儿窗口回收：主控端离线时，把所有"整块落在副屏上"的可见窗口搬回主屏。
+                // 为什么需要这个（除了 SHOW 事件上的反向抓取）：Telegram 等从托盘恢复**不触发 SHOW**
+                // （窗口一直是"可见"的，只是不在前台），SHOW 路径抓不到 → 客户反馈"tg 第一次打开不回主屏"。
+                // 周期检查每秒跑一次，条件更严（要求主控端离线 ≥10 秒），避免跟远端操作打架。
+                if (!_viewerOnline)   // 主控端 10 秒没发过任何输入
+                {
+                    _windows.ReclaimOrphanWindowsFromVirtual();
+                }
+
                 // 补抬起：远端停手 3 秒后
                 if (now - Interlocked.Read(ref _lastRemoteKeyTick) > 3000)
                 {
@@ -1009,16 +922,24 @@ public sealed class WorkerContext : ApplicationContext
                     }
                 }
 
-                // Win+R 会话期：运行框 + 它启动出来的程序都摆到外屏
+                // Win+R 会话期：运行框 + 它启动出来的程序都摆到外屏。
+                // 两道闸门缺一不可（少一道就会出现"本机用户一开微信就被搬到副屏"）：
+                //   ① 远端**刚刚**在操作（3 秒内）—— 命令敲下去后程序一般 1~3 秒就起来了；
+                //   ② 本机用户此刻没在动键鼠 —— 他动手时一个窗口都不碰（他在自己开程序）。
                 MoveRunDialogToVirtualIfExpected();
-                if (now < Interlocked.Read(ref _expectRunDialogUntil))
+                // 判据用**远端键盘**（而不是"远端动过鼠标"）：新程序只可能由 Win+R / 敲命令带出来，
+                // 而鼠标是随时在动的 —— 用鼠标当判据会导致"本机用户一开应用就被搬走"（现场反馈）。
+                bool remoteTyping = now - Interlocked.Read(ref _lastRemoteKeyTick) < 5000;
+                bool localBusy = _arbiter?.LocalActiveWithin(2000) ?? false;
+                if (now < Interlocked.Read(ref _expectRunDialogUntil) && remoteTyping && !localBusy)
                 {
                     int n = _windows.SweepNewWindowsFromPhysical(remoteActive: true, localActive: false);
                     if (n > 0) _log.Info($"Win+R 期间把 {n} 个新窗口摆到了外屏");
                 }
 
-                // 本机用户点任务栏把外屏窗口叫起来 → 搬回主屏
-                MoveForegroundBackToPrimaryIfLocal();
+                // 本机用户点任务栏把外屏窗口叫起来 → 搬回主屏（默认关闭，见 AgentConfig.ReturnWindowOnLocalClick：
+                // 开着会把远端正在用的窗口抢回主屏，现场反馈过，所以做成开关且默认关）
+                if (_cfg.ReturnWindowOnLocalClick) MoveForegroundBackToPrimaryIfLocal();
             }
             catch (Exception ex) { _log.Debug($"周期性杂务异常：{ex.Message}"); }
             for (int i = 0; i < 10 && !_stop; i++) Thread.Sleep(100);   // 1 秒一轮，停止时能立刻退出
@@ -1098,7 +1019,7 @@ public sealed class WorkerContext : ApplicationContext
     private void SendSoftwareState(string exePath, int pid, bool running)
     {
         var info = new SoftwareStateInfo { ExePath = exePath, Pid = pid, IsRunning = running };
-        _ipc.Send(new ProtocolMessage(MessageType.SoftwareState, JsonCodec.Encode(info)));
+        _bridge.SendToCoordinator(new ProtocolMessage(MessageType.SoftwareState, JsonCodec.Encode(info)));
     }
 
     private void SendMonitorInfo()
@@ -1129,7 +1050,7 @@ public sealed class WorkerContext : ApplicationContext
                 Device = m.DeviceName,
             });
         }
-        _ipc.Send(new ProtocolMessage(MessageType.MonitorInfo, JsonCodec.Encode(info)));
+        _bridge.SendToCoordinator(new ProtocolMessage(MessageType.MonitorInfo, JsonCodec.Encode(info)));
     }
 
     private void SendStatus()
@@ -1180,63 +1101,27 @@ public sealed class WorkerContext : ApplicationContext
                 CursorContested = _router?.CursorContested ?? false,
                 // 有同类软件在跑（哪怕此刻点击是好的）也要上报：主控端据此显示"与它共用光标"
                 CursorBlockerHint = _router?.BlockerHint ?? "",
+                // 抢窗闸门的诊断：仲裁器在不在岗 + 本机物理输入空闲多久（-1=无仲裁器 → 闸门失效）
+                CursorArbiterArmed = _arbiter is { Armed: true },
+                LocalInputIdleMs = _arbiter == null ? -1 : Environment.TickCount64 - _arbiter.LastPhysicalInputTick,
             };
-            _ipc.Send(new ProtocolMessage(MessageType.WorkerStatus, JsonCodec.Encode(status)));
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.WorkerStatus, JsonCodec.Encode(status)));
         }
         catch { }
-    }
-
-    // ---------------------------------------------------------------- 父进程看护
-
-    private void WatchParent()
-    {
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                var parent = Process.GetProcessById(_parentPid);
-                parent.WaitForExit();
-                _log.Warn("父进程（Coordinator）已退出，Worker 跟随退出");
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"父进程看护异常：{ex.Message}");
-            }
-            _stop = true;
-            try { ExitThread(); } catch { }
-        });
     }
 
     protected override void Dispose(bool disposing)
     {
         _stop = true;
+        // 退订桥事件：桥的生命周期跟 Coordinator（比引擎长），引擎重启后是新的 WorkerContext，
+        // 不退订的话旧的（已 Dispose 的）实例还会收到消息、跟新实例抢输入。
+        _bridge.MessageFromCoordinator -= OnMessage;
         try { _statusTimer?.Dispose(); } catch { }
         try { _arbiter?.Dispose(); } catch { }
         try { _clipboard?.Dispose(); } catch { }
         try { _encoder?.Dispose(); } catch { }
         try { _source?.Dispose(); } catch { }
-        try { _ipc.Dispose(); } catch { }
-        _log.Info($"Worker 收尾完成（运行 {_uptime.Elapsed.TotalSeconds:F0}s，采集 {_framesCaptured} 帧）");
+        _log.Info($"采集引擎收尾完成（运行 {_uptime.Elapsed.TotalSeconds:F0}s，采集 {_framesCaptured} 帧）");
         base.Dispose(disposing);
-    }
-}
-
-/// <summary>Worker 侧需要的少量会话/令牌查询（避免引用 Coordinator 程序集）</summary>
-internal static class SessionLauncherHelper
-{
-    public static int CurrentSessionId()
-    {
-        NativeApi.ProcessIdToSessionId(Environment.ProcessId, out int sid);
-        return sid;
-    }
-
-    public static bool IsElevated
-    {
-        get
-        {
-            using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
-            return new System.Security.Principal.WindowsPrincipal(id)
-                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-        }
     }
 }

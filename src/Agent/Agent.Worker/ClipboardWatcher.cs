@@ -65,12 +65,16 @@ public sealed class ClipboardWatcher : NativeWindow, IDisposable
                     var files = new List<FileDropInfo>();
                     foreach (var f in Clipboard.GetFileDropList())
                     {
-                        if (string.IsNullOrEmpty(f) || !File.Exists(f)) continue;
+                        // 文件夹复制（2026-10 新增）：目录走 IsFolder，由协调器打包成 zip 上传。
+                        // 注意不能只看 File.Exists —— 目录会被它判 false，以前文件夹就是这样被静默丢掉的。
+                        bool isDir = !string.IsNullOrEmpty(f) && Directory.Exists(f);
+                        if (string.IsNullOrEmpty(f) || (!isDir && !File.Exists(f))) continue;
                         files.Add(new FileDropInfo
                         {
                             LocalPath = f,
-                            FileName = Path.GetFileName(f),
-                            FileSize = new FileInfo(f).Length,
+                            FileName = Path.GetFileName(f.TrimEnd('\\', '/')),
+                            FileSize = isDir ? 0 : new FileInfo(f).Length,
+                            IsFolder = isDir,
                         });
                     }
                     if (files.Count > 0)

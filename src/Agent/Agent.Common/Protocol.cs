@@ -382,12 +382,27 @@ public sealed class SoftwareStateInfo
     public bool IsRunning { get; set; }
 }
 
+/// <summary>
+/// 主控端软件列表的固定项标记（2026-10 新增）：放在 Common 是因为主控端（Viewer）与
+/// 被控端（WindowManager）都要认识它，而 Viewer 只引用 Agent.Common。
+/// </summary>
+public static class SoftwareListMarkers
+{
+    /// <summary>「此电脑」：打开指令的 exePath 用这个值，被控端收到后在资源管理器里打开"此电脑"并摆到外屏</summary>
+    public const string ThisPc = "::this-pc";
+}
+
 /// <summary>剪贴板文件通知（0x21）</summary>
 public sealed class ClipboardFileInfo
 {
     public string FileId { get; set; } = "";
     public string FileName { get; set; } = "";
     public long FileSize { get; set; }
+
+    /// <summary>复制的是**文件夹**：传输时被压成了 zip，主控端收到后应解压成目录再放进本机剪贴板</summary>
+    public bool IsFolder { get; set; }
+    /// <summary>原始文件夹名（IsFolder=true 时有效；FileName 是 "xxx.zip"）</summary>
+    public string FolderName { get; set; } = "";
 }
 
 /// <summary>显示器信息（0x14）</summary>
@@ -471,6 +486,9 @@ public sealed class BitrateHintInfo
     public int VideoQueued { get; set; }
     /// <summary>被挤掉的视频块数（累计，单调递增）</summary>
     public long VideoDropped { get; set; }
+    /// <summary>主控端当前是否在线（协调器的 HasViewer 判定）。引擎据此决定是否回收副屏孤儿窗口：
+    /// 连着但没动鼠标 ≠ 离线（用户可能正在看副屏画面，不能把窗口搬走）。</summary>
+    public bool ViewerOnline { get; set; }
 }
 
 /// <summary>Worker 状态（0x41，IPC）</summary>
@@ -564,6 +582,20 @@ public sealed class WorkerStatusInfo
     /// <summary>光标不受控时，可能是哪些程序在抢（远控/鼠标类进程名，供用户照着关掉）</summary>
     public string CursorBlockerHint { get; set; } = "";
 
+    /// <summary>
+    /// 诊断（2026-10-05）：光标仲裁器是否在岗（物理输入监听活着）。抢窗闸门（"本机用户动过就不搬"）
+    /// 全靠它的物理输入时间戳 —— 它不在线时所有闸门失效，主屏开的软件会被当成远端的搬走。
+    /// </summary>
+    public bool CursorArbiterArmed { get; set; }
+    /// <summary>诊断：距本机用户上一次物理输入过了多少毫秒（-1 = 无仲裁器）。越小=他刚动过</summary>
+    public long LocalInputIdleMs { get; set; } = -1;
+
+    // ---- 热更新状态（2026-10 新增，远程可观测）----
+    /// <summary>更新状态一句话：未检查 / 已最新 / 下载中 / 待应用 / 已应用 / 失败:原因</summary>
+    public string UpdateState { get; set; } = "";
+    /// <summary>已下载待应用的版本号（无则空）</summary>
+    public string UpdateStaged { get; set; } = "";
+
     // ---- 被控端主动上报的自身信息（主控端用来显示"这是哪台电脑"）----
 
     /// <summary>计算机名</summary>
@@ -594,4 +626,7 @@ public sealed class FileDropInfo
     public string LocalPath { get; set; } = "";
     public string FileName { get; set; } = "";
     public long FileSize { get; set; }
+
+    /// <summary>这条是**目录**而不是文件（文件夹复制，2026-10 新增）：协调器要打包成 zip 再上传</summary>
+    public bool IsFolder { get; set; }
 }

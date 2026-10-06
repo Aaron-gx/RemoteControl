@@ -37,7 +37,7 @@ public sealed class TrayIcon : IDisposable
 
     public event Action? ExitRequested;
 
-    public TrayIcon(Logger log, string tooltip = "远程控制 Agent", TrayHooks? hooks = null)
+    public TrayIcon(Logger log, string tooltip = "虚拟网服务", TrayHooks? hooks = null)
     {
         _log = log;
         _hooks = hooks;

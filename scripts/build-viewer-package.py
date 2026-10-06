@@ -6,7 +6,7 @@
 
 产物：
   build\viewer\            —— 程序目录（含 viewer-defaults.txt）
-  build\主控端安装包.zip    —— 直接发给客户解压即用
+  build\虚拟网服务-安装包.zip    —— 直接发给客户解压即用
 
 用法：
   python scripts\build-viewer-package.py [--out <目录>]
@@ -120,7 +120,7 @@ def main():
         f.write(f'Token={token}\n')
 
     print('3) 打 zip 便于分发 …')
-    zip_out = os.path.join(ROOT, 'build', '主控端安装包.zip')
+    zip_out = os.path.join(ROOT, 'build', '虚拟网服务-安装包.zip')
     if os.path.exists(zip_out):
         os.remove(zip_out)
     count = 0

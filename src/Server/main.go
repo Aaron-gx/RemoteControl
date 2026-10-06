@@ -271,6 +271,13 @@ func newMux(hub *Hub, store *FileStore) *http.ServeMux {
 	store.Register(mux)
 	registerAdmin(mux, hub, hub.License, hub.Logger())
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	// 热更新分发：持久目录 <data>/updates（不走 /api/upload 的 10 分钟暂存）。
+	// 在这里构造（而不是改 newMux 签名）是为了让既有测试零改动地拿到同一套路由。
+	if upd, err := NewUpdateStore(filepath.Join(store.Dir(), "updates"), store.Token, hub.Logger()); err == nil {
+		upd.Register(mux, hub)
+	} else {
+		hub.Logger().Printf("update: store unavailable: %v", err)
+	}
 	return mux
 }
 

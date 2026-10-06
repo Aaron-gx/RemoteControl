@@ -87,6 +87,15 @@ public sealed class CursorArbiter : IDisposable
     {
         if (Armed) return true;
 
+        // 被同类远控挤掉时钩子没拆（被动监听，见 Disarm）：直接把仲裁开回来，不用重装
+        if (_mouseHook != IntPtr.Zero)
+        {
+            Armed = true;
+            DisarmedByRival = false;
+            _log.Info("同类远控已退出：光标仲裁重新启用（被动监听钩子一直在岗）");
+            return true;
+        }
+
         // 同一个会话里**只允许一个仲裁器装钩子**。
         // 为什么：机器上装了两份被控端时，两份都会装 WH_MOUSE_LL —— 另一份会把远端注入的
         // 光标当成"本机用户物理输入"抢回去，现场表现就是"在副屏点击、主屏的鼠标也跟着点、
@@ -147,6 +156,16 @@ public sealed class CursorArbiter : IDisposable
         DisarmedByRival = byRival;
         if (!Armed) return;
         Armed = false;
+        if (byRival)
+        {
+            // 【被动监听模式】被同类远控挤掉时**不拆钩子**：仲裁（还光标/重放）全部停用，
+            // 但钩子继续"只看不碰"地记录本机物理输入 —— "本机用户动过就不搬窗口"的所有闸门
+            // 都靠 LastPhysicalInputTick，拆了钩子闸门就全瞎了（实测：开着 UU远程 的机器上
+            // 主屏开任何软件都被搬到副屏，就是这里瞎的）。被动钩子永远 CallNextHookEx 直通，
+            // 不改写任何事件，不会跟对方的钩子抢任何东西。
+            _log.Warn($"光标仲裁已停用（保留被动监听）：{reason}");
+            return;
+        }
         try { if (_mouseHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_mouseHook); } catch { }
         try { if (_kbHook != IntPtr.Zero) NativeApi.UnhookWindowsHookEx(_kbHook); } catch { }
         _mouseHook = _kbHook = IntPtr.Zero;
@@ -207,7 +226,19 @@ public sealed class CursorArbiter : IDisposable
 
     private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode < 0 || _disposed || !Armed) return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        if (nCode < 0 || _disposed) return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        if (!Armed)
+        {
+            // 被动监听（被同类远控挤掉后钩子保留）：只记录物理输入时间戳，其余一概不管、直通
+            try
+            {
+                var ms0 = Marshal.PtrToStructure<NativeApi.MSLLHOOKSTRUCT>(lParam);
+                if (!NativeApi.IsOurInjection(ms0.flags, ms0.dwExtraInfo))
+                    Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
+            }
+            catch { }
+            return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        }
         try
         {
             var ms = Marshal.PtrToStructure<NativeApi.MSLLHOOKSTRUCT>(lParam);
@@ -252,10 +283,11 @@ public sealed class CursorArbiter : IDisposable
         return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
 
-    /// <summary>键盘钩子只用来判断"本机用户是不是正在用键盘"，从不拦截任何按键</summary>
+    /// <summary>键盘钩子只用来判断"本机用户是不是正在用键盘"，从不拦截任何按键。
+    /// 被动监听期间（仲裁被同类远控挤掉）同样持续记录时间戳 —— 钩子只要还挂着就记。</summary>
     private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && !_disposed && Armed)
+        if (nCode >= 0 && !_disposed)
         {
             try
             {

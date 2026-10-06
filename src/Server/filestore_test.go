@@ -188,8 +188,16 @@ func TestUploadRejectsOversizedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read staging dir: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("rejected upload left %d files behind: %v", len(entries), entries)
+	// 2026-10 起新增热更新目录 <data>/updates（newMux 自动创建，持久而非暂存）——
+	// 它合法存在，不属于"拒绝上传留下的垃圾"，排除后再断言。
+	var leftovers []string
+	for _, e := range entries {
+		if e.Name() != "updates" {
+			leftovers = append(leftovers, e.Name())
+		}
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("rejected upload left %d files behind: %v", len(leftovers), leftovers)
 	}
 
 	// the limit itself must still be accepted

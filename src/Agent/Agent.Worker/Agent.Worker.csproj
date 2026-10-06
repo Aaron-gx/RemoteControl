@@ -1,8 +1,12 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <!-- 2026-10 进程合并：Worker 不再是独立 exe，而是被 Agent.Coordinator 引用的类库。
+         原来的跨会话形态（Session 0 的 Coordinator 拉起 Session 1 的 Worker）已随多会话方案废弃；
+         现在 WorkerContext 由 Coordinator 进程里的一条 STA 线程承载（见 Agent.Coordinator/WorkerHost.cs），
+         与 Coordinator 之间用进程内 WorkerBridge 通信（取代 Named Pipe + 共享内存）。 -->
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0-windows10.0.22000.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -11,10 +15,7 @@
     <AssemblyName>Agent.Worker</AssemblyName>
     <RootNamespace>Agent.Worker</RootNamespace>
     <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
-    <!-- 会话内运行，不要弹出控制台窗口 -->
-    <DisableWinExeOutputInference>true</DisableWinExeOutputInference>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <ApplicationIcon>..\..\Assets\agent.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
