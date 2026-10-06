@@ -240,7 +240,8 @@ public sealed class RemoteScreenControl : Image
             e.RightButton == MouseButtonState.Released) return;
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
-        SetCursor(x, y);
+        SetCursor(x, y);                                         // 本地光标显示保留
+        if (InReadOnlyRegion(x, y)) return;                     // 只读区域：移动不转发到被控端
         RemoteMouseMove?.Invoke(x, y);
     }
 
@@ -252,8 +253,7 @@ public sealed class RemoteScreenControl : Image
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
         SetCursor(x, y);
-        // 物理屏区域：**纯监视**（2026-10-05 客户要求"取消所有鼠标操作，只监视"）
-        // 不转发点击（不打扰本机用户）、也不拉窗口（想搬窗口用软件列表右键「搬到副屏」）
+        // 物理屏区域：**纯监视**——所有鼠标/键盘/滚轮一律不转发
         if (InReadOnlyRegion(x, y)) return;
         RemoteMouseButton?.Invoke(x, y, ButtonIndex(e.ChangedButton), false);
         e.Handled = true;
@@ -265,7 +265,7 @@ public sealed class RemoteScreenControl : Image
         ReleaseMouseCapture();
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
-        SetCursor(x, y);
+        if (InReadOnlyRegion(x, y)) return;                     // 只读区域：抬起也不转发
         RemoteMouseButton?.Invoke(x, y, ButtonIndex(e.ChangedButton), true);
         e.Handled = true;
     }
@@ -275,7 +275,7 @@ public sealed class RemoteScreenControl : Image
         base.OnMouseWheel(e);
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
-        SetCursor(x, y);
+        if (InReadOnlyRegion(x, y)) return;                     // 只读区域：滚轮不转发
         RemoteMouseWheel?.Invoke(x, y, (short)Math.Clamp(e.Delta, short.MinValue, short.MaxValue));
         e.Handled = true;
     }
@@ -304,6 +304,8 @@ public sealed class RemoteScreenControl : Image
 
     private void HandleKey(KeyEventArgs e, bool up)
     {
+        // 只读视图（主屏纯监视）：键盘一律不转发
+        if (ReadOnlyPhysicalScreens && _readOnlyRegions.Count > 0) return;
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         if (key is Key.LeftAlt or Key.RightAlt or Key.System)
         {

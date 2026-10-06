@@ -76,8 +76,9 @@ public partial class MainWindow : Window
         SelectCaptureMode(_cfg.CaptureMode);
         Width = Math.Max(900, _cfg.WindowWidth);
         Height = Math.Max(600, _cfg.WindowHeight);
-        // 物理屏是否只读（默认 false = 主屏也能直接操作，见 ViewerConfig.PhysicalScreenReadOnly）
-        Screen.ReadOnlyPhysicalScreens = _cfg.PhysicalScreenReadOnly;
+        // 物理屏**永远只读**（2026-10-06 客户定稿：主屏只监视，任何模式下都不能操作物理屏）。
+        // 不读配置——旧配置里 PhysicalScreenReadOnly=false 会导致"主屏还有功能"
+        Screen.ReadOnlyPhysicalScreens = true;
         Screen.ShowPlaceholder("未连接");
         ShowEmptyHint("未连接：点「连接」后显示被控端的软件列表");
 
