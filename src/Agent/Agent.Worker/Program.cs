@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.4.1";
+    public const string Version = "1.4.2";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -1040,9 +1040,15 @@ public sealed class WorkerContext : ApplicationContext
             Count = monitors.Count,
             AllScreens = _captureAll,
         };
-        // 每块屏在画面里的位置：主控端据此把物理屏画成"只读区域"（看得到、点不到）
+        // 每块屏在画面里的位置：主控端据此把物理屏画成"只读区域"（看得到、点不到）。
+        // 【键盘兼容 2026-10-07】仅副屏模式下**不发送物理屏条目**：旧版主控端检查
+        // _readOnlyRegions.Count > 0 就拦键盘，只要 Screens 列表里有物理屏（IsVirtual=false）
+        // 就会拦截。不发物理屏条目 → _readOnlyRegions 为空 → 旧版键盘也能打字。
+        // 坐标映射用的是上面的顶层 Left/Top/Width/Height，不依赖 Screens 列表。
         foreach (var m in monitors)
         {
+            if (!_captureAll && !m.IsVirtual && _captureMode == CaptureMode.VirtualOnly)
+                continue;   // 仅副屏模式：跳过物理屏，旧版主控端键盘就不拦了
             info.Screens.Add(new ScreenRect
             {
                 Left = m.Left - info.Left,
