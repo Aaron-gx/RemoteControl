@@ -847,15 +847,14 @@ public sealed class WindowManager
             // 之前 4 秒豁免只覆盖同名（第②级），新进程（第③级）仍被拦 → cmd 打开仍闪（客户反馈）
             if (!oursByPid && !oursByName && !justOpened && LocalUserTouchedRecently()) return;
 
-            // 同名/猜测认领的尺寸护栏（精确认领不受限）：只搬"像正常应用/文件夹窗口"的 ——
-            // 现场抓到过 406x82 的浮条和 2560x1392 的全屏大窗被同名规则搬走，那些是系统/用户的东西。
-            // 正常窗口在 300x200 以上、且不超过主屏的九成（比主屏还大的十有八九是桌面/覆盖层）。
+            // 同名/猜测认领的尺寸护栏：只搬"像正常应用窗口"的（排除浮条和覆盖层）。
+            // 【修复 2026-10-07】去掉"不超过主屏九成"的宽度限制——那个护栏把宽窗口（如浏览器）
+            // 拦住了不搬 → 窗口跨在两屏中间（客户反馈"一半在主控端一半在被控端"）。
+            // 桌面/任务栏已由 IsShellWindow 过滤，不需要宽度限制。
             if (!oursByPid)
             {
                 int w = r.Right - r.Left, h = r.Bottom - r.Top;
-                var primary = DisplayHelper.GetMonitors().FirstOrDefault(m => m.IsPrimary);
-                if (primary != null && (w > primary.Width * 0.9 || h > primary.Height * 0.9)) return;
-                if (w < 300 || h < 200) return;
+                if (w < 300 || h < 200) return;   // 只排除小浮条
             }
 
             lock (_caughtLock) { if (_caught.Count > 400) _caught.Clear(); _caught.Add(hwnd); }
