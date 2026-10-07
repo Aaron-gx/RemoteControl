@@ -304,8 +304,11 @@ public sealed class RemoteScreenControl : Image
 
     private void HandleKey(KeyEventArgs e, bool up)
     {
-        // 只读视图（主屏纯监视）：键盘一律不转发
-        if (ReadOnlyPhysicalScreens && _readOnlyRegions.Count > 0) return;
+        // 只读视图（主屏纯监视）：键盘不转发。
+        // 【修复 2026-10-07】只在**整个画面都是只读屏**时才拦（PrimaryOnly 模式）。
+        // 之前检查 _readOnlyRegions.Count > 0 永远为 true（物理屏永远存在于列表里），
+        // 导致副屏模式下也打不了字（客户反馈"键盘打不了字过去"）。
+        if (ReadOnlyPhysicalScreens && _screens.Count > 0 && _screens.All(scr => !scr.IsVirtual)) return;
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         if (key is Key.LeftAlt or Key.RightAlt or Key.System)
         {

@@ -765,7 +765,9 @@ public sealed class WindowManager
             var arb = Arbiter;
             bool justOpened = Environment.TickCount64 - _armTick < 4000;   // 打开指令后头 4 秒：同名窗口与指令强相关，按确定认领处理
             if (!oursByPid && !justOpened && arb != null && arb.LocalActiveRecently) return;
-            if (!oursByPid && !oursByName && LocalUserTouchedRecently()) return;
+            // 【修复 2026-10-07】justOpened 也要豁免第③级（新进程）：cmd.exe 的窗口属于 conhost（不同进程不同名），
+            // 之前 4 秒豁免只覆盖同名（第②级），新进程（第③级）仍被拦 → cmd 打开仍闪（客户反馈）
+            if (!oursByPid && !oursByName && !justOpened && LocalUserTouchedRecently()) return;
 
             if (!NativeApi.GetWindowRect(hwnd, out var r)) return;
             bool onVirtual = r.Left >= target.Left && r.Left < target.Right &&
@@ -841,7 +843,9 @@ public sealed class WindowManager
             var arb = Arbiter;
             bool justOpened = Environment.TickCount64 - _armTick < 4000;   // 打开指令后头 4 秒：同名窗口与指令强相关，按确定认领处理
             if (!oursByPid && !justOpened && arb != null && arb.LocalActiveRecently) return;
-            if (!oursByPid && !oursByName && LocalUserTouchedRecently()) return;
+            // 【修复 2026-10-07】justOpened 也要豁免第③级（新进程）：cmd.exe 的窗口属于 conhost（不同进程不同名），
+            // 之前 4 秒豁免只覆盖同名（第②级），新进程（第③级）仍被拦 → cmd 打开仍闪（客户反馈）
+            if (!oursByPid && !oursByName && !justOpened && LocalUserTouchedRecently()) return;
 
             // 同名/猜测认领的尺寸护栏（精确认领不受限）：只搬"像正常应用/文件夹窗口"的 ——
             // 现场抓到过 406x82 的浮条和 2560x1392 的全屏大窗被同名规则搬走，那些是系统/用户的东西。
