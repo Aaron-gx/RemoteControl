@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.3.0";
+    public const string Version = "1.4.0";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -901,10 +901,11 @@ public sealed class WorkerContext : ApplicationContext
                 // 为什么需要这个（除了 SHOW 事件上的反向抓取）：Telegram 等从托盘恢复**不触发 SHOW**
                 // （窗口一直是"可见"的，只是不在前台），SHOW 路径抓不到 → 客户反馈"tg 第一次打开不回主屏"。
                 // 周期检查每秒跑一次，条件更严（要求主控端离线 ≥10 秒），避免跟远端操作打架。
-                if (!_viewerOnline)   // 主控端 10 秒没发过任何输入
-                {
-                    _windows.ReclaimOrphanWindowsFromVirtual();
-                }
+                // 【性能 2026-10-06】孤儿回收暂停：每秒 EnumWindows+GetMonitors 偷 CPU 导致帧率 30→21.8
+                // if (!_viewerOnline)
+                // {
+                //     _windows.ReclaimOrphanWindowsFromVirtual();
+                // }
 
                 // 补抬起：远端停手 3 秒后
                 if (now - Interlocked.Read(ref _lastRemoteKeyTick) > 3000)

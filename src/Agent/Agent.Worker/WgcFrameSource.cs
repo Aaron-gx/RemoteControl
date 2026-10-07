@@ -73,8 +73,14 @@ public sealed unsafe class WgcFrameSource : FrameSource
             // （后台定向注入模式下，系统光标压根不在外屏上）。
             _session.IsCursorCaptureEnabled = false;
             // 去掉系统在**被采集的物理屏**四周画的黄色"正在被捕获"指示框（客户反馈"主屏有黄框"）。
-            // 只影响系统叠加层、不影响画面内容；老系统（build<20348）没有这个 API，抛异常就地吞掉。
-            _session.IsBorderRequired = false;
+            // 用反射调（API 需 build 20348+，而 TFM 定在 19041 就没有这个属性的编译期绑定）：
+            // 老系统上反射拿不到属性 → 静默跳过（黄色边框仍在但功能不受影响）。
+            try
+            {
+                _session.GetType().InvokeMember("IsBorderRequired",
+                    System.Reflection.BindingFlags.SetProperty, null, _session, new object[] { false });
+            }
+            catch { /* build < 20348 没有此属性 */ }
         }
         catch (Exception ex)
         {

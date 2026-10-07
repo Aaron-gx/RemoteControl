@@ -6,7 +6,7 @@
          现在 WorkerContext 由 Coordinator 进程里的一条 STA 线程承载（见 Agent.Coordinator/WorkerHost.cs），
          与 Coordinator 之间用进程内 WorkerBridge 通信（取代 Named Pipe + 共享内存）。 -->
     <OutputType>Library</OutputType>
-    <TargetFramework>net8.0-windows10.0.22000.0</TargetFramework>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
