@@ -137,6 +137,8 @@ python scripts/_rcp.py run "<cmd>"  # 在被控端跑命令（输出走文件+cl
 
 构建/发布：`scripts/build-all.ps1 -ToolsRoot D:\tools` → `scripts/_publish_update.py build/agent-X.Y.Z.zip X.Y.Z "说明" 100` → 安装包 `build-setup-agent/viewer.ps1 -Token <口令>`（口令内嵌+setup-defaults.ini 双保险）。
 
+⚠ **禁止裸 `dotnet publish -o build/viewer`**（2026-10-08 事故）：build\viewer 是**自包含**发布（免装 .NET 双击即跑）；裸 publish 不清目录，会把框架依赖版 exe/runtimeconfig 盖在自包含运行时上 → 双击弹"必须安装 .NET 8"（开发机上带 DOTNET_ROOT 能跑，极易漏测）。临时验证用 `-o build/viewer-test` 之类独立目录；正式恢复一律带 `-r win-x64 --self-contained true`，或直接跑 build-setup-viewer.ps1（会顺手补 ffmpeg/文档并剔除 config/logs）。本机 dotnet 在 D:\tools\dotnet（非系统路径），本机双击自包含版是唯一可靠回归法。
+
 ## 6. 深入文档（按需读）
 
 `docs/架构-单会话共享与双光标.md`（双用户共享的设计极限与取舍）· `docs/使用说明.md` · `docs/运维-授权与防绕过.md` · `docs/部署-香港服务器.md` · `docs/验收报告.md` · `docs/P2P方案.md` · `../uu-reverse/README.md`（UU远程逆向对比）· `README.md`（产品总览）
