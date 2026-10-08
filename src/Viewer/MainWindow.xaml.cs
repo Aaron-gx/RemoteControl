@@ -623,7 +623,7 @@ public partial class MainWindow : Window
                 null, ct: default, token: _cfg.AgentToken);
             if (string.IsNullOrEmpty(path))
             {
-                _log.Warn($"接收远程文件失败：{info.FileName}");
+                _log.Warn($"接收远程文件失败：{info.FileName}（fileId={info.FileId} server={_cfg.ResolveFileServerUrl()} token={(string.IsNullOrEmpty(_cfg.AgentToken) ? "未配置" : "有")}）");
                 Dispatcher.Invoke(() => ClipboardHint.Text = $"✗ 接收 {info.FileName} 失败（网络或服务器不可用）");
                 return;
             }
@@ -691,7 +691,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>主控端自身版本（热更新提示用，2026-10 新增；主控端不做自动应用——数量少、用户是厂商自己人，提示下载即可）</summary>
-    public const string ViewerVersion = "1.2.0";
+    public const string ViewerVersion = "1.2.1";
 
     /// <summary>
     /// 查更新清单：验签通过且版本比自己新 → 状态栏提示"有新版本"，点一下用浏览器打开下载页。
@@ -1192,10 +1192,22 @@ public partial class MainWindow : Window
     private void OnLocalClipboardChanged()
     {
         if (!_cfg.ClipboardSyncEnabled || !_ws.IsConnected) return;
+        // 读和写一样会被占用（CLIPBRD_E_CANT_OPEN），一次读不到就把"本机→远程"的同步丢了
+        string? text = null;
+        for (int i = 0; i < 3 && text == null; i++)
+        {
+            try
+            {
+                if (Clipboard.ContainsText()) text = Clipboard.GetText();
+            }
+            catch (Exception ex)
+            {
+                if (i == 2) _log.Debug($"读取本机剪贴板失败（重试 3 次）：{ex.Message}");
+                else Thread.Sleep(50);
+            }
+        }
         try
         {
-            if (!Clipboard.ContainsText()) return;
-            var text = Clipboard.GetText();
             if (string.IsNullOrEmpty(text) || text == _lastLocalClipboard) return;
             _lastLocalClipboard = text;
             if (text == _suppressClipboard)
@@ -1216,13 +1228,21 @@ public partial class MainWindow : Window
     {
         _suppressClipboard = text;
         _lastLocalClipboard = text;
-        try
+        // 剪贴板是全局独占资源，输入法/剪贴板管理器随时可能占着（CLIPBRD_E_CANT_OPEN，
+        // 2026-10-08 现场日志：收到远程文本但一次都没重试就丢了，用户"复制不过来"）。
+        // 重试预算收紧到 ~360ms：这是 UI 线程，卡太久会被当成死机。
+        for (int i = 0; i < 6; i++)
         {
-            Clipboard.SetText(text);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"写入本机剪贴板失败：{ex.Message}");
+            try
+            {
+                Clipboard.SetText(text);
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (i == 5) _log.Warn($"写入本机剪贴板失败（重试 6 次后放弃）：{ex.Message}");
+                else Thread.Sleep(60);
+            }
         }
     }
 
