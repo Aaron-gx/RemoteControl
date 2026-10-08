@@ -22,6 +22,17 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
 
+        // 崩溃转储要最早挂（比任何可能崩的初始化都早）。dump 落在 logs\crash\，保留 5 份；
+        // 上次崩溃的 dump 顺带报出来，提醒去捞（2026-10-08，对标 UU crashpad 的轻量版）。
+        try
+        {
+            var earlyLog = new Logger("coordinator", minLevel: LogLevel.Info);
+            var dumpDir = Path.Combine(AppContext.BaseDirectory, "logs", "crash");
+            CrashDumper.Install(dumpDir, earlyLog);
+            CrashDumper.ReportPreviousCrashes(earlyLog);
+        }
+        catch { }
+
         CoordinatorApp? app = null;
         try
         {

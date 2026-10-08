@@ -168,7 +168,7 @@ Write-Host ""
 Write-Host "=== 构建完成 ===" -ForegroundColor Green
 Write-Host ("  安装程序：$setupExe（$mb MB）")
 Write-Host  "  用法：把这一个 exe 拷到目标电脑 → 双击 → 按向导装（也可 /VERYSILENT 静默装）"
-Write-Host  "  卸载：设置 → 应用 → 已安装的应用 → 远程控制 · 被控端 → 卸载"
+Write-Host  "  卸载：设置 → 应用 → 已安装的应用 → 虚拟服务器 → 卸载"
 if (Test-Path -LiteralPath $defaults) { Write-Host "  预置令牌：$defaults（随包分发，装的时候自动填好）" }
 
 # ---------------------------------------------------------------- 6. 分发用 zip（可选）

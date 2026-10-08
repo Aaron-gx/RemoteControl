@@ -229,11 +229,14 @@ public sealed class CursorArbiter : IDisposable
         if (nCode < 0 || _disposed) return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         if (!Armed)
         {
-            // 被动监听（被同类远控挤掉后钩子保留）：只记录物理输入时间戳，其余一概不管、直通
+            // 被动监听（被同类远控挤掉后钩子保留）：只记录物理输入时间戳，其余一概不管、直通。
+            // 【2026-10-08】必须用"人手判定"（不带注入位）而不是"非我们的注入"：
+            // GameViewer/UU远程 拽光标的 SendInput 事件没打我们的标记，会被当成"本机用户
+            // 在操作"，远端按键被 800ms 闸门丢弃 —— 现场 Ctrl+C/V 全丢、打字卡就是它。
             try
             {
                 var ms0 = Marshal.PtrToStructure<NativeApi.MSLLHOOKSTRUCT>(lParam);
-                if (!NativeApi.IsOurInjection(ms0.flags, ms0.dwExtraInfo))
+                if (!NativeApi.IsSoftwareInjected(ms0.flags))
                     Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
             }
             catch { }
@@ -250,8 +253,11 @@ public sealed class CursorArbiter : IDisposable
                 return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
             }
 
-            // 到这里就是本机用户的输入（物理设备，或别的软件用 SendInput 送的）
-            Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
+            // 到这里：不是我们的注入。其中带注入位的是**别的软件**注入的（GameViewer 拽光标、
+            // 宏工具…）—— 不是人手，不计入"本机用户在操作"（否则远端按键被闸门误拦）；
+            // 归还/重放逻辑保持原样，只影响时间戳。
+            if (!NativeApi.IsSoftwareInjected(ms.flags))
+                Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
 
             if (!IsOnVirtual(ms.pt.X, ms.pt.Y))
             {
@@ -292,7 +298,8 @@ public sealed class CursorArbiter : IDisposable
             try
             {
                 var kb = Marshal.PtrToStructure<NativeApi.KBDLLHOOKSTRUCT>(lParam);
-                if (!NativeApi.IsOurInjection(kb.flags, kb.dwExtraInfo))
+                // 人手判定：别的软件（GameViewer 等）注入的键不算本机用户在打字（见 MouseProc 被动分支注）
+                if (!NativeApi.IsSoftwareInjected(kb.flags))
                     Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
             }
             catch { }

@@ -10,6 +10,7 @@
 """
 import asyncio
 import json
+import os
 import struct
 import sys
 
@@ -73,7 +74,8 @@ async def session(cmd_args, seconds: float = 12.0):
                     elif t == 0x21:
                         print("[CLIPBOARD-FILE] " + payload.decode("utf-8", "replace"), flush=True)
                     elif t == 0x14:
-                        print("[MONITOR] " + payload.decode("utf-8", "replace")[:200], flush=True)
+                        import os as _os
+                        print("[MONITOR] " + payload.decode("utf-8", "replace")[:4000 if _os.environ.get("RC_FULLMON") else 200], flush=True)
                     elif t == 0x1F:
                         print("[ERROR] " + payload.decode("utf-8", "replace"), flush=True)
                     # 0x01 视频帧计数（不打印）
@@ -90,6 +92,505 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "status"
     if mode == "status":
         asyncio.run(session({}, 8))
+    elif mode == "typetest":
+        # 端到端键盘验证：开记事本(外屏) → 键入 HELLO → Ctrl+A Ctrl+C → 等 0x20 剪贴板回传
+        # → 清空 → Ctrl+V 粘贴回 → 再 Ctrl+A Ctrl+C 验证粘贴结果。
+        # 剪贴板回传 = "hello1/2" 时说明 Ctrl+C 与 Ctrl+V 在被控端真实生效。
+        async def _type():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    clips = []
+
+                    async def recv_for(sec):
+                        end = asyncio.get_event_loop().time() + sec
+                        while True:
+                            left = end - asyncio.get_event_loop().time()
+                            if left <= 0:
+                                return
+                            try:
+                                msg = await ws.receive(timeout=left)
+                            except asyncio.TimeoutError:
+                                return
+                            if msg.type != aiohttp.WSMsgType.BINARY:
+                                continue
+                            data = msg.data
+                            t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                            payload = data[5:5 + n]
+                            if t == 0x30:
+                                await ws.send_bytes(frame(0x30, payload))
+                            elif t == 0x20:
+                                txt = payload.decode("utf-8", "replace").strip()
+                                clips.append(txt)
+                                print(f"[CLIP] #{len(clips)}: {txt!r}", flush=True)
+
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+
+                    async def tap(vk, hold=0.03):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+
+                    async def combo(mod, vk):
+                        await key(mod); await asyncio.sleep(0.04)
+                        await key(vk); await asyncio.sleep(0.04)
+                        await key(vk, True); await asyncio.sleep(0.02)
+                        await key(mod, True)
+
+                    # 1) 开记事本（走 OPEN 通道 → StartOnVirtualScreen → 外屏）
+                    await ws.send_bytes(frame(0x15, b""))   # 上线信号
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    print("[sent OPEN notepad]", flush=True)
+                    await recv_for(3.0)
+
+                    # 2) 键入 HELLO（VK: H=0x48 E=0x45 L=0x4C O=0x4F）
+                    for vk in (0x48, 0x45, 0x4C, 0x4C, 0x4F):
+                        await tap(vk)
+                        await asyncio.sleep(0.12)
+                    await recv_for(0.6)
+
+                    # 3) Ctrl+A 全选 → Ctrl+C 复制（Ctrl=0x11 A=0x41 C=0x43）
+                    await combo(0x11, 0x41); await asyncio.sleep(0.25)
+                    await combo(0x11, 0x43)
+                    await recv_for(2.5)          # 等剪贴板同步回传
+                    c1 = list(clips)
+
+                    # 4) 清空（Ctrl+A → Del=0x2E）→ Ctrl+V 粘贴回（V=0x56）
+                    await combo(0x11, 0x41); await asyncio.sleep(0.25)
+                    await tap(0x2E); await asyncio.sleep(0.25)
+                    await combo(0x11, 0x56)
+                    await recv_for(1.0)
+
+                    # 5) 再 Ctrl+A Ctrl+C：剪贴板应重新出现 HELLO（= 粘贴真的发生了）
+                    clips.clear()
+                    await combo(0x11, 0x41); await asyncio.sleep(0.25)
+                    await combo(0x11, 0x43)
+                    await recv_for(2.5)
+
+                    print("=" * 60, flush=True)
+                    ok1 = any("HELLO" in c for c in c1)
+                    ok2 = any("HELLO" in c for c in clips)
+                    print(f"Ctrl+C 复制: {'✓ 生效' if ok1 else '✗ 未生效'}（第一次剪贴板={c1}）", flush=True)
+                    print(f"Ctrl+V 粘贴: {'✓ 生效' if ok2 else '✗ 未生效'}（粘贴后剪贴板={clips}）", flush=True)
+                    print("=" * 60, flush=True)
+        asyncio.run(_type())
+    elif mode == "kbtest2":
+        # 可视化键盘测试：开记事本 → 键入 → Ctrl+A → Ctrl+C → 截图虚拟屏(base64 回传)。
+        # 全程保持 viewer 在线（孤儿回收不触发），剪贴板 0x20 与截图都从同一会话收。
+        async def _kb2():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    clips = []
+
+                    async def recv_for(sec):
+                        end = asyncio.get_event_loop().time() + sec
+                        while True:
+                            left = end - asyncio.get_event_loop().time()
+                            if left <= 0:
+                                return
+                            try:
+                                msg = await ws.receive(timeout=left)
+                            except asyncio.TimeoutError:
+                                return
+                            if msg.type != aiohttp.WSMsgType.BINARY:
+                                continue
+                            data = msg.data
+                            t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                            payload = data[5:5 + n]
+                            if t == 0x30:
+                                await ws.send_bytes(frame(0x30, payload))
+                            elif t == 0x20:
+                                txt = payload.decode("utf-8", "replace").strip()
+                                clips.append(txt)
+                                tag = "B64-SHOT" if len(txt) > 50000 else ("HELLO?" if "HELLO" in txt else "OTHER")
+                                print(f"[CLIP] {tag} len={len(txt)} head={txt[:60]!r}", flush=True)
+
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+
+                    async def tap(vk, hold=0.04):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+
+                    async def combo(mod, vk, pre=0.05, post=0.03):
+                        await key(mod); await asyncio.sleep(pre)
+                        await key(vk); await asyncio.sleep(post)
+                        await key(vk, True); await asyncio.sleep(0.03)
+                        await key(mod, True)
+
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    print("[OPEN notepad]", flush=True)
+                    await recv_for(3.5)
+
+                    for vk in (0x48, 0x45, 0x4C, 0x4C, 0x4F):   # HELLO
+                        await tap(vk)
+                        await asyncio.sleep(0.15)
+                    await recv_for(0.8)
+                    print("[typed HELLO]", flush=True)
+
+                    await combo(0x11, 0x41)                        # Ctrl+A
+                    await recv_for(0.8)
+                    print("[Ctrl+A done]", flush=True)
+                    await combo(0x11, 0x43)                        # Ctrl+C
+                    await recv_for(2.5)
+                    print("[Ctrl+C done]", flush=True)
+
+                    # 同会话截图：PS 抓虚拟屏 → 缩放 → PNG base64 → Set-Clipboard → 0x20 回来
+                    shot = ("-NoProfile -Command \""
+                            "Add-Type -AssemblyName System.Windows.Forms;"
+                            "Add-Type -AssemblyName System.Drawing;"
+                            "$b=New-Object System.Drawing.Bitmap 1920,1080;"
+                            "$g=[System.Drawing.Graphics]::FromImage($b);"
+                            "$g.CopyFromScreen(2560,0,0,0,$b.Size);"
+                            "$s=New-Object System.Drawing.Bitmap 640,360;"
+                            "$g2=[System.Drawing.Graphics]::FromImage($s);"
+                            "$g2.DrawImage($b,0,0,640,360);"
+                            "$s.Save($env:TEMP+'\\vsk.png',[System.Drawing.Imaging.ImageFormat]::Png);"
+                            "Set-Clipboard ([Convert]::ToBase64String([IO.File]::ReadAllBytes($env:TEMP+'\\vsk.png')))"
+                            "\"")
+                    ps_exe = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": ps_exe, "args": shot}).encode()))
+                    await recv_for(9.0)
+
+                    import base64 as _b
+                    b64s = [c for c in clips if c.startswith("iVBOR")]   # PNG base64 魔数
+                    hellos = [c for c in clips if "HELLO" in c and len(c) < 5000]
+                    print("=" * 60, flush=True)
+                    print(f"剪贴板出现 HELLO（Ctrl+C 生效）: {'✓' if hellos else '✗'}", flush=True)
+                    if b64s:
+                        try:
+                            open(r"D:\tools\vsk.png", "wb").write(_b.b64decode(b64s[-1]))
+                            print("截图已存 D:\\tools\\vsk.png", flush=True)
+                        except Exception as e:
+                            print("截图解码失败:", e, flush=True)
+                    else:
+                        print("截图未收到", flush=True)
+                    print("=" * 60, flush=True)
+        asyncio.run(_kb2())
+    elif mode == "kbtest3":
+        # 确定性键盘测试：开记事本 → 键入 → Ctrl+A → 读编辑框文本(WM_GETTEXT)/选区(EM_GETSEL)/
+        # 前台焦点(GetGUIThreadInfo) → 输出到文件 → clip 回传。不依赖截图与视觉模型。
+        async def _kb3():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    clips = []
+
+                    async def recv_for(sec):
+                        end = asyncio.get_event_loop().time() + sec
+                        while True:
+                            left = end - asyncio.get_event_loop().time()
+                            if left <= 0:
+                                    return
+                            try:
+                                msg = await ws.receive(timeout=left)
+                            except asyncio.TimeoutError:
+                                return
+                            if msg.type != aiohttp.WSMsgType.BINARY:
+                                continue
+                            data = msg.data
+                            t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                            payload = data[5:5 + n]
+                            if t == 0x30:
+                                await ws.send_bytes(frame(0x30, payload))
+                            elif t == 0x20:
+                                txt = payload.decode("utf-8", "replace").strip()
+                                clips.append(txt)
+                                print(f"[CLIP] len={len(txt)} head={txt[:70]!r}", flush=True)
+
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+
+                    async def tap(vk, hold=0.04):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+
+                    async def combo(mod, vk, pre=0.06, post=0.04):
+                        await key(mod); await asyncio.sleep(pre)
+                        await key(vk); await asyncio.sleep(post)
+                        await key(vk, True); await asyncio.sleep(0.04)
+                        await key(mod, True)
+
+                    import base64 as _b64m
+                    probe_ps = r'''
+Add-Type @"
+using System;using System.Text;using System.Runtime.InteropServices;
+public class NP {
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr wp, StringBuilder lp);
+ [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, out int wp, out int lp);
+ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GTI gti);
+ [StructLayout(LayoutKind.Sequential)] public struct RECTc{public int L,T,R,B;}
+ [StructLayout(LayoutKind.Sequential)] public struct GTI{
+  public int cbSize; public uint flags; public IntPtr hwndActive; public IntPtr hwndFocus;
+  public IntPtr hwndCapture; public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret;
+  public RECTc rcCaret;
+ }
+}
+"@
+$h=[NP]::FindWindowW('Notepad',$null)
+$out=@()
+$out+='hwnd='+$h
+$e=[NP]::FindWindowExW($h,[IntPtr]::Zero,'Edit',$null)
+$out+='edit='+$e
+if($e -ne [IntPtr]::Zero){
+ $sb=New-Object System.Text.StringBuilder 4096
+ [void][NP]::SendMessageW($e,0x000D,[IntPtr]4096,$sb)
+ $out+='TEXT=['+$sb.ToString()+']'
+ $s=0;$t=0
+ [void][NP]::SendMessageW($e,0x00B0,[ref]$s,[ref]$t)
+ $out+=('SEL={0},{1}' -f $s,$t)
+}
+$g=New-Object NP+GTI
+$g.cbSize=[System.Runtime.InteropServices.Marshal]::SizeOf($g)
+$fg=[NP]::GetForegroundWindow()
+[void][NP]::GetGUIThreadInfo(0,[ref]$g)
+$out+='FG='+$fg+' fgFocus='+$g.hwndFocus+' fgCaret='+$g.hwndCaret+' caretXY='+$g.rcCaret.L+','+$g.rcCaret.T
+$out -join [Environment]::NewLine | Out-File ($env:TEMP+'\kb3.txt')
+Get-Content ($env:TEMP+'\kb3.txt') | clip
+'''
+                    probe = "-NoProfile -EncodedCommand " + _b64m.b64encode(
+                        probe_ps.encode("utf-16-le")).decode()
+                    ps_exe = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+                    async def probe_dump(tag):
+                        await ws.send_bytes(frame(0x11, json.dumps(
+                            {"exePath": ps_exe, "args": probe}).encode()))
+                        await recv_for(7.0)
+                        print(f"--- {tag} probed ---", flush=True)
+
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    await recv_for(3.5)
+
+                    await probe_dump("fresh-open")
+
+                    for vk in (0x48, 0x45, 0x4C, 0x4C, 0x4F):
+                        await tap(vk)
+                        await asyncio.sleep(0.15)
+                    await recv_for(0.8)
+                    await probe_dump("after-typing")
+
+                    await combo(0x11, 0x41)
+                    await recv_for(0.8)
+                    await probe_dump("after-ctrlA")
+        asyncio.run(_kb3())
+    elif mode == "capture":
+        # 抓视频流到本地文件：连接期间收到的全部 0x01 视频帧按序落盘（裸 H.264 annex-B），
+        # 之后本地 ffmpeg 解码任意帧 = 主控端用户看到的画面。用法：capture <out.bin> [秒]
+        out_path = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\cap.h264"
+        secs = float(sys.argv[3]) if len(sys.argv) > 3 else 15.0
+        async def _cap():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    buf = bytearray()
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+                    async def tap(vk, hold=0.04):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+                    async def combo(mod, vk, pre=0.06, post=0.04):
+                        await key(mod); await asyncio.sleep(pre)
+                        await key(vk); await asyncio.sleep(post)
+                        await key(vk, True); await asyncio.sleep(0.04)
+                        await key(mod, True)
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.5)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    print("[OPEN notepad]", flush=True)
+                    end = asyncio.get_event_loop().time() + secs
+                    typed = False
+
+                    async def typing_task():
+                        await asyncio.sleep(3.5)
+                        for vk in (0x48, 0x45, 0x4C, 0x4C, 0x4F):
+                            await tap(vk)
+                            await asyncio.sleep(0.15)
+                        await asyncio.sleep(0.5)
+                        await combo(0x11, 0x41)   # Ctrl+A
+                        print("[typed HELLO + Ctrl+A]", flush=True)
+                    asyncio.get_event_loop().create_task(typing_task())
+                    while True:
+                        left = end - asyncio.get_event_loop().time()
+                        if left <= 0:
+                            break
+                        try:
+                            msg = await ws.receive(timeout=min(left, 1.0))
+                        except asyncio.TimeoutError:
+                            continue
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        data = msg.data
+                        t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                        payload = data[5:5 + n]
+                        if t == 0x30:
+                            await ws.send_bytes(frame(0x30, payload))
+                        elif t == 0x01:
+                            buf.extend(payload)
+                    open(out_path, "wb").write(bytes(buf))
+                    print(f"[saved {len(buf)} bytes -> {out_path}]", flush=True)
+        asyncio.run(_cap())
+    elif mode == "kbtest4":
+        # 修饰键区分实验（视频流取证）：同一记事本里依次测
+        #   轮1 Shift+End   轮2 左Ctrl+A   轮3 右Ctrl+A
+        # 每轮之间 1.2s 停顿（按 2fps 解码正好各占 2-3 帧），选区=蓝色高亮肉眼可辨。
+        out_path = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\cap4.h264"
+        async def _kb4():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    buf = bytearray()
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+                    async def tap(vk, hold=0.04):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+                    async def combo(mod, vk, pre=0.06, post=0.04):
+                        await key(mod); await asyncio.sleep(pre)
+                        await key(vk); await asyncio.sleep(post)
+                        await key(vk, True); await asyncio.sleep(0.04)
+                        await key(mod, True)
+                    async def type_str(s):
+                        for ch in s:
+                            vk = ord(ch.upper())
+                            await tap(vk)
+                            await asyncio.sleep(0.09)
+                    async def rounds():
+                        await asyncio.sleep(3.5)      # 等记事本开好
+                        await type_str("AB")
+                        await combo(0x10, 0x23)        # Shift+End → 应选中 AB
+                        await asyncio.sleep(1.6)
+                        await tap(0x24)                # Home 取消选区
+                        await tap(0x0D)                # 回车到第2行
+                        await type_str("CD")
+                        await combo(0x11, 0x41)        # 左Ctrl+A → 应全选
+                        await asyncio.sleep(1.6)
+                        await tap(0x24)
+                        await tap(0x0D)
+                        await type_str("EF")
+                        await combo(0xA3, 0x41)        # 右Ctrl+A（0xA3=VK_RCONTROL）
+                        await asyncio.sleep(1.8)
+                        print("[3 rounds done: Shift+End / LCtrl+A / RCtrl+A]", flush=True)
+                    asyncio.get_event_loop().create_task(rounds())
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode())
+                    )
+                    end = asyncio.get_event_loop().time() + 15.0
+                    while True:
+                        left = end - asyncio.get_event_loop().time()
+                        if left <= 0:
+                            break
+                        try:
+                            msg = await ws.receive(timeout=min(left, 1.0))
+                        except asyncio.TimeoutError:
+                            continue
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        data = msg.data
+                        t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                        payload = data[5:5 + n]
+                        if t == 0x30:
+                            await ws.send_bytes(frame(0x30, payload))
+                        elif t == 0x01:
+                            buf.extend(payload)
+                    open(out_path, "wb").write(bytes(buf))
+                    print(f"[saved {len(buf)} bytes -> {out_path}]", flush=True)
+        asyncio.run(_kb4())
+    elif mode == "kbtest5":
+        # 最终闭环：打字→Ctrl+A→Ctrl+C(等剪贴板回传)→清空→Ctrl+V→再全选复制。
+        # 视频流取证(选区高亮) + 剪贴板 0x20 回传(复制生效) 双证据。全程无被控端弹窗。
+        out_path = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\cap9.h264"
+        async def _kb5():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    buf = bytearray()
+                    clips = []
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+                    async def tap(vk, hold=0.05):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+                    async def combo(mod, vk, pre=0.08, post=0.05):
+                        await key(mod); await asyncio.sleep(pre)
+                        await key(vk); await asyncio.sleep(post)
+                        await key(vk, True); await asyncio.sleep(0.05)
+                        await key(mod, True)
+                    async def type_str(s2):
+                        for ch in s2:
+                            await tap(ord(ch.upper()))
+                            await asyncio.sleep(0.12)
+                    async def script():
+                        await asyncio.sleep(3.5)                       # t≈3.5 记事本就绪
+                        if os.environ.get("KB_SHIFT_TOGGLE"):
+                            await tap(0x10)                            # Shift 单击：微软拼音 中⇄英
+                            await asyncio.sleep(0.6)
+                        await type_str("HELLO")                        # 轮1: 打字
+                        await asyncio.sleep(2.0)                       # t≈6.5
+                        await combo(0x11, 0x41)                        # 轮2: Ctrl+A
+                        await asyncio.sleep(2.0)                       # t≈8.5
+                        await combo(0x11, 0x43)                        # 轮3: Ctrl+C
+                        await asyncio.sleep(2.5)                       # 等剪贴板回传
+                        await combo(0x11, 0x41)                        # 轮4: 全选+Del 清空
+                        await asyncio.sleep(0.4)
+                        await tap(0x2E)
+                        await asyncio.sleep(1.2)
+                        await combo(0x11, 0x56)                        # 轮5: Ctrl+V 粘贴回
+                        await asyncio.sleep(2.0)
+                        await combo(0x11, 0x41)                        # 轮6: 再全选+复制验证
+                        await asyncio.sleep(0.4)
+                        await combo(0x11, 0x43)
+                        await asyncio.sleep(2.5)
+                        print("[script done]", flush=True)
+                    asyncio.get_event_loop().create_task(script())
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    end = asyncio.get_event_loop().time() + 22.0
+                    while True:
+                        left = end - asyncio.get_event_loop().time()
+                        if left <= 0:
+                            break
+                        try:
+                            msg = await ws.receive(timeout=min(left, 1.0))
+                        except asyncio.TimeoutError:
+                            continue
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        data = msg.data
+                        t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                        payload = data[5:5 + n]
+                        if t == 0x30:
+                            await ws.send_bytes(frame(0x30, payload))
+                        elif t == 0x01:
+                            buf.extend(payload)
+                        elif t == 0x20:
+                            txt = payload.decode("utf-8", "replace").strip()
+                            clips.append(txt)
+                            print(f"[CLIP#{len(clips)}] len={len(txt)} {txt[:60]!r}", flush=True)
+                    open(out_path, "wb").write(bytes(buf))
+                    hellos = [c for c in clips if "HELLO" in c and len(c) < 100]
+                    print("=" * 56, flush=True)
+                    print(f"剪贴板出现 HELLO: {'✓ Ctrl+C/复制生效' if hellos else '✗ 未生效'}  clips={[c[:20] for c in clips]}", flush=True)
+                    print(f"视频流 {len(buf)}B -> {out_path}（本地解码看选区/粘贴）", flush=True)
+                    print("=" * 56, flush=True)
+        asyncio.run(_kb5())
     elif mode == "thispc":
         asyncio.run(session({"open": ("::this-pc", "")}, 15))
     elif mode == "run":
@@ -110,12 +611,19 @@ def main():
         asyncio.run(session({"open": (ps_exe, ps)}, 30))
     elif mode == "deploy":
         # 远程热更新：下载补丁 zip → 停被控端 → 解压覆盖 → 重启（一条 PowerShell 完成，杀掉父进程后继续跑）
+        # 【2026-10-08 踩坑】iwr 失败时旧 rcp.zip 残留 → Expand-Archive 把旧版解回去 →
+        # "部署成功"其实还是旧版本。必须：先删旧包 → -UseBasicParsing → 校验下载字节数 → 对不上就中止。
         file_id = sys.argv[2]
+        expect = int(sys.argv[3]) if len(sys.argv) > 3 else 0
         ps = ("-NoProfile -Command \""
-              f"iwr 'http://{RELAY}/api/download/{file_id}?token={TOKEN}' -OutFile $env:TEMP\\rcp.zip;"
-              "$p=(Get-Process Agent.Coordinator -ErrorAction Stop).Path;"
+              "$ErrorActionPreference='Stop';"
+              "Remove-Item $env:TEMP\\rcp.zip -Force -ErrorAction SilentlyContinue;"
+              f"iwr 'http://{RELAY}/api/download/{file_id}?token={TOKEN}' -UseBasicParsing -OutFile $env:TEMP\\rcp.zip;"
+              "$z=Get-Item $env:TEMP\\rcp.zip;"
+              + (f"if($z.Length -ne {expect}){{Set-Clipboard ('DL-SIZE-MISMATCH '+$z.Length);exit 1}};" if expect else "")
+              + "$p=(Get-Process Agent.Coordinator -ErrorAction Stop).Path;"
               "$d=Split-Path $p;"
-              "Write-Host ('install-dir: '+$d);"
+              "Set-Clipboard ('install-dir: '+$d);"
               "Stop-Process -Name Agent.Coordinator -Force;"
               "Start-Sleep 2;"
               "Expand-Archive $env:TEMP\\rcp.zip -DestinationPath $d -Force;"

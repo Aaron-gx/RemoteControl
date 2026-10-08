@@ -62,6 +62,9 @@ public static partial class NativeApi
     public static extern IntPtr SetActiveWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
     public static extern bool BringWindowToTop(IntPtr hwnd);
 
     [DllImport("user32.dll")]

@@ -41,6 +41,17 @@ public static partial class NativeApi
     public static bool IsOurInjection(uint flags, IntPtr extraInfo)
         => (flags & LLMHF_INJECTED) != 0 && extraInfo.ToInt64() == InjectTag;
 
+    /// <summary>
+    /// 这个事件是不是**任何软件**注入的（只看 LLMHF_INJECTED 位）。
+    /// 与 <see cref="IsOurInjection"/> 的分工：那个认"是不是我们自己"，这个认"是不是人手"。
+    /// 用途：判断"本机用户物理输入"时必须排除它 —— 同机的 GameViewer/UU远程 也会用 SendInput
+    /// 拽光标，它们的事件没打我们的标记，若当成"本机用户在操作"，远端按键会被 800ms 闸门
+    /// 全部丢弃（2026-10-08 现场：Ctrl+C/V 全丢、打字卡的根因）。
+    /// 真人输入（键盘/鼠标/触控板走输入栈）不带注入位；极少数用 SendInput 的触摸板驱动
+    /// 会被误判成软件注入，权衡后接受（远控共存是真实现场，前者是理论场景）。
+    /// </summary>
+    public static bool IsSoftwareInjected(uint flags) => (flags & LLMHF_INJECTED) != 0;
+
     // ---------------------------------------------------------------- 结构
 
     [StructLayout(LayoutKind.Sequential)]

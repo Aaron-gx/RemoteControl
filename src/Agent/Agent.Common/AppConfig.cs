@@ -41,7 +41,10 @@ public sealed class AgentConfig
     /// </summary>
     public bool AutoUpdateEnabled { get; set; } = true;
     /// <summary>检查更新的间隔（小时）。启动后 30 秒会先查一次。</summary>
-    public int UpdateCheckIntervalHours { get; set; } = 6;
+    public int UpdateCheckIntervalHours { get; set; } = 0;
+    /// <summary>更新检查周期（分钟），优先于 Hours。默认 15：真机踩坑（2026-10-08）——
+    /// 被控端停在旧版 6 小时，键盘五连修复全没生效，用户以为产品坏了。</summary>
+    public int UpdateCheckIntervalMinutes { get; set; } = 15;
 
     /// <summary>
     /// 光标仲裁（只在采集目标是虚拟外屏时生效）：

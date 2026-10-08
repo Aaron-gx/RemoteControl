@@ -283,13 +283,28 @@ public sealed class InputInjector
         }
         uint f = 0;
         if (up) f |= NativeApi.KEYEVENTF_KEYUP;
-        if ((flags & 1) != 0) f |= NativeApi.KEYEVENTF_EXTENDEDKEY;
+        bool ext = (flags & 1) != 0;
+        if (ext) f |= NativeApi.KEYEVENTF_EXTENDEDKEY;
+
+        // 【修复 2026-10-08 扫描码注入】中文输入法（微软拼音实测）会吞掉"只带 VK、不带扫描码"
+        // 的合成 Ctrl 组合 —— Shift 组合和普通字母能过、Ctrl 全被吃（现场：Ctrl+C/V/A 全部失效，
+        // 打字因输入法管线额外绕行而发滞）。带上真实扫描码（KEYEVENTF_SCANCODE）后事件与物理键盘
+        // 无异，输入法照常放行。扫描码查不到的键（罕见）退回纯 VK 注入。
+        ushort scan = 0;
+        try
+        {
+            // 基础扫描码；E0 前缀（方向键/小键盘等）由上面的 KEYEVENTF_EXTENDEDKEY 表达
+            scan = unchecked((ushort)NativeApi.MapVirtualKeyW(vk, NativeApi.MAPVK_VK_TO_VSC));
+        }
+        catch { }
+        if (scan != 0) f |= NativeApi.KEYEVENTF_SCANCODE;
+
         var inputs = new NativeApi.INPUT[1];
         inputs[0].type = NativeApi.INPUT_KEYBOARD;
         inputs[0].u.ki = new NativeApi.KEYBDINPUT
         {
             wVk = vk,
-            wScan = 0,
+            wScan = scan,
             dwFlags = f,
             time = 0,
             dwExtraInfo = NativeApi.InjectTagPtr,

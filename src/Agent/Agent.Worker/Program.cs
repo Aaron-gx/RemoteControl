@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.4.3";
+    public const string Version = "1.5.1";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -91,6 +91,11 @@ public sealed class WorkerContext : ApplicationContext
     /// <summary>主控端是否在线（协调器每秒通过 IpcBitrateHint 告知——不能用"远端没动鼠标"代替）</summary>
     private volatile bool _viewerOnline;
     private long _lastReclaimTick;
+    private long _nextTopoCheckMs;
+    private long _topoFailBackoffMs = 30_000;
+    /// <summary>最近一次健康显示布局的快照（config\display-layout.json）</summary>
+    private static string DisplayLayoutPath =>
+        Path.Combine(AppContext.BaseDirectory, "config", "display-layout.json");
     /// <summary>上一次"因为本机用户在操作所以丢掉了远端按键"的提示时间</summary>
     private long _lastKeyBlockedNotifyTick;
     private readonly Dictionary<string, int> _launched = new(StringComparer.OrdinalIgnoreCase);
@@ -125,6 +130,12 @@ public sealed class WorkerContext : ApplicationContext
         }
         DisplayHelper.TrySetDisplayMode(virt.DeviceName, _cfg.VirtualDisplayWidth,
             _cfg.VirtualDisplayHeight, _cfg.VirtualDisplayRefreshRate, msg => _log.Info(msg));
+        // 外屏与物理屏重叠（物理屏换分辨率/驱动重建后的常见残留）必须先归位：
+        // 重叠时外屏窗口的左边缘会同时画在物理屏上，本机用户看得见（"窗口一半在主屏一半在副屏"）。
+        // EnsureVirtualAdjacent 内部已核实挪动真的生效（核实不了会记日志说明原因）。
+        DisplayHelper.EnsureVirtualAdjacent(virt, msg => _log.Info(msg));
+        // 布局医生：与最近一次健康快照对照，说清差异（2026-10-08，对标 UU 的 display_layout 体系）
+        DisplayLayoutSnapshot.Doctor(DisplayLayoutPath, _log);
 
         _captureMode = _cfg.CaptureAllScreens ? CaptureMode.AllScreens : CaptureMode.VirtualOnly;
         _target = BuildCaptureTarget();
@@ -347,6 +358,63 @@ public sealed class WorkerContext : ApplicationContext
                                   $"( {cl},{ct} {cw}x{ch} )，重建画布采集");
                         _needCaptureSwitch = true;
                         continue;
+                    }
+                }
+                // 仅副屏模式也要盯拓扑（2026-10-07）：本机用户改物理屏分辨率/接拔屏后，
+                // 虚拟外屏可能留在旧坐标上、与物理屏交叠 → 副屏窗口左半边画到物理屏上
+                // （"窗口一半在主屏一半在副屏"）。每 2 秒核一次外屏矩形与重叠关系。
+                if (!_captureAll && sw.ElapsedMilliseconds >= _nextTopoCheckMs)
+                {
+                    long topoNow = sw.ElapsedMilliseconds;
+                    _nextTopoCheckMs = topoNow + 2000;
+                    var virt = _virtualScreen;
+                    if (virt is { IsVirtual: true })
+                    {
+                        var cur = DisplayHelper.GetMonitors()
+                            .FirstOrDefault(m => m.DeviceName == virt.DeviceName);
+                        if (cur != null && !DisplayHelper.OverlapsAnyPhysical(cur))
+                        {
+                            // 布局健康：随手存一份快照（有变化才写盘，内部自节流）
+                            DisplayLayoutSnapshot.SaveIfChanged(DisplayLayoutPath);
+                        }
+                        if (cur == null)
+                        {
+                            _log.Warn($"虚拟外屏 {virt.DeviceName} 消失，重新挑采集目标");
+                            _needCaptureSwitch = true;   // BuildCaptureTarget 会重新 PickCaptureTarget
+                        }
+                        else if (cur.Left != virt.Left || cur.Top != virt.Top ||
+                                 cur.Width != virt.Width || cur.Height != virt.Height)
+                        {
+                            _log.Info($"虚拟外屏位置/尺寸变化：({virt.Left},{virt.Top} {virt.Width}x{virt.Height}) → " +
+                                      $"({cur.Left},{cur.Top} {cur.Width}x{cur.Height})，重建采集");
+                            _virtualScreen = cur;
+                            _windows.SetCaptureTarget(cur);
+                            _topoFailBackoffMs = 30_000;   // 拓扑真的动了：重置归位退避
+                            _needCaptureSwitch = true;
+                        }
+                        else if (DisplayHelper.OverlapsAnyPhysical(cur))
+                        {
+                            if (DisplayHelper.EnsureVirtualAdjacent(cur, msg => _log.Info(msg)))
+                            {
+                                var moved = DisplayHelper.GetMonitors()
+                                    .FirstOrDefault(m => m.DeviceName == cur.DeviceName);
+                                if (moved != null)
+                                {
+                                    _windows.ShiftWindowsWithVirtualScreen(cur, moved);
+                                    _virtualScreen = moved;
+                                    _windows.SetCaptureTarget(moved);
+                                }
+                                _topoFailBackoffMs = 30_000;
+                                _needCaptureSwitch = true;
+                            }
+                            else
+                            {
+                                // 挪不动（驱动/同机远控软件锁死位置）：指数退避 30s→30min，
+                                // 别每 2 秒白试一次（每次核实要 Sleep 600ms，会卡采集）
+                                _nextTopoCheckMs = topoNow + _topoFailBackoffMs;
+                                _topoFailBackoffMs = Math.Min(_topoFailBackoffMs * 2, 1_800_000);
+                            }
+                        }
                     }
                 }
                 if (_needStreamReset)

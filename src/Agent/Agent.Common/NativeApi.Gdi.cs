@@ -149,6 +149,7 @@ public static partial class NativeApi
     public const uint DM_PELSHEIGHT = 0x00100000;
     public const uint DM_DISPLAYFREQUENCY = 0x00400000;
     public const uint DM_BITSPERPEL = 0x00040000;
+    public const uint DM_DISPLAYPOSITION = 0x00000020;
     public const uint CDS_UPDATEREGISTRY = 0x00000001;
     public const int DISP_CHANGE_SUCCESSFUL = 0;
 

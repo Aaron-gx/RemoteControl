@@ -67,4 +67,18 @@ public static partial class NativeApi
     public static extern IntPtr GetKeyboardLayout(uint threadId);
 
     public const uint MAPVK_VK_TO_VSC = 0;
+
+    // ---------------------------------------------------------------- 输入法（IME）模式控制
+    // 微软拼音在"中"模式下会把合成注入的字母全部吃进拼音组字框、Ctrl 组合键直接拦截
+    // （2026-10-08 现场：远端打字进组字框发滞、Ctrl+C/V 全失效）。远端认领的窗口
+    // 一律切到"英"直通模式；中文输入由主控端本地输入后经剪贴板 Ctrl+V 粘贴。
+
+    [DllImport("imm32.dll")]
+    public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hwnd);
+
+    public const uint WM_IME_CONTROL = 0x0283;
+    public const uint IMC_GETCONVERSIONMODE = 1;
+    public const uint IMC_SETCONVERSIONMODE = 2;
+    /// <summary>IME_CMODE_NATIVE：中文（组字）模式</summary>
+    public const int IME_CMODE_NATIVE = 0x0001;
 }

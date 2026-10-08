@@ -200,6 +200,47 @@ public sealed class WindowManager
         catch { }
     }
 
+    /// <summary>
+    /// 虚拟外屏整体挪位后，把中心点还留在旧矩形里的可见顶层窗口按相同位移平移过去。
+    /// 系统挪屏不保证带着普通窗口走：外屏从 (1920,0) 挪到 (2560,0) 后，
+    /// 原来停在外屏上的窗口会孤零零留在物理屏区域里（最大化窗口系统会自己跟着屏走，跳过）。
+    /// </summary>
+    public void ShiftWindowsWithVirtualScreen(DisplayInfo oldRect, DisplayInfo newRect)
+    {
+        int dx = newRect.Left - oldRect.Left, dy = newRect.Top - oldRect.Top;
+        if (dx == 0 && dy == 0) return;
+        try
+        {
+            NativeApi.EnumWindows((h, _) =>
+            {
+                try
+                {
+                    if (!NativeApi.IsWindow(h) || !NativeApi.IsWindowVisible(h)) return true;
+                    if (NativeApi.GetAncestor(h, NativeApi.GA_ROOT) != h) return true;
+                    if (IsShellWindow(h)) return true;
+                    // 控制台窗口 IsSaneWindow 会过滤掉，但 cmd/PowerShell 是远端最常用的，单独放行
+                    bool console = NativeApi.GetClassName(h).Contains("ConsoleWindow");
+                    if (!console && !IsSaneWindow(h)) return true;
+                    if (NativeApi.IsZoomed(h)) return true;   // 最大化窗口由系统随屏迁移
+                    NativeApi.GetWindowThreadProcessId(h, out int pid);
+                    if (pid == 0 || pid == Environment.ProcessId) return true;
+                    if (!NativeApi.GetWindowRect(h, out var r)) return true;
+                    int cx = (r.Left + r.Right) / 2, cy = (r.Top + r.Bottom) / 2;
+                    if (cx < oldRect.Left || cx >= oldRect.Right || cy < oldRect.Top || cy >= oldRect.Bottom)
+                        return true;   // 中心不在旧外屏里，不归我们管
+                    if (NativeApi.SetWindowPos(h, IntPtr.Zero, r.Left + dx, r.Top + dy, 0, 0,
+                            NativeApi.SWP_NOSIZE | NativeApi.SWP_NOZORDER | NativeApi.SWP_NOACTIVATE))
+                    {
+                        _log.Info($"外屏挪位：窗口（{ProcessNameOf(pid)}）随屏平移 → ({r.Left + dx},{r.Top + dy})");
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
     /// <summary>现在屏幕上有哪些窗口 = 基线。远端按 Win+R 之前拍一张，之后新出现的才算"它带出来的"</summary>
     public void SnapshotBaseline()
     {
@@ -869,6 +910,10 @@ public sealed class WindowManager
             {
                 NativeApi.UncloakWindow(hwnd);
                 NativeApi.ShowWindow(hwnd, NativeApi.SW_SHOWNOACTIVATE);  // 在副屏恢复显示（不抢焦点）
+                // 【修复 2026-10-08】恢复显示后必须**强制激活**：SHOWNOACTIVATE 出来的窗口
+                // 前台归它、键盘焦点却没人认领 —— WinUI 应用（新版记事本等）不走激活流程就不给
+                // 编辑框设焦点，SendInput 的键全落空（现场：远端打字/复制粘贴全部无效）。
+                ForceActivateWindow(hwnd);
             }
         }
         catch { }
@@ -1194,6 +1239,72 @@ public sealed class WindowManager
     }
 
     /// <summary>
+    /// 把窗口的输入法切到"英文直通"（微软拼音的"英"状态）。
+    /// 中文模式下输入法会把合成注入的字母全部吃进拼音组字框（远端打字发滞、出现莫名汉字），
+    /// 并拦截 Ctrl 组合键（Ctrl+C/V/A 全失效）。远端认领的窗口一律英文直通；
+    /// 要输中文：主控端本地打好字 → 剪贴板同步 → Ctrl+V 粘贴。
+    /// 输入法模式是按窗口输入上下文存的，只影响这个窗口，不动本机用户自己的窗口。
+    /// </summary>
+    public void NormalizeImeToEnglish(IntPtr hwnd)
+    {
+        try
+        {
+            var ime = NativeApi.ImmGetDefaultIMEWnd(hwnd);
+            if (ime == IntPtr.Zero) return;
+            var mode = NativeApi.SendMessageW(ime, NativeApi.WM_IME_CONTROL,
+                (IntPtr)NativeApi.IMC_GETCONVERSIONMODE, IntPtr.Zero);
+            if (((int)mode.ToInt64() & NativeApi.IME_CMODE_NATIVE) != 0)
+            {
+                NativeApi.SendMessageW(ime, NativeApi.WM_IME_CONTROL,
+                    (IntPtr)NativeApi.IMC_SETCONVERSIONMODE, IntPtr.Zero);   // 清掉 NATIVE 位 → 英文直通
+                _log.Info($"已把窗口 {hwnd} 的输入法切到英文直通（原模式 {mode}）：远端字母不再进组字框，Ctrl 组合键恢复");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"切换输入法模式失败（不影响其余功能）：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 强制激活窗口并把**键盘焦点**真正交给它 —— 即使 GetForegroundWindow 已经是它。
+    /// RobustSetForeground 在"已是前台"时会提前返回，但 SHOWNOACTIVATE 出来的窗口
+    /// 可能前台归它、焦点却没人认领（WinUI 应用不走激活流程就不给编辑框 SetFocus，
+    /// SendInput 的键全部落空）。这里把本线程附加到目标窗口线程的输入队列上，
+    /// SetActiveWindow + SetFocus 走完整的激活链。
+    /// </summary>
+    public void ForceActivateWindow(IntPtr hwnd)
+    {
+        try
+        {
+            var arb = Arbiter;
+            if (arb != null && arb.LocalActiveRecently) return;   // 本机用户在操作时不抢焦点
+            if (NativeApi.IsIconic(hwnd)) NativeApi.ShowWindow(hwnd, NativeApi.SW_RESTORE);
+            uint targetThread = NativeApi.GetWindowThreadProcessId(hwnd, out _);
+            uint myThread = NativeApi.GetCurrentThreadId();
+            bool attached = targetThread != 0 && targetThread != myThread
+                            && NativeApi.AttachThreadInput(myThread, targetThread, true);
+            try
+            {
+                NativeApi.BringWindowToTop(hwnd);
+                NativeApi.SetForegroundWindow(hwnd);
+                NativeApi.SetActiveWindow(hwnd);
+                NativeApi.SetFocus(hwnd);
+                NormalizeImeToEnglish(hwnd);
+                _log.Info($"已强制激活搬到外屏的窗口 {hwnd}（前台={NativeApi.GetForegroundWindow()} 焦点给到它）");
+            }
+            finally
+            {
+                if (attached) NativeApi.AttachThreadInput(myThread, targetThread, false);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"强制激活失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// 把窗口置为前台。Windows 有"前台锁"：非前台进程直接 SetForegroundWindow 可能被忽略，
     /// 标准绕过办法是先把本线程的输入队列附加到当前前台窗口的线程上。
     /// 键鼠注入要落到目标窗口，这一步是关键。
@@ -1236,6 +1347,7 @@ public sealed class WindowManager
                 if (attached) NativeApi.AttachThreadInput(myThread, fgThread, false);
             }
             var now = NativeApi.GetForegroundWindow();
+            if (now == hwnd) NormalizeImeToEnglish(hwnd);
             _log.Info($"已尝试把窗口 {hwnd} 置为前台（当前前台={now}，{(now == hwnd ? "成功" : "未生效")}）");
         }
         catch (Exception ex)

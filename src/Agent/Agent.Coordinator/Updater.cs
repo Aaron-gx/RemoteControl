@@ -55,7 +55,10 @@ public sealed class Updater : IDisposable
         _ = Task.Run(async () =>
         {
             // 启动后先等 30 秒（别抢启动期的网络/磁盘），以后每 6 小时查一次
-            var interval = TimeSpan.FromHours(Math.Max(1, _cfg.UpdateCheckIntervalHours));
+            // 分钟优先；旧配置里的 Hours 仍认（>0 时用小时值）。下限 5 分钟。
+            var interval = _cfg.UpdateCheckIntervalMinutes > 0
+                ? TimeSpan.FromMinutes(Math.Max(5, _cfg.UpdateCheckIntervalMinutes))
+                : TimeSpan.FromHours(Math.Max(1, _cfg.UpdateCheckIntervalHours));
             while (!_cts.IsCancellationRequested)
             {
                 try { await Task.Delay(TimeSpan.FromSeconds(30), _cts.Token); } catch { return; }

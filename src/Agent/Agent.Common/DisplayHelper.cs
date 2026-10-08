@@ -1,6 +1,89 @@
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Agent.Common;
+
+/// <summary>一次"健康布局"的快照（诊断与自愈参照）。对标 UU远程 的 save/restore_display_layout——
+/// 我们的虚拟外屏常驻，不做整拓扑回滚（风险高：SetDisplayConfig 配错会黑屏），快照用于：
+/// 启动时对照当前布局找异常（医生日志）+ 现场排障 + 人工恢复参照。</summary>
+public sealed class DisplayLayoutSnapshot
+{
+    public long SavedAt { get; set; }
+    public List<DisplayInfo> Monitors { get; set; } = new();
+
+    public string Describe() => string.Join(" | ", Monitors);
+
+    public static DisplayLayoutSnapshot Capture() => new()
+    {
+        SavedAt = DateTimeOffset.Now.ToUnixTimeSeconds(),
+        Monitors = DisplayHelper.GetMonitors().ToList(),
+    };
+
+    /// <summary>落盘（内容有变化才写，避免 2 秒一拍刷盘）。只在布局"健康"（外屏在、不重叠）时存。</summary>
+    /// <returns>true=这次真的写了新快照</returns>
+    public static bool SaveIfChanged(string path, Logger? log = null)
+    {
+        try
+        {
+            var snap = Capture();
+            var virt = snap.Monitors.FirstOrDefault(m => m.IsVirtual);
+            if (virt == null) return false;
+            foreach (var p in snap.Monitors.Where(m => !m.IsVirtual))
+            {
+                if (virt.Left < p.Right && virt.Right > p.Left && virt.Top < p.Bottom && virt.Bottom > p.Top)
+                    return false;   // 还重叠着：不健康，不存
+            }
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            string fresh = System.Text.Json.JsonSerializer.Serialize(snap,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            string? old = File.Exists(path) ? File.ReadAllText(path) : null;
+            if (old == fresh) return false;
+            File.WriteAllText(path, fresh);
+            log?.Info($"显示布局快照已更新：{snap.Describe()}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log?.Debug($"写显示布局快照失败：{ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>启动"布局医生"：读出快照并与当前拓扑对照，差异写日志
+    ///（自愈仍走既有的相邻归位/分辨率切换路径，这里负责"说清楚"而不是"动手"）。</summary>
+    public static void Doctor(string path, Logger log)
+    {
+        try
+        {
+            var cur = DisplayHelper.GetMonitors();
+            if (!File.Exists(path))
+            {
+                log.Info($"布局医生：无历史快照（首次运行），当前拓扑：{string.Join(" | ", cur)}");
+                return;
+            }
+            var snap = System.Text.Json.JsonSerializer.Deserialize<DisplayLayoutSnapshot>(File.ReadAllText(path));
+            if (snap == null || snap.Monitors.Count == 0) return;
+            var diffs = new List<string>();
+            foreach (var s in snap.Monitors)
+            {
+                var c = cur.FirstOrDefault(m => m.DeviceName == s.DeviceName);
+                if (c == null) { diffs.Add($"{s.DeviceName} 快照里有、现在没了"); continue; }
+                if (c.Left != s.Left || c.Top != s.Top || c.Width != s.Width || c.Height != s.Height)
+                    diffs.Add($"{s.DeviceName} 快照({s.Left},{s.Top} {s.Width}x{s.Height}) → 现在({c.Left},{c.Top} {c.Width}x{c.Height})");
+            }
+            foreach (var c in cur.Where(c => snap.Monitors.All(s => s.DeviceName != c.DeviceName)))
+                diffs.Add($"{c.DeviceName} 快照里没有、现在新出现");
+            log.Info(diffs.Count == 0
+                ? $"布局医生：与最近一次健康快照一致（{snap.Describe()}）"
+                : $"布局医生：与快照有差异 —— {string.Join("；", diffs)}");
+        }
+        catch (Exception ex)
+        {
+            log.Debug($"布局医生异常：{ex.Message}");
+        }
+    }
+}
 
 public sealed record DisplayInfo(string DeviceName, int Left, int Top, int Width, int Height, bool IsPrimary,
     string AdapterName = "")
@@ -83,6 +166,88 @@ public static class DisplayHelper
         var virtualMonitor = monitors.FirstOrDefault(m => m.IsVirtual);
         if (virtualMonitor != null) return virtualMonitor;
         return monitors.FirstOrDefault(m => m.IsPrimary) ?? monitors[0];
+    }
+
+    /// <summary>虚拟外屏矩形是否与任一物理屏相交</summary>
+    public static bool OverlapsAnyPhysical(DisplayInfo virt)
+    {
+        foreach (var p in GetMonitors())
+        {
+            if (p.DeviceName == virt.DeviceName || p.IsVirtual) continue;
+            if (virt.Left < p.Right && virt.Right > p.Left && virt.Top < p.Bottom && virt.Bottom > p.Top)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 确保虚拟外屏**紧贴所有物理屏并集的右侧、互不重叠**（2026-10-07，客户反馈
+    /// "窗口一半在主屏一半在副屏"）。物理屏换分辨率（1920→2560）或 IDD 驱动重建后，
+    /// 外屏可能仍停在旧坐标（例如 x=1920），把物理屏右半边盖住 —— 落在外屏上的窗口
+    /// 左边 640px 会同时显示在物理屏上，本机用户看得一清二楚。
+    /// 重叠时用 ChangeDisplaySettingsEx 挪到所有物理屏右侧紧贴处。
+    /// 返回 true=**已核实挪动生效**（坐标已变，调用方必须重新枚举并重建采集目标）。
+    /// 【2026-10-08 真机踩坑】部分 IDD 驱动/同机远控软件会把位置锁死：API 返回成功(0)
+    /// 但位置纹丝不动 —— 必须重枚举核实，否则调用方会陷入"假成功→重建→再试"的死循环。
+    /// </summary>
+    public static bool EnsureVirtualAdjacent(DisplayInfo virt, Action<string>? log = null)
+    {
+        try
+        {
+            var monitors = GetMonitors();
+            var me = monitors.FirstOrDefault(m => m.DeviceName == virt.DeviceName) ?? virt;
+            var physical = monitors.Where(m => m.DeviceName != me.DeviceName && !m.IsVirtual).ToList();
+            if (physical.Count == 0) return false;
+            bool overlaps = physical.Any(p =>
+                me.Left < p.Right && me.Right > p.Left && me.Top < p.Bottom && me.Bottom > p.Top);
+            if (!overlaps) return false;
+
+            // 挪到所有物理屏并集的右侧，顶边与最靠右那块物理屏对齐
+            int newLeft = physical.Max(p => p.Right);
+            int newTop = physical.First(p => p.Right == newLeft).Top;
+            if (newLeft == me.Left && newTop == me.Top) return false;
+
+            var dm = new NativeApi.DEVMODEW
+            {
+                dmDeviceName = "",
+                dmFormName = "",
+                dmSize = (ushort)Marshal.SizeOf<NativeApi.DEVMODEW>(),
+            };
+            if (!NativeApi.EnumDisplaySettingsW(me.DeviceName, -1, ref dm))
+            {
+                log?.Invoke($"读取 {me.DeviceName} 当前显示模式失败，无法挪位");
+                return false;
+            }
+            log?.Invoke($"虚拟外屏 {me.DeviceName} 与物理屏重叠（{me.Left},{me.Top} {me.Width}x{me.Height}，" +
+                        $"物理屏并集右边线 {newLeft}）→ 尝试挪到 ({newLeft},{newTop})");
+            dm.dmPositionX = newLeft;
+            dm.dmPositionY = newTop;
+            dm.dmFields = NativeApi.DM_DISPLAYPOSITION;
+            int r = NativeApi.ChangeDisplaySettingsExW(me.DeviceName, ref dm, IntPtr.Zero,
+                NativeApi.CDS_UPDATEREGISTRY, IntPtr.Zero);
+            if (r != NativeApi.DISP_CHANGE_SUCCESSFUL)
+            {
+                log?.Invoke($"挪动虚拟外屏失败：ChangeDisplaySettingsEx 返回 {r}");
+                return false;
+            }
+            // API 报成功不算数，重枚举核实位置真的变了
+            Thread.Sleep(600);
+            var after = GetMonitors().FirstOrDefault(m => m.DeviceName == me.DeviceName);
+            if (after == null || after.Left != newLeft || after.Top != newTop)
+            {
+                log?.Invoke($"挪动未生效（{me.DeviceName} 位置仍为 ({after?.Left.ToString() ?? "?"},{after?.Top.ToString() ?? "?"})，" +
+                            "被虚拟屏驱动或同机远控软件锁定）。外屏与物理屏重叠期间，副屏窗口会有一截显示在物理屏上；" +
+                            "重启被控端或重插物理屏可恢复。");
+                return false;
+            }
+            log?.Invoke($"虚拟外屏已归位到 ({after.Left},{after.Top})");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"挪动虚拟外屏异常：{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>

@@ -116,5 +116,5 @@ Write-Host "`n=== 构建完成 ===" -ForegroundColor Cyan
 Write-Host "  安装程序：$setupExe（$sizeMb MB）"
 Write-Host "  用法：把这一个 exe 拷到目标电脑 → 双击 → 按向导装（也可 /VERYSILENT 静默装）"
 Write-Host "        静默安装示例：虚拟服务器客户端-安装程序.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
-Write-Host "  卸载：设置 → 应用 → 已安装的应用 → 远程控制 · 主控端 → 卸载"
+Write-Host "  卸载：设置 → 应用 → 已安装的应用 → 虚拟服务器客户端 → 卸载"
 Write-Host "  预置服务器：$ServerUrl（向导里可改；也可用同目录 setup-defaults.ini 覆盖口令）"
