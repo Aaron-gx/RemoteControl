@@ -29,6 +29,16 @@ public static partial class NativeApi
     public const uint LLMHF_LOWER_IL_INJECTED = 0x00000002;
 
     /// <summary>
+    /// KBDLLHOOKSTRUCT.flags：事件由软件注入。键盘的注入位是 0x10，和鼠标的
+    /// LLMHF_INJECTED(0x1) **不是同一个位** —— 2026-10-08 事故：键盘事件误用鼠标位判断，
+    /// 我们自己注入的键（flags 含 0x10）被当成"人手在打字"布防闸门，后续远端键全被拦掉，
+    /// 现象是"只出第一个字母"（装了 GameViewer 的机器上仲裁器武装钩子后才暴露）。
+    /// </summary>
+    public const uint LLKHF_INJECTED = 0x00000010;
+    /// <summary>KBDLLHOOKSTRUCT.flags：由更低完整性级别的进程注入</summary>
+    public const uint LLKHF_LOWER_IL_INJECTED = 0x00000002;
+
+    /// <summary>
     /// 我们自己的注入事件标记，写进 MOUSEINPUT / KEYBDINPUT 的 dwExtraInfo。
     /// 只靠 LLMHF_INJECTED 区分不了"远端注入"和"本机触摸板/厂商驱动用 SendInput 送的输入"，
     /// 而两者的待遇正好相反（前者要归还光标、后者必须原样放行），所以必须打这个记号。
@@ -51,6 +61,9 @@ public static partial class NativeApi
     /// 会被误判成软件注入，权衡后接受（远控共存是真实现场，前者是理论场景）。
     /// </summary>
     public static bool IsSoftwareInjected(uint flags) => (flags & LLMHF_INJECTED) != 0;
+
+    /// <summary>键盘版：注入位是 LLKHF_INJECTED(0x10)，不是鼠标的 0x1（见常量注）</summary>
+    public static bool IsSoftwareInjectedKb(uint flags) => (flags & LLKHF_INJECTED) != 0;
 
     // ---------------------------------------------------------------- 结构
 

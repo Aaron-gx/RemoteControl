@@ -309,8 +309,9 @@ public sealed class CursorArbiter : IDisposable
             try
             {
                 var kb = Marshal.PtrToStructure<NativeApi.KBDLLHOOKSTRUCT>(lParam);
-                // 人手判定：别的软件（GameViewer 等）注入的键不算本机用户在打字（见 MouseProc 被动分支注）
-                if (!NativeApi.IsSoftwareInjected(kb.flags))
+                // 人手判定：键盘注入位是 LLKHF_INJECTED(0x10)，必须用键盘版判断 ——
+                // 用鼠标位(0x1)会把自己注入的键当成"人手在打字"，闸门拦掉全部远端键（2026-10-08）
+                if (!NativeApi.IsSoftwareInjectedKb(kb.flags))
                 {
                     Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
                     _lastPhysicalSource = $"kb vk=0x{kb.vkCode:X} flags=0x{kb.flags:X} extra=0x{kb.dwExtraInfo.ToInt64():X}";
