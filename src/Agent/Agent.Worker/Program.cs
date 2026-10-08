@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.1";
+    public const string Version = "1.5.2";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -778,6 +778,9 @@ public sealed class WorkerContext : ApplicationContext
                     NotifyRemoteKeysBlocked();
                     break;
                 }
+                // 前台窗口输入法英文化（3 秒节流）：真实光标模式下点进已有窗口不会经过
+                // ForceActivateWindow，中文模式的组字框会吃掉后续按键（2026-10-08 现场）
+                _windows.EnsureImeEnglishForForeground();
                 lock (_remoteKeysDown) _remoteKeysDown.Add(vk);
                 _injector.Key(vk, up, flags);
                 break;

@@ -1238,6 +1238,30 @@ public sealed class WindowManager
         RobustSetForeground(hwnd);
     }
 
+    private IntPtr _imeCheckedWindow;
+    private long _imeCheckedTick;
+
+    /// <summary>
+    /// 【修复 2026-10-08】打字前确保**当前前台窗口**输入法是英文直通（同一窗口 3 秒节流）。
+    /// 场景：真实光标模式下远端点进一个已在前的窗口（浏览器/早就开着的应用）——
+    /// ClaimedWindow 只在后台注入路径设置，这类窗口不会走 ForceActivateWindow，
+    /// 输入法停留在中文模式，字母全部进拼音组字框（现场：打一个字后就不动了）。
+    /// </summary>
+    public void EnsureImeEnglishForForeground()
+    {
+        try
+        {
+            var fg = NativeApi.GetForegroundWindow();
+            if (fg == IntPtr.Zero) return;
+            long now = Environment.TickCount64;
+            if (fg == _imeCheckedWindow && now - _imeCheckedTick < 3000) return;
+            _imeCheckedWindow = fg;
+            _imeCheckedTick = now;
+            NormalizeImeToEnglish(fg);
+        }
+        catch { }
+    }
+
     /// <summary>
     /// 把窗口的输入法切到"英文直通"（微软拼音的"英"状态）。
     /// 中文模式下输入法会把合成注入的字母全部吃进拼音组字框（远端打字发滞、出现莫名汉字），

@@ -591,6 +591,78 @@ Get-Content ($env:TEMP+'\kb3.txt') | clip
                     print(f"视频流 {len(buf)}B -> {out_path}（本地解码看选区/粘贴）", flush=True)
                     print("=" * 56, flush=True)
         asyncio.run(_kb5())
+    elif mode == "kbtest6":
+        # 复现用户场景的验收：记事本开好后把它的输入法**强制设回中文**（模拟用户点进
+        # 已有窗口时的状态），然后模拟快速连打，验收 EnsureImeEnglishForForeground：
+        # 第一个键落下前输入法应被自动切英，字直落不进组字框。
+        out_path = sys.argv[2] if len(sys.argv) > 2 else r"D:\tools\cap6.h264"
+        async def _kb6():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    buf = bytearray()
+                    async def key(vk, up=False, flags=0):
+                        await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
+                    async def tap(vk, hold=0.03):
+                        await key(vk); await asyncio.sleep(hold); await key(vk, True)
+                    import base64 as _b
+                    set_ime_cn = r'''
+Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class IME6 {
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
+ [DllImport("imm32.dll")] public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr h);
+ [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+}
+"@
+$h=[IME6]::FindWindowW("Notepad",$null)
+$ime=[IME6]::ImmGetDefaultIMEWnd($h)
+[void][IME6]::SendMessageW($ime,0x283,[IntPtr]2,[IntPtr]1)
+"IME set NATIVE(中文) for $h" | Out-File $env:TEMP\kb6.txt -Encoding utf8
+'''
+                    ps_args = "-NoProfile -WindowStyle Hidden -EncodedCommand " + _b.b64encode(
+                        set_ime_cn.encode("utf-16-le")).decode()
+                    ps_exe = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+
+                    async def script():
+                        await asyncio.sleep(3.5)      # 记事本就绪（已被 ForceActivate+IME 英文化）
+                        # 强制把记事本输入法设回中文（复现"点进已有窗口"的状态）
+                        await ws.send_bytes(frame(0x11, json.dumps(
+                            {"exePath": ps_exe, "args": ps_args}).encode()))
+                        await asyncio.sleep(2.0)       # 等 PS 跑完、前台回落
+                        # 模拟快速连打：HELLO 间隔 30ms（用户"连续按了很多次"的场景）
+                        for ch in "HELLOWORLD123":
+                            await tap(ord(ch))
+                            await asyncio.sleep(0.03)
+                        print("[burst typed: HELLOWORLD123]", flush=True)
+                        await asyncio.sleep(2.5)
+                    asyncio.get_event_loop().create_task(script())
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x11, json.dumps(
+                        {"exePath": "C:\\Windows\\System32\\notepad.exe", "args": ""}).encode()))
+                    end = asyncio.get_event_loop().time() + 14.0
+                    while True:
+                        left = end - asyncio.get_event_loop().time()
+                        if left <= 0:
+                            break
+                        try:
+                            msg = await ws.receive(timeout=min(left, 1.0))
+                        except asyncio.TimeoutError:
+                            continue
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        data = msg.data
+                        t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                        payload = data[5:5 + n]
+                        if t == 0x30:
+                            await ws.send_bytes(frame(0x30, payload))
+                        elif t == 0x01:
+                            buf.extend(payload)
+                    open(out_path, "wb").write(bytes(buf))
+                    print(f"[saved {len(buf)}B -> {out_path}]", flush=True)
+        asyncio.run(_kb6())
     elif mode == "thispc":
         asyncio.run(session({"open": ("::this-pc", "")}, 15))
     elif mode == "run":
