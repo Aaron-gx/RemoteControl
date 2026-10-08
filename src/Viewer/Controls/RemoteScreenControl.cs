@@ -53,6 +53,13 @@ public sealed class RemoteScreenControl : Image
         Focusable = true;
         FocusVisualStyle = null;
         ClipToBounds = true;
+        // 【修复 2026-10-08】关掉本控件的输入法接管 —— 主控端开着中文输入法时，字母键会被
+        // 本地 IME 截走进组字框：只有第一个键漏成 KeyDown 发到远端，其余全部消失
+        // （现场：连按 L 只出现一个 L、选词不过去、乱打只剩首字母）。关掉后每个键都是
+        // 原始 KeyDown 直发远端（远端窗口已被被控端切成英文直通，字随手动）。
+        // 中文输入：主控端本地打好字 → 剪贴板 → Ctrl+V。
+        InputMethod.SetIsInputMethodEnabled(this, false);
+        InputMethod.SetIsInputMethodSuspended(this, true);
         _log = Logger.Current ?? new Logger("viewer");
         MouseEnter += (_, _) => { _capturingMouse = true; Focus(); };
         MouseLeave += (_, _) => { _capturingMouse = false; };

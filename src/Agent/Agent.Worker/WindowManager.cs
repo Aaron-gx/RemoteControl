@@ -1275,12 +1275,16 @@ public sealed class WindowManager
         {
             var ime = NativeApi.ImmGetDefaultIMEWnd(hwnd);
             if (ime == IntPtr.Zero) return;
-            var mode = NativeApi.SendMessageW(ime, NativeApi.WM_IME_CONTROL,
-                (IntPtr)NativeApi.IMC_GETCONVERSIONMODE, IntPtr.Zero);
+            // 【加固 2026-10-08】裸 SendMessage 是跨进程同步调用：目标 IME 窗口忙/挂时会把
+            // 按键热路径整个拖住（现场"打字一个字一个字往外蹦"的嫌疑路径）。改 60ms 超时版。
+            var mode = NativeApi.SendMessageTimeoutW(ime, NativeApi.WM_IME_CONTROL,
+                (IntPtr)NativeApi.IMC_GETCONVERSIONMODE, IntPtr.Zero,
+                NativeApi.SMTO_ABORTIFHUNG, 60, out _);
             if (((int)mode.ToInt64() & NativeApi.IME_CMODE_NATIVE) != 0)
             {
-                NativeApi.SendMessageW(ime, NativeApi.WM_IME_CONTROL,
-                    (IntPtr)NativeApi.IMC_SETCONVERSIONMODE, IntPtr.Zero);   // 清掉 NATIVE 位 → 英文直通
+                NativeApi.SendMessageTimeoutW(ime, NativeApi.WM_IME_CONTROL,
+                    (IntPtr)NativeApi.IMC_SETCONVERSIONMODE, IntPtr.Zero,
+                    NativeApi.SMTO_ABORTIFHUNG, 60, out _);   // 清掉 NATIVE 位 → 英文直通
                 _log.Info($"已把窗口 {hwnd} 的输入法切到英文直通（原模式 {mode}）：远端字母不再进组字框，Ctrl 组合键恢复");
             }
         }

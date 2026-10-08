@@ -286,6 +286,24 @@ public sealed class InputInjector
         bool ext = (flags & 1) != 0;
         if (ext) f |= NativeApi.KEYEVENTF_EXTENDEDKEY;
 
+        // 【2026-10-08】flags bit1 = 文本注入（主控端输入法组好的文字按字符送过来）：
+        // KEYEVENTF_UNICODE 直接产字符，不走远端输入法，中文/emoji 都能进。
+        if ((flags & 2) != 0)
+        {
+            var u = new NativeApi.INPUT[1];
+            u[0].type = NativeApi.INPUT_KEYBOARD;
+            u[0].u.ki = new NativeApi.KEYBDINPUT
+            {
+                wVk = 0,
+                wScan = vk,
+                dwFlags = NativeApi.KEYEVENTF_UNICODE | (up ? NativeApi.KEYEVENTF_KEYUP : 0),
+                time = 0,
+                dwExtraInfo = NativeApi.InjectTagPtr,
+            };
+            NativeApi.SendInput(1, u, Marshal.SizeOf<NativeApi.INPUT>());
+            return;
+        }
+
         // 【修复 2026-10-08 扫描码注入】中文输入法（微软拼音实测）会吞掉"只带 VK、不带扫描码"
         // 的合成 Ctrl 组合 —— Shift 组合和普通字母能过、Ctrl 全被吃（现场：Ctrl+C/V/A 全部失效，
         // 打字因输入法管线额外绕行而发滞）。带上真实扫描码（KEYEVENTF_SCANCODE）后事件与物理键盘

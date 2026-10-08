@@ -154,6 +154,13 @@ public static partial class NativeApi
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    /// <summary>带超时的跨进程 SendMessage：目标窗口挂了也不拖死调用线程（键盘热路径专用）。</summary>
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam,
+        uint flags, uint timeoutMs, out IntPtr result);
+
     /// <summary>取窗口标题/控件文本</summary>
     public static string GetWindowText(IntPtr hwnd)
     {

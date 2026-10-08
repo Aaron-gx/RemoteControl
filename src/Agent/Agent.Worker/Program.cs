@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.3";
+    public const string Version = "1.5.5";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -99,6 +99,7 @@ public sealed class WorkerContext : ApplicationContext
         Path.Combine(AppContext.BaseDirectory, "config", "display-layout.json");
     /// <summary>上一次"因为本机用户在操作所以丢掉了远端按键"的提示时间</summary>
     private long _lastKeyBlockedNotifyTick;
+    private long _lastGateSourceLogTick;
     private readonly Dictionary<string, int> _launched = new(StringComparer.OrdinalIgnoreCase);
 
     public WorkerContext(AgentConfig cfg, Logger log, int sessionId, WorkerBridge bridge)
@@ -645,7 +646,7 @@ public sealed class WorkerContext : ApplicationContext
     }
 
     /// <summary>本机用户刚动过键鼠多久之内，远端按键先不放行（够短，不会影响正常远端打字）</summary>
-    private const long RemoteKeyBlockWindowMs = 800;
+    private const long RemoteKeyBlockWindowMs = 300;   // 收紧：800ms 假阳性面太大（2026-10-08 现场：无真人的机器持续被拦）
 
     /// <summary>远端按键因为本机用户正在操作而被丢弃 → 限流告知主控端（10s 最多一条）</summary>
     private void NotifyRemoteKeysBlocked()
@@ -778,6 +779,12 @@ public sealed class WorkerContext : ApplicationContext
 
                 if (_arbiter != null && _arbiter.LocalActiveWithin(RemoteKeyBlockWindowMs))
                 {
+                    long nowB = Environment.TickCount64;
+                    if (nowB - _lastGateSourceLogTick > 1000)
+                    {
+                        _lastGateSourceLogTick = nowB;
+                        _log.Warn($"远端按键被本机活跃闸门拦下：来源={_arbiter.LastPhysicalSource}");
+                    }
                     NotifyRemoteKeysBlocked();
                     break;
                 }

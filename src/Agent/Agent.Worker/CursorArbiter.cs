@@ -53,6 +53,8 @@ public sealed class CursorArbiter : IDisposable
     private int _physX, _physY;                           // 本机用户最后在物理屏上的位置
     private int _seenX, _seenY;                           // 最近一次看到的光标位置（含远端注入）
     private long _lastPhysicalTick;
+    /// <summary>最近一次"物理输入"的来源描述（排障用：假信号到底是谁发的）</summary>
+    private string _lastPhysicalSource = "";
     private long _snapBacks;
     private int _errors;
     private bool _disposed;
@@ -67,6 +69,9 @@ public sealed class CursorArbiter : IDisposable
 
     /// <summary>本机用户在最近 ms 毫秒内动过鼠标或键盘吗</summary>
     public bool LocalActiveWithin(long ms) => Environment.TickCount64 - LastPhysicalInputTick < ms;
+
+    /// <summary>最近物理输入的来源描述 + 距今毫秒（排障：识别"没有真人的机器却判定本机用户在操作"的假信号）</summary>
+    public string LastPhysicalSource => $"{_lastPhysicalSource} ({Environment.TickCount64 - LastPhysicalInputTick}ms 前)";
 
     /// <summary>钩子是否已装上（= 正在仲裁光标）</summary>
     public bool Armed { get; private set; }
@@ -237,7 +242,10 @@ public sealed class CursorArbiter : IDisposable
             {
                 var ms0 = Marshal.PtrToStructure<NativeApi.MSLLHOOKSTRUCT>(lParam);
                 if (!NativeApi.IsSoftwareInjected(ms0.flags))
+                {
                     Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
+                    _lastPhysicalSource = $"mouse ({ms0.pt.X},{ms0.pt.Y}) flags=0x{ms0.flags:X} extra=0x{ms0.dwExtraInfo.ToInt64():X}";
+                }
             }
             catch { }
             return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -257,7 +265,10 @@ public sealed class CursorArbiter : IDisposable
             // 宏工具…）—— 不是人手，不计入"本机用户在操作"（否则远端按键被闸门误拦）；
             // 归还/重放逻辑保持原样，只影响时间戳。
             if (!NativeApi.IsSoftwareInjected(ms.flags))
+            {
                 Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
+                _lastPhysicalSource = $"mouse-armed ({ms.pt.X},{ms.pt.Y}) flags=0x{ms.flags:X} extra=0x{ms.dwExtraInfo.ToInt64():X}";
+            }
 
             if (!IsOnVirtual(ms.pt.X, ms.pt.Y))
             {
@@ -300,7 +311,10 @@ public sealed class CursorArbiter : IDisposable
                 var kb = Marshal.PtrToStructure<NativeApi.KBDLLHOOKSTRUCT>(lParam);
                 // 人手判定：别的软件（GameViewer 等）注入的键不算本机用户在打字（见 MouseProc 被动分支注）
                 if (!NativeApi.IsSoftwareInjected(kb.flags))
+                {
                     Interlocked.Exchange(ref _lastPhysicalTick, Environment.TickCount64);
+                    _lastPhysicalSource = $"kb vk=0x{kb.vkCode:X} flags=0x{kb.flags:X} extra=0x{kb.dwExtraInfo.ToInt64():X}";
+                }
             }
             catch { }
         }
