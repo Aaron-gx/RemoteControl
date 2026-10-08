@@ -168,6 +168,38 @@ public static class DisplayHelper
         return monitors.FirstOrDefault(m => m.IsPrimary) ?? monitors[0];
     }
 
+    /// <summary>
+    /// 重启虚拟显示驱动设备节点（2026-10-08 真机事故：VDD 显示器自发消失 + NVIDIA 驱动重置把物理屏
+    /// 也带走了，桌面塌缩成 800x600，远端键鼠全部错位）。现场验证 `pnputil /restart-device`
+    /// 能把虚拟屏拉回来（物理屏需重启机器恢复）。巡检发现"该有的虚拟屏没了"时自动执行，10 分钟节流。
+    /// </summary>
+    public static bool TryRestartVirtualDisplayDriver(string driverId, Action<string>? log = null)
+    {
+        if (string.IsNullOrWhiteSpace(driverId)) return false;
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("pnputil", $"/restart-device \"{driverId}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return false;
+            var output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(15000);
+            var firstLine = output.Trim().Split('\n').FirstOrDefault() ?? "";
+            log?.Invoke($"已执行 pnputil /restart-device {driverId}（exit={p.ExitCode}）：{firstLine}");
+            return p.ExitCode == 0;
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"重启虚拟屏驱动失败：{ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>虚拟外屏矩形是否与任一物理屏相交</summary>
     public static bool OverlapsAnyPhysical(DisplayInfo virt)
     {

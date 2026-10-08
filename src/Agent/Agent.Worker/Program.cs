@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.2";
+    public const string Version = "1.5.3";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -91,6 +91,7 @@ public sealed class WorkerContext : ApplicationContext
     /// <summary>主控端是否在线（协调器每秒通过 IpcBitrateHint 告知——不能用"远端没动鼠标"代替）</summary>
     private volatile bool _viewerOnline;
     private long _lastReclaimTick;
+    private long _lastVddRestartTick;
     private long _nextTopoCheckMs;
     private long _topoFailBackoffMs = 30_000;
     /// <summary>最近一次健康显示布局的快照（config\display-layout.json）</summary>
@@ -380,6 +381,15 @@ public sealed class WorkerContext : ApplicationContext
                         if (cur == null)
                         {
                             _log.Warn($"虚拟外屏 {virt.DeviceName} 消失，重新挑采集目标");
+                            // 自愈（2026-10-08）：VDD 显示器自发消失时重启驱动设备节点把它拉回来，
+                            // 10 分钟节流防抖。物理屏若也被 GPU 重置带走了，这救不了——那需要重启机器。
+                            if (_cfg.EnableVirtualDisplay &&
+                                topoNow - _lastVddRestartTick > 600_000)
+                            {
+                                _lastVddRestartTick = topoNow;
+                                DisplayHelper.TryRestartVirtualDisplayDriver(_cfg.VirtualDisplayDriverId,
+                                    msg => _log.Info(msg));
+                            }
                             _needCaptureSwitch = true;   // BuildCaptureTarget 会重新 PickCaptureTarget
                         }
                         else if (cur.Left != virt.Left || cur.Top != virt.Top ||
