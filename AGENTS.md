@@ -17,12 +17,13 @@ Windows 远程控制软件，三部分（对客户一律叫"**虚拟服务器**"
 
 ## 1. 铁律（违反会出事故，先记住再动手）
 
-1. **被控端绝不能在本机跑/测**——窗口搬移、键鼠注入会劫持你自己的电脑。被控端只部署到远程真机验收。主控端、LicenseKeygen、CrashDumpProbe 可以本机跑。
+1. **被控端绝不能在本机跑/测**——窗口搬移、键鼠注入会劫持你自己的电脑。被控端只部署到远程真机验收。**输入类实验更不能本机 SendInput**（2026-10-09 险些把测试键打进用户聊天窗口）。主控端、LicenseKeygen、CrashDumpProbe 可以本机跑。
 2. **下载的东西不放 C 盘**；本机有 Clash 代理 `127.0.0.1:7897`。
-3. **改完必须真机验收再交付**（验收工具见 §5）。
+3. **改完必须真机验收再交付**（验收工具见 §5）；**输入相关改动必须覆盖装了 UU/GameViewer 的机器**（仲裁器只在那种机器上武装，bug 只在那种机器上现形）。
 4. 工具链在 `D:\tools\`（dotnet/go/ffmpeg/innosetup/7zip），不在 PATH 里，脚本用 `-ToolsRoot D:\tools`。
 5. 热更新包必须用 `license/private.pem` 签名（`scripts/_publish_update.py` 自动做）；私钥/令牌不入 git（见 .gitignore）。
 6. 日志/注释/提交信息用中文；提交格式 `vX.Y.Z: 改动一句话`。
+7. **等被控端自动升级时别频繁 status/grablog**——查询也算"主控端连接"，会一直重置"空闲 5 分钟才应用"的计时；≥7 分钟查一次。
 
 ## 2. 一屏架构（数据流）
 
@@ -111,22 +112,25 @@ Agent.Coordinator（单进程，两半）：                              │
 ### 其它目录
 `scripts/`（构建/发布/真机诊断，见§5）· `docs/`（专题文档，见§6）· `build/`（产物，gitignore）· `license/`（私钥，gitignore）· `config/relay-token.txt`（中继口令）· `third_party/`（ffmpeg）· `drivers/`（VDD 虚拟屏驱动，gitignore）
 
-## 4. 五个最容易踩坑的机制（改之前先懂）
+## 4. 最容易踩坑的机制（改之前先懂）
 
 1. **窗口搬移三级认领**（WindowManager.TryCatchWindow）：①精确pid=远端开的 ②同名进程 ③新进程——级数越靠后闸门越严（本机用户 1.2s 内动过键鼠就不搬），防止把本机用户开的软件搬到副屏；`justOpened`（打开指令后 4 秒）豁免闸门。
-2. **键盘链路**（v1.4.6~1.4.9 打磨完）：KeyEvent → 本机用户 800ms 内动手则丢（防打进他的窗口）→ EnsureClaimedForeground → **扫描码 SendInput**（纯 VK 会被微软拼音吃 Ctrl）→ 认领过的窗口自动 **IME 英文直通**（中文输入走剪贴板粘贴）。
-3. **光标**：一会话一光标。本机用户空闲→远端用真实光标；用户动手/光标被 GameViewer 类软件抢→切后台定向注入（PostMessage）。我们注入都带 `InjectTag`，`IsSoftwareInjected` 区分"人手/软件注入"（别把同机远控的注入当成人在打字）。
+2. **键盘链路**（v1.4.6~1.5.13 打磨完）：KeyEvent → 本机用户 **300ms** 内动手则丢（防打进他的窗口；"物理人手"判定：键盘用 `LLKHF_INJECTED=0x10`、鼠标用 `LLMHF_INJECTED=0x1`，**不是一个位，用错就自己拦自己**——v1.5.6 事故）→ EnsureClaimedForeground → **扫描码 SendInput**（纯 VK 会被微软拼音吃 Ctrl）→ 认领过的窗口自动 **IME 英文直通**（中文输入走剪贴板粘贴）→ **Ctrl+A/C 双路注入**（扫描码+VK 各一次，幂等键专属；Win11 新记事本扫描码组合丢失、老 IME 吃 VK 组合，两条路各救一头）→ **Ctrl+C 另补 Ctrl+Insert 第三通道**（新记事本唯 C 不通的怪癖）。V/Z/S 等非幂等键**绝不双发**（粘贴/撤销两次会出事）。
+3. **光标**：一会话一光标。本机用户空闲→远端用真实光标；用户动手/光标被 GameViewer 类软件抢→切后台定向注入（PostMessage）。我们注入都带 `InjectTag`，`IsSoftwareInjected(Kb)` 区分"人手/软件注入"（别把同机远控的注入当成人在打字——仲裁器只在检测到同类远控时武装，没装 UU 的机器永远复现不了这类 bug，**测试必须覆盖装了 UU 的机器**）。
 4. **热更新闭环**：`_publish_update.py`（签名+上传+manifest）→ 被控端每 **15 分钟**检查 → 暂存 → **无主控端连接 5 分钟**才应用（绝不断正在用的人）→ 90 秒报平安失败自动回滚。诊断期可手动 `_rcp.py deploy`。
 5. **虚拟屏布局**：物理屏 0,0 起，虚拟屏须在其右侧紧贴（重叠=窗口半边显示在主屏）。启动 EnsureVirtualAdjacent 归位 + 2 秒巡检 + 布局快照 `config/display-layout.json` + 布局医生日志。注意：某些机器虚拟屏位置被驱动锁死，ChangeDisplaySettingsEx 会"假成功"——代码里有核实+指数退避。
+6. **无人观看暂停**（v1.5.8）：所有主控端断开 ≥10 秒 → 暂停采集与编码（ffmpeg 空转等输入近零开销，拓扑自愈照跑）；BitrateHint 或码流重建请求一到立即恢复。被控端 7×24 挂在客户机上不能空烧。
+7. **编码器自适应**（v1.5.8）：候选 nvenc→qsv→amf→libx264，**按真实分辨率/帧率探测**（64x64 小图探测会让半残驱动蒙混过关→实跑反复重建码流="换台电脑特别卡"）；探测缓存按分辨率区分；运行期硬件编码器反复失败自动 ForceSoftware 降级。
+8. **剪贴板监听序号纪律**（v1.5.11）：`GetClipboardSequenceNumber` 只在**成功读到内容后**才提交 `_lastSequence`；被占用重试 5 次全失败则 600ms 后主动补读（Windows 不会为"没读走"的内容再发 WM_CLIPBOARDUPDATE）——先提交后读=这次复制永久丢失。
 
 ## 5. 真机验收工具（scripts/_rcp.py）
 
-连真机做诊断/部署（连接信息在文件顶部常量；机器：`WIN-CEQ12K8EJM9-D625DA31`=开发测试机，`WIN-JOGG0C60202-9567957E`=用户试用机）：
+连真机做诊断/部署（连接信息在文件顶部常量；机器：`WIN-CEQ12K8EJM9-D625DA31`=开发测试机，`WIN-JOGG0C60202-9567957E`=用户试用机【VDD 已坏待重装驱动，画面停顿与此有关】，`WIN-VSAQ3MBL5MA-55BC6EC8`=朋友机【Win11 26H2 新记事本，输入法怪癖多，是好试金石】，`WIN-OG1HLKFEOE9-ECB5FE5A`=第二台朋友机）：
 
 ```bash
-export RC_AGENT=WIN-CEQ   # 或 WIN-JOGG；不设则默认测试机
+export RC_AGENT=WIN-VSAQ3MBL5MA-55BC6EC8   # 或 WIN-CEQ 等；不设则默认测试机
 python scripts/_rcp.py status     # 版本/FPS/输入路径/更新状态；RC_FULLMON=1 看完整显示拓扑
-python scripts/_rcp.py grablog    # 拉两端日志尾（经剪贴板通道）
+python scripts/_rcp.py grablog    # 拉两端日志尾（经剪贴板通道）；RC_TAIL=600 拉更多行
 python scripts/_rcp.py thispc     # 远程打开"此电脑"（测窗口搬移零闪）
 python scripts/_rcp.py typetest   # 键盘端到端：打字→Ctrl+C→剪贴板回传→Ctrl+V 粘贴回
 python scripts/_rcp.py kbtest5    # 视频流取证版键盘测试（含选区高亮判定）
@@ -134,6 +138,10 @@ python scripts/_rcp.py capture out.h264 15   # 抓 15 秒视频流，本地 ffmp
 python scripts/_rcp.py deploy <fileId> <字节数>   # 手动热更（先 /api/upload 拿 fileId）
 python scripts/_rcp.py run "<cmd>"  # 在被控端跑命令（输出走文件+clip 两步回传更稳）
 ```
+
+⚠ **status/grablog 也是"主控端连接"**：会重置被控端"空闲 5 分钟才应用更新"的计时——等升级时要拉长间隔（≥7 分钟查一次），别越查越升不上去。
+
+⚠ **绝不在开发机本地注入键鼠做测试**（2026-10-09 险些把测试键打进用户聊天窗口）：输入类实验一律走真机远程（ztest*.py 模式：aiohttp 连 WS 按协议注入 + `capture` 抓帧看结果 + CLIPNOW 探针读远端剪贴板——把结果 Add-Content 进 `logs\worker-9999.log` 再 grablog，时间戳要带上防读到旧行）。
 
 构建/发布：`scripts/build-all.ps1 -ToolsRoot D:\tools` → `scripts/_publish_update.py build/agent-X.Y.Z.zip X.Y.Z "说明" 100` → 安装包 `build-setup-agent/viewer.ps1 -Token <口令>`（口令内嵌+setup-defaults.ini 双保险）。
 
@@ -147,4 +155,4 @@ python scripts/_rcp.py run "<cmd>"  # 在被控端跑命令（输出走文件+cl
 
 ## 7. 版本速史
 
-1.2.x 进程合并/热更新体系 → 1.3.0 文件夹复制 → 1.4.0 性能（TFM 19041 回退）→ 1.4.1~1.4.5 窗口搬移/键盘/断线回收/跨双屏（虚拟屏相邻归位）→ 1.4.6~1.4.9 键盘三连修（注入误判/窗口焦点/扫描码+IME）→ **1.5.0 崩溃转储+布局快照/医生** → **1.5.1 更新周期 6h→15min**
+1.2.x 进程合并/热更新体系 → 1.3.0 文件夹复制 → 1.4.0 性能（TFM 19041 回退）→ 1.4.1~1.4.5 窗口搬移/键盘/断线回收/跨双屏（虚拟屏相邻归位）→ 1.4.6~1.4.9 键盘三连修（注入误判/窗口焦点/扫描码+IME）→ **1.5.0 崩溃转储+布局快照/医生** → **1.5.1 更新周期 6h→15min** → 1.5.2 ClaimedWindow 补设 → 1.5.3 VDD 自灭 pnputil 自愈 → 1.5.4 Unicode 文本注入通道 → **1.5.5 键盘闸门 800→300ms+来源记录** → **1.5.6 键盘注入位 LLKHF(0x10)≠鼠标位(0x1)，闸门自拦根治**（装 UU 机器"只出第一个字母"）→ **1.5.7 文件夹打包暂存盘自动选（安装盘>源盘>Temp），C 盘保护** → **1.5.8 自适应三件套**（无人观看≥10s 暂停采集编码 / 编码器真实分辨率探测 / 黄框 IsBorderRequired 编译期绑定+TFM 22621）→ **1.5.9 热更包补齐 SDK 投影 DLL（5 个）**（1.5.8 的包不齐导致 WGC 回退 GDI）→ **1.5.10 更新器加固**（下载 tmp+原子改名/同版本哈希去重/应用脚本 Wait-Process+解压重试×3/回滚含 SDK DLL）→ **1.5.11 剪贴板序号读后才提交+600ms 补读；防闪武装期 25s→60s+钩子线程最高优先级** → **1.5.12 Ctrl+A/C 双路注入**（扫描码+VK，幂等键专属）→ **1.5.13 Ctrl+C 补 Ctrl+Insert 第三通道**（Win11 新记事本唯 C 不通）。主控端并行线：viewer 1.2.1（本地剪贴板读写重试 6×60ms/3×50ms，CLIPBRD_E_CANT_OPEN 不再一击即丢）。
