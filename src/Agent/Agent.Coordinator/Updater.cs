@@ -35,6 +35,10 @@ public sealed class Updater : IDisposable
 
     private string WorkDir => Path.Combine(Path.GetTempPath(), "RC-Update");
     private string MarkerPath => Path.Combine(WorkDir, "ok.marker");
+    /// <summary>应用进行中标记：应用脚本启动前写、退出前删。进程看门狗据此避免在"停-盖-起"期间抢启动旧程序。</summary>
+    private string UpdatingPath => Path.Combine(WorkDir, "updating.txt");
+    /// <summary>某版本应用失败（回滚）的标记文件名模式：failed-{版本}.txt（24 小时内不再重试该版本）</summary>
+    private string FailedPath(string ver) => Path.Combine(WorkDir, $"failed-{ver}.txt");
 
     public Updater(AgentConfig cfg, Logger log, Func<bool> hasViewer)
     {
@@ -138,6 +142,23 @@ public sealed class Updater : IDisposable
                 _state = $"已最新（{WorkerContext.Version}）";
                 return;
             }
+
+            // 2.5) 应用失败记忆（2026-10-09 事故）：该版本此前应用过且被回滚（failed 标记），
+            // 24 小时内不再重试 —— 否则"应用→崩→回滚→下轮再应用"无限循环，
+            // 机器每 15 分钟死一次（现场：两台被控端晚间反复掉线）。
+            try
+            {
+                var fp = FailedPath(payload.Ver);
+                if (File.Exists(fp) && File.GetLastWriteTimeUtc(fp) > DateTime.UtcNow.AddHours(-24))
+                {
+                    _state = $"跳过 v{payload.Ver}（此前应用失败，24h 内不重试）";
+                    var ago = DateTime.Now - File.GetLastWriteTime(fp);
+                    _log.Warn($"版本 {payload.Ver} 在 {ago.TotalMinutes:F0} 分钟前应用失败被回滚，本轮跳过" +
+                              "（24 小时内不重试；服务器发更高版本时仍会正常升级）");
+                    return;
+                }
+            }
+            catch { /* 标记读不了就当没有 */ }
 
             // 3) 下载 + 哈希比对（地址不在签名里，但包内容必须与签名里的哈希一致）
             _state = $"下载中 v{payload.Ver}";
@@ -259,7 +280,10 @@ public sealed class Updater : IDisposable
 
         var ps = new StringBuilder();
         ps.Append("$ErrorActionPreference='Continue';");
-        ps.Append($"$dir='{psEsc(dir)}';$bak='{psEsc(bak)}';$zip='{psEsc(zipPath)}';$ok='{psEsc(MarkerPath)}';");
+        ps.Append($"$dir='{psEsc(dir)}';$bak='{psEsc(bak)}';$zip='{psEsc(zipPath)}';$ok='{psEsc(MarkerPath)}';" +
+                  $"$upd='{psEsc(UpdatingPath)}';$fail='{psEsc(FailedPath(version))}';");
+        // updating 标记：应用期间进程看门狗不抢着启动程序（脚本退出前删除；脚本被杀死时 10 分钟后过期）
+        ps.Append("Set-Content $upd (Get-Date -Format o);");
         ps.Append("Start-Sleep 3;" +                          // 给调用方时间退出/日志落盘
                   "Stop-Process -Name Agent.Coordinator -Force -ErrorAction SilentlyContinue;" +
                   "Wait-Process -Name Agent.Coordinator -Timeout 15 -ErrorAction SilentlyContinue;" +  // 等进程死透再动文件（2026-10-09：2秒不够，SDK DLL被占→IOException）
@@ -272,12 +296,14 @@ public sealed class Updater : IDisposable
                   "Copy-Item \"$dir\\Microsoft.Windows.SDK.NET.dll\",\"$dir\\WinRT.Runtime.dll\" $bak -Force -ErrorAction SilentlyContinue;" +
                   // 解压重试 ×3：文件偶被杀毒/残留句柄占用，一次失败就回滚太脆
                   "$ok2=$false;for($i=0;$i -lt 3 -and -not $ok2;$i++){try{Expand-Archive $zip $dir -Force -ErrorAction Stop;$ok2=$true}catch{Start-Sleep 3}};" +
-                  "if(-not $ok2){Copy-Item \"$bak\\*\" $dir -Force;Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;exit 1};" +
+                  // 解压失败：回滚 + 记失败标记（24h 内不再重试该版本——否则每 15 分钟死一次）
+                  "if(-not $ok2){Copy-Item \"$bak\\*\" $dir -Force;Set-Content $fail 'extract-failed';Remove-Item $upd -Force -ErrorAction SilentlyContinue;Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;exit 1};" +
                   "Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;" +
                   "$deadline=(Get-Date).AddSeconds(90);" +
                   "while((Get-Date) -lt $deadline -and -not (Test-Path $ok)){Start-Sleep 3};" +
-                  "if(Test-Path $ok){exit 0};" +
-                  "Copy-Item \"$bak\\*\" $dir -Force;" +                 // 90 秒没报平安：回滚（含 SDK DLL）
+                  "if(Test-Path $ok){Remove-Item $upd -Force -ErrorAction SilentlyContinue;exit 0};" +
+                  // 90 秒没报平安：回滚（含 SDK DLL）+ 记失败标记
+                  "Copy-Item \"$bak\\*\" $dir -Force;Set-Content $fail 'no-peace-in-90s';Remove-Item $upd -Force -ErrorAction SilentlyContinue;" +
                   "Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;");
         var scriptPath = Path.Combine(WorkDir, "apply.ps1");
         File.WriteAllText(scriptPath, ps.ToString(), System.Text.Encoding.UTF8);

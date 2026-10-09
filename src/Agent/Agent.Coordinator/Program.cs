@@ -230,6 +230,9 @@ public sealed class CoordinatorApp : IDisposable
         }
 
         EnsureBootAutostart();
+        EnsureProcessWatchdog();
+        // 清掉上次优雅退出的标记（现在进程活着，看门狗恢复"死了就拉起"的职责）
+        try { if (File.Exists(CleanExitPath)) File.Delete(CleanExitPath); } catch { }
 
         _bus.WorkerConnected += OnWorkerConnected;
         _bus.WorkerDisconnected += OnWorkerDisconnected;
@@ -600,6 +603,75 @@ public sealed class CoordinatorApp : IDisposable
         catch (Exception ex)
         {
             _log.Debug($"检查开机自启任务异常：{ex.Message}");
+        }
+    }
+
+    /// <summary>优雅退出标记：看门狗看到它就不拉起进程（10 分钟内有效；进程启动时删除）</summary>
+    private string CleanExitPath => Path.Combine(Path.GetTempPath(), "RC-Update", "clean-exit.txt");
+
+    /// <summary>
+    /// 进程级看门狗（2026-10-09 事故）：热更新"报平安后第 2 分钟崩溃"这类进程级死亡，
+    /// 此前只能等下次开机自启 —— 机器一整晚在线列表里消失。这里注册一个每 2 分钟跑一次的
+    /// 计划任务：进程不在且没有"正在更新/刚优雅退出"标记 → 拉起来。
+    /// 不抢热更新的台：应用脚本会写 updating.txt（10 分钟内看门狗不动）。
+    /// 不和人工退出打架：托盘退出/任务管理器前若有优雅退出流程会写 clean-exit.txt（30 分钟内不拉起）；
+    /// 强杀（Stop-Process）没有标记会被拉起——运维真想停住就用托盘退出或先删计划任务。
+    /// </summary>
+    private void EnsureProcessWatchdog()
+    {
+        if (!_cfg.AutoStartOnBoot)
+        {
+            _log.Debug("配置里 AutoStartOnBoot=false，跳过进程看门狗注册");
+            return;
+        }
+        const string TaskName = "RemoteControlAgentWatchdog";
+        try
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "Agent.Coordinator.exe");
+            if (!File.Exists(exe)) return;
+            var workDir = Path.Combine(Path.GetTempPath(), "RC-Update");
+            Directory.CreateDirectory(workDir);
+            var script = Path.Combine(workDir, "watchdog.ps1");
+
+            // 看门狗脚本：每次启动都重写（安装目录/临时目录可能变）
+            var ps = new StringBuilder();
+            ps.AppendLine("$p = Get-Process Agent.Coordinator -ErrorAction SilentlyContinue;");
+            ps.AppendLine("if ($p) { exit 0 }");
+            ps.AppendLine($"$wd = '{workDir.Replace("'", "''")}';");
+            ps.AppendLine("$u = Join-Path $wd 'updating.txt';");
+            ps.AppendLine("if ((Test-Path $u) -and (Get-Item $u).LastWriteTime -gt (Get-Date).AddMinutes(-10)) { exit 0 }");
+            ps.AppendLine("$c = Join-Path $wd 'clean-exit.txt';");
+            ps.AppendLine("if ((Test-Path $c) -and (Get-Item $c).LastWriteTime -gt (Get-Date).AddMinutes(-30)) { exit 0 }");
+            ps.AppendLine($"Start-Process '{exe.Replace("'", "''")}' -WorkingDirectory '{AppContext.BaseDirectory.TrimEnd('\\').Replace("'", "''")}';");
+            ps.AppendLine("$stamp = Join-Path $wd 'watchdog-restarted.txt';");
+            ps.AppendLine("Set-Content $stamp (Get-Date -Format o);");
+            File.WriteAllText(script, ps.ToString(), System.Text.Encoding.UTF8);
+
+            // 幂等注册（已存在则跳过——不覆盖运维改过的配置）
+            var query = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/query", "/tn", TaskName }) query.ArgumentList.Add(a);
+            using (var q = Process.Start(query))
+            {
+                if (q == null) return;
+                q.StandardOutput.ReadToEnd();
+                q.StandardError.ReadToEnd();
+                q.WaitForExit(5000);
+                if (q.ExitCode == 0) return;
+            }
+            var tr = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{script}\"";
+            var create = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/create", "/tn", TaskName, "/tr", tr, "/sc", "minute", "/mo", "2", "/ru", "SYSTEM", "/rl", "highest", "/f" })
+                create.ArgumentList.Add(a);
+            using var c = Process.Start(create);
+            if (c == null) return;
+            var output = c.StandardOutput.ReadToEnd() + c.StandardError.ReadToEnd();
+            c.WaitForExit(8000);
+            if (c.ExitCode == 0) _log.Info($"已注册进程看门狗任务（{TaskName}：每 2 分钟，进程不在且非更新/优雅退出时拉起）");
+            else _log.Warn($"注册进程看门狗失败（无管理员权限时属正常）：{output.Trim()}");
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"进程看门狗注册异常：{ex.Message}");
         }
     }
 
@@ -1077,6 +1149,13 @@ public sealed class CoordinatorApp : IDisposable
     private void Shutdown()
     {
         _log.Info("收到退出请求，开始关闭…");
+        // 优雅退出标记：进程看门狗 30 分钟内不拉起（强杀没有这步，会被看门狗拉回——按设计）
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(CleanExitPath)!);
+            File.WriteAllText(CleanExitPath, $"clean exit {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        }
+        catch { }
         try { _cts.Cancel(); } catch { }
 
         // 1. 通知采集引擎退出（走正常收尾：卸钩子、关编码器，否则会留下 ffmpeg 进程、拖慢整机输入）
