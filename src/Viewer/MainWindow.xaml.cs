@@ -691,7 +691,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>主控端自身版本（热更新提示用，2026-10 新增；主控端不做自动应用——数量少、用户是厂商自己人，提示下载即可）</summary>
-    public const string ViewerVersion = "1.2.1";
+    public const string ViewerVersion = "1.2.2";
 
     /// <summary>
     /// 查更新清单：验签通过且版本比自己新 → 状态栏提示"有新版本"，点一下用浏览器打开下载页。
