@@ -267,9 +267,21 @@ public sealed class InputInjector
     }
 
     private long _lastKeyLogTicks;
+    /// <summary>当前我们自己注入且未抬起的修饰键数量（Shift/Ctrl/Alt/Win）——双路注入的判定依据</summary>
+    private int _modsDown;
+
+    private static bool IsModifierKey(ushort vk) =>
+        vk is 0x10 or 0x11 or 0x12 or 0x5B or 0x5C || (vk >= 0xA0 && vk <= 0xA5);
 
     public void Key(ushort vk, bool up, byte flags)
     {
+        // 修饰键计数：我们注入的按下/抬起配对维护（乱序容错：抬起时不为零才减）
+        if (IsModifierKey(vk))
+        {
+            if (!up) Interlocked.Increment(ref _modsDown);
+            else if (Interlocked.CompareExchange(ref _modsDown, 0, 0) > 0) Interlocked.Decrement(ref _modsDown);
+        }
+
         // 诊断：按键注入时记录当前前台窗口（限流：每 10 秒最多 3 条，避免刷日志）
         long now = Environment.TickCount64;
         long last = Interlocked.Read(ref _lastKeyLogTicks);
@@ -315,7 +327,31 @@ public sealed class InputInjector
             scan = unchecked((ushort)NativeApi.MapVirtualKeyW(vk, NativeApi.MAPVK_VK_TO_VSC));
         }
         catch { }
+        // 【flags bit2】强制纯 VK 注入（诊断/逃生通道）
+        if ((flags & 4) != 0) scan = 0;
         if (scan != 0) f |= NativeApi.KEYEVENTF_SCANCODE;
+
+        // 【2026-10-09 双路注入】修饰键按住期间，Ctrl+A / Ctrl+C 在不同环境下走不同死路：
+        // 老环境（经典应用+中文IME）吃纯 VK 组合 → 扫描码路径救（v1.4.8）；
+        // 新环境（Win11 24H2+ 新记事本等 WinUI 应用）扫描码组合又会被弄丢 → 纯 VK 反而通。
+        // A（全选）和 C（复制）幂等——两条路各发一次，结果不变，谁通吃谁。
+        // 只对这两个键做（V/Z/S 等不幂等：粘贴两次/撤销两次会出事，绝不能双发）。
+        bool modDown = _modsDown > 0;
+        bool idempotentCombo = vk is 0x41 or 0x43;   // 'A' 全选 / 'C' 复制
+        if (modDown && idempotentCombo && scan != 0)
+        {
+            var dual = new NativeApi.INPUT[1];
+            dual[0].type = NativeApi.INPUT_KEYBOARD;
+            dual[0].u.ki = new NativeApi.KEYBDINPUT
+            {
+                wVk = vk,
+                wScan = 0,
+                dwFlags = f & ~NativeApi.KEYEVENTF_SCANCODE,
+                time = 0,
+                dwExtraInfo = NativeApi.InjectTagPtr,
+            };
+            NativeApi.SendInput(1, dual, Marshal.SizeOf<NativeApi.INPUT>());
+        }
 
         var inputs = new NativeApi.INPUT[1];
         inputs[0].type = NativeApi.INPUT_KEYBOARD;
