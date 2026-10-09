@@ -46,6 +46,12 @@ public sealed class BitrateGovernor
     private long _lastStepTick;
     private long _cleanSince;
     private long _lastSeenDrops;
+    /// <summary>振荡记忆（2026-10-09）：升档后 15s 内又拥塞 = 该档位链路扛不住，
+    /// 5 分钟内不再尝试升回去——否则就是"升→堵→降→好→升→堵"的锯齿，
+    /// 每次换档还要重启编码器，画面一顿一顿（现场日志 40 分钟内降升 8 次）。</summary>
+    private int _minAllowedLevel;
+    private long _minAllowedUntil;
+    private long _lastStepUpTick;
 
     public BitrateGovernor(Logger log, int kbps, int fps)
     {
@@ -79,9 +85,18 @@ public sealed class BitrateGovernor
         bool congested = droppedThisTick || outboundCongested;
         if (congested) _cleanSince = 0;
         else if (_cleanSince == 0) _cleanSince = now;
+        if (now >= _minAllowedUntil) _minAllowedLevel = 0;   // 振荡记忆到期：允许重新试探
 
         if (congested && _level < MaxLevel && now - _lastStepTick >= StepDownInterval)
         {
+            // 升上去没多久就堵：这不是偶发抖动，是链路真扛不住这个档位 —— 记住它
+            if (_lastStepUpTick != 0 && now - _lastStepUpTick < 15_000 && _level > _minAllowedLevel)
+            {
+                _minAllowedLevel = _level;
+                _minAllowedUntil = now + 300_000;
+                _log.Warn($"升档后 {(now - _lastStepUpTick) / 1000.0:F0}s 就拥塞：{_level} 档链路扛不住，" +
+                          $"5 分钟内不再尝试升回该档（消除升降锯齿）");
+            }
             _level++;
             _lastStepTick = now;
             _log.Warn($"链路拥塞（{(droppedThisTick ? "帧环写不进" : "中继队列积压")}），" +
@@ -92,8 +107,11 @@ public sealed class BitrateGovernor
         if (!congested && _cleanSince != 0 && _level > 0
             && now - _cleanSince >= CleanBeforeStepUpMs && now - _lastStepTick >= StepUpDedupMs)
         {
+            if (_level - 1 < _minAllowedLevel)
+                return false;   // 振荡记忆生效：升回去就是再堵一轮，先稳住
             _level--;
             _lastStepTick = now;
+            _lastStepUpTick = now;
             _log.Info($"链路已通畅 {CleanBeforeStepUpMs / 1000}s，码率自适应升回第 {_level} 档：" +
                       $"{BitrateKbps}kbps / {FrameRate}fps");
             return true;
