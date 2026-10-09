@@ -143,19 +143,42 @@ public sealed class Updater : IDisposable
             _state = $"下载中 v{payload.Ver}";
             Directory.CreateDirectory(WorkDir);
             var zipPath = Path.Combine(WorkDir, $"agent-{payload.Ver}.zip");
-            using (var fs = File.Create(zipPath))
+            // 已有同版本包且哈希对得上就不重复下载：省流量，也避免覆盖正在被应用脚本读取的 zip
+            //（2026-10-09 现场：上一轮应用脚本还没退干净，File.Create 直接 IOException，状态卡在"失败"）
+            var needDownload = true;
+            try
             {
-                using var dl = await _http.GetAsync($"{baseUri.TrimEnd('/')}/{entry.PackageUrl.TrimStart('/')}" + q);
-                if (!dl.IsSuccessStatusCode)
+                if (File.Exists(zipPath))
                 {
-                    _state = $"失败:下载 HTTP {(int)dl.StatusCode}";
-                    _log.Warn($"更新包下载失败 HTTP {(int)dl.StatusCode}");
-                    return;
+                    using var fsOld = File.OpenRead(zipPath);
+                    var oldHex = Convert.ToHexString(await SHA256.HashDataAsync(fsOld)).ToLowerInvariant();
+                    if (string.Equals(oldHex, payload.Sha256.ToLowerInvariant(), StringComparison.Ordinal))
+                        needDownload = false;
                 }
-                await dl.Content.CopyToAsync(fs);
             }
-            var actual = await SHA256.HashDataAsync(File.OpenRead(zipPath));
-            var actualHex = Convert.ToHexString(actual).ToLowerInvariant();
+            catch { /* 读不了就当没有，重新下载 */ }
+            if (needDownload)
+            {
+                // 先写 .tmp 再原子改名：目标被占用（应用脚本/杀毒）时本轮失败下轮重试，不再一击致命
+                var tmp = zipPath + ".tmp";
+                using (var fs = File.Create(tmp))
+                {
+                    using var dl = await _http.GetAsync($"{baseUri.TrimEnd('/')}/{entry.PackageUrl.TrimStart('/')}" + q);
+                    if (!dl.IsSuccessStatusCode)
+                    {
+                        _state = $"失败:下载 HTTP {(int)dl.StatusCode}";
+                        _log.Warn($"更新包下载失败 HTTP {(int)dl.StatusCode}");
+                        return;
+                    }
+                    await dl.Content.CopyToAsync(fs);
+                }
+                File.Move(tmp, zipPath, overwrite: true);
+            }
+            string actualHex;
+            using (var fsVerify = File.OpenRead(zipPath))
+            {
+                actualHex = Convert.ToHexString(await SHA256.HashDataAsync(fsVerify)).ToLowerInvariant();
+            }
             if (!string.Equals(actualHex, payload.Sha256.ToLowerInvariant(), StringComparison.Ordinal))
             {
                 _state = "失败:哈希不一致";
@@ -239,16 +262,22 @@ public sealed class Updater : IDisposable
         ps.Append($"$dir='{psEsc(dir)}';$bak='{psEsc(bak)}';$zip='{psEsc(zipPath)}';$ok='{psEsc(MarkerPath)}';");
         ps.Append("Start-Sleep 3;" +                          // 给调用方时间退出/日志落盘
                   "Stop-Process -Name Agent.Coordinator -Force -ErrorAction SilentlyContinue;" +
+                  "Wait-Process -Name Agent.Coordinator -Timeout 15 -ErrorAction SilentlyContinue;" +  // 等进程死透再动文件（2026-10-09：2秒不够，SDK DLL被占→IOException）
                   "Start-Sleep 2;" +
                   "New-Item -ItemType Directory -Force -Path $bak | Out-Null;" +
                   "Remove-Item \"$bak\\*\" -Force -ErrorAction SilentlyContinue;" +
-                  "Copy-Item \"$dir\\Agent.*.dll\" $bak -Force;" +      // 备份（zip 里只有这几个会变）
-                  "Expand-Archive $zip $dir -Force;" +
+                  "Copy-Item \"$dir\\Agent.*.dll\" $bak -Force;" +      // 备份：业务 DLL
+                  // SDK 投影与 WinRT 运行时（1.5.9 起热更包也带它们——回滚必须一起还原，
+                  // 否则"旧业务 DLL + 新 SDK DLL"版本对不上，WGC 直接加载失败）
+                  "Copy-Item \"$dir\\Microsoft.Windows.SDK.NET.dll\",\"$dir\\WinRT.Runtime.dll\" $bak -Force -ErrorAction SilentlyContinue;" +
+                  // 解压重试 ×3：文件偶被杀毒/残留句柄占用，一次失败就回滚太脆
+                  "$ok2=$false;for($i=0;$i -lt 3 -and -not $ok2;$i++){try{Expand-Archive $zip $dir -Force -ErrorAction Stop;$ok2=$true}catch{Start-Sleep 3}};" +
+                  "if(-not $ok2){Copy-Item \"$bak\\*\" $dir -Force;Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;exit 1};" +
                   "Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;" +
                   "$deadline=(Get-Date).AddSeconds(90);" +
                   "while((Get-Date) -lt $deadline -and -not (Test-Path $ok)){Start-Sleep 3};" +
                   "if(Test-Path $ok){exit 0};" +
-                  "Copy-Item \"$bak\\*\" $dir -Force;" +                 // 90 秒没报平安：回滚
+                  "Copy-Item \"$bak\\*\" $dir -Force;" +                 // 90 秒没报平安：回滚（含 SDK DLL）
                   "Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;");
         var scriptPath = Path.Combine(WorkDir, "apply.ps1");
         File.WriteAllText(scriptPath, ps.ToString(), System.Text.Encoding.UTF8);
