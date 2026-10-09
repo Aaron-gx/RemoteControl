@@ -351,6 +351,34 @@ public sealed class InputInjector
                 dwExtraInfo = NativeApi.InjectTagPtr,
             };
             NativeApi.SendInput(1, dual, Marshal.SizeOf<NativeApi.INPUT>());
+
+            // 【第三条路】C 再补一个 Ctrl+Insert（老式复制组合）。Win11 24H2+ 新记事本实测：
+            // Ctrl+A 双路已通、Ctrl+V 本来就通、唯独 Ctrl+C 扫描码和 VK 两条路全被它弄丢
+            // ——Insert 组合不经任何现代加速键表，老编辑器语义直通（2026-10-09）。
+            // 只在按下时补发一对完整 Insert 按压；复制幂等，多执行一次无副作用。
+            if (vk == 0x43 && !up)
+            {
+                var ins = new NativeApi.INPUT[2];
+                ins[0].type = NativeApi.INPUT_KEYBOARD;
+                ins[0].u.ki = new NativeApi.KEYBDINPUT
+                {
+                    wVk = 0x2D,          // VK_INSERT
+                    wScan = 0,
+                    dwFlags = NativeApi.KEYEVENTF_EXTENDEDKEY,
+                    time = 0,
+                    dwExtraInfo = NativeApi.InjectTagPtr,
+                };
+                ins[1].type = NativeApi.INPUT_KEYBOARD;
+                ins[1].u.ki = new NativeApi.KEYBDINPUT
+                {
+                    wVk = 0x2D,
+                    wScan = 0,
+                    dwFlags = NativeApi.KEYEVENTF_EXTENDEDKEY | NativeApi.KEYEVENTF_KEYUP,
+                    time = 0,
+                    dwExtraInfo = NativeApi.InjectTagPtr,
+                };
+                NativeApi.SendInput(2, ins, Marshal.SizeOf<NativeApi.INPUT>());
+            }
         }
 
         var inputs = new NativeApi.INPUT[1];
