@@ -1,7 +1,7 @@
 # AGENTS.md — AI 助手 / 新人 5 分钟上手地图
 
 > 这个文件是给 AI（和新人）的第一入口：先读这份，再按需要跳源码。目标是**不用通读代码就能干活**。
-> 当前版本：**v1.5.15**（版本号在 `src/Agent/Agent.Worker/Program.cs` 的 `Version` 常量）。
+> 当前版本：**v1.5.16**（版本号在 `src/Agent/Agent.Worker/Program.cs` 的 `Version` 常量）。
 
 ## 0. 这是什么项目
 
