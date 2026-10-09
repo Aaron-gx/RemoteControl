@@ -563,7 +563,9 @@ public sealed class WindowManager
         SnapshotBaseline();
         lock (_catchGate)
         {
-            _catchUntil = Environment.TickCount64 + 25_000;
+            // 60 秒（原 25 秒）：启动慢的程序（游戏/IDE 30 秒后才建主窗口）出来时钩子还在岗，
+            // 否则主窗口落在主屏没人搬（2026-10-09 客户反馈"打开软件闪/跑到主屏"的一部分）
+            _catchUntil = Environment.TickCount64 + 60_000;
             _armTick = Environment.TickCount64;   // "打开指令刚发生"的锚点：头几秒内的同名窗口视为确定认领
             Interlocked.Exchange(ref _prePosLogCount, 0);
             _catchPid = pid;
@@ -573,7 +575,12 @@ public sealed class WindowManager
             if (_catchThread == null || !_catchThread.IsAlive)
             {
                 _showCatchProc = OnWindowShown;
-                _catchThread = new Thread(CatchLoop) { IsBackground = true, Name = "show-catcher" };
+                _catchThread = new Thread(CatchLoop)
+                {
+                    IsBackground = true,
+                    Name = "show-catcher",
+                    Priority = ThreadPriority.Highest,   // 带外 WinEvent 走消息队列，忙机器上排队延迟直接决定主屏闪几帧
+                };
                 _catchThread.Start();
             }
         }

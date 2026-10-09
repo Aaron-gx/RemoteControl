@@ -53,10 +53,11 @@ public sealed class ClipboardWatcher : NativeWindow, IDisposable
     {
         uint seq = NativeApi.GetClipboardSequenceNumber();
         if (seq == _lastSequence) return;
-        _lastSequence = seq;
+        // 注意：_lastSequence 只在**成功读到内容**后才提交（旧代码先提交后读，
+        // 读取被占用重试全失败后这次复制就被序号挡住永远丢了——"第一次 Ctrl+C
+        // 回传不到主控端"的根因，2026-10-09）。
 
-        // 我们自己写入的文本不再回传
-        for (int attempt = 0; attempt < 3; attempt++)
+        for (int attempt = 0; attempt < 5; attempt++)
         {
             try
             {
@@ -84,39 +85,57 @@ public sealed class ClipboardWatcher : NativeWindow, IDisposable
                         if (sig == _lastFileSignature && DateTime.UtcNow - _lastFileReportUtc < TimeSpan.FromSeconds(3))
                         {
                             _log.Debug("剪贴板文件与上次相同，跳过重复上报");
+                            _lastSequence = seq;
                             return;
                         }
                         _lastFileSignature = sig;
                         _lastFileReportUtc = DateTime.UtcNow;
                         _log.Info($"检测到剪贴板文件：{string.Join(", ", files.Select(f => f.FileName))}");
+                        _lastSequence = seq;
                         FilesCopied?.Invoke(files);
                     }
+                    else _lastSequence = seq;
                     return;
                 }
 
                 if (Clipboard.ContainsText())
                 {
                     var text = Clipboard.GetText();
-                    if (string.IsNullOrEmpty(text)) return;
-                    if (text == _lastText) return;
+                    if (string.IsNullOrEmpty(text)) { _lastSequence = seq; return; }
+                    if (text == _lastText) { _lastSequence = seq; return; }
                     _lastText = text;
                     if (text == _suppressText)
                     {
                         _log.Debug("剪贴板文本来自主控端同步，忽略上报");
+                        _lastSequence = seq;
                         return;
                     }
                     _log.Info($"检测到剪贴板文本（{text.Length} 字符）");
+                    _lastSequence = seq;
                     TextCopied?.Invoke(text);
                     return;
                 }
+                _lastSequence = seq;   // 空剪贴板/其它格式：也算处理过
             }
             catch (ExternalException ex)
             {
-                // 剪贴板被其它进程占用
+                // 剪贴板被其它进程占用（刚执行 Ctrl+C 的应用/杀毒在扫）：退避重试
                 _log.Debug($"剪贴板忙（第 {attempt + 1} 次）：{ex.Message}");
-                Thread.Sleep(60);
+                Thread.Sleep(80);
             }
         }
+
+        // 5 次都没读到（占用超过 ~400ms）：序号故意不提交，并主动安排 600ms 后补读——
+        // Windows 不会因为"我们没读走"而再发 WM_CLIPBOARDUPDATE，不补读这次复制就静默丢了。
+        _log.Warn("剪贴板持续被占用，600ms 后补读");
+        var t = new System.Windows.Forms.Timer { Interval = 600 };
+        t.Tick += (s, e) =>
+        {
+            t.Stop();
+            t.Dispose();
+            try { OnClipboardUpdate(); } catch { }
+        };
+        t.Start();
     }
 
     /// <summary>把主控端下发的文本写入本会话剪贴板</summary>

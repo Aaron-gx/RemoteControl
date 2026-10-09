@@ -128,12 +128,12 @@ def main():
                     async def key(vk, up=False, flags=0):
                         await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
 
-                    async def tap(vk, hold=0.03):
+                    async def tap(vk, hold=0.08):
                         await key(vk); await asyncio.sleep(hold); await key(vk, True)
 
                     async def combo(mod, vk):
-                        await key(mod); await asyncio.sleep(0.04)
-                        await key(vk); await asyncio.sleep(0.04)
+                        await key(mod); await asyncio.sleep(0.08)
+                        await key(vk); await asyncio.sleep(0.08)
                         await key(vk, True); await asyncio.sleep(0.02)
                         await key(mod, True)
 
@@ -604,7 +604,7 @@ Get-Content ($env:TEMP+'\kb3.txt') | clip
                     buf = bytearray()
                     async def key(vk, up=False, flags=0):
                         await ws.send_bytes(frame(0x05, struct.pack(">HBB", vk, 1 if up else 0, flags)))
-                    async def tap(vk, hold=0.03):
+                    async def tap(vk, hold=0.08):
                         await key(vk); await asyncio.sleep(hold); await key(vk, True)
                     import base64 as _b
                     set_ime_cn = r'''
