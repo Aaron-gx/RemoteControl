@@ -87,6 +87,12 @@ public sealed class DirectLinkServer : IDisposable
         _ = Task.Run(() => AcceptLoop(_cts.Token));
         _ = Task.Run(() => LivenessLoop(_cts.Token));
 
+        // 【2026-10-09 流畅性关键修复】Windows 防火墙默认拦入站 TCP——主控端与被控端同局域网时，
+        // 直连候选能收到（SYN 被丢=连接超时），视频只能绕道香港中继（实测中继 RTT ~170ms，
+        // 高峰期还拥塞降档，"卡"的主要来源）。这里自加放行规则（幂等：已存在就不重复加）。
+        // 被控端以管理员运行，netsh 可用；失败只记日志不影响其它功能。
+        _ = Task.Run(() => EnsureFirewallRule());
+
         // UPnP 自动映射（失败不影响中继可用）
         if (_cfg.UpnpEnabled)
         {
@@ -142,6 +148,52 @@ public sealed class DirectLinkServer : IDisposable
             }
             catch (OperationCanceledException) { return; }
             catch { }
+        }
+    }
+
+    /// <summary>防火墙放行规则名（产品对外名称用"虚拟服务器"，不出现敏感字样）</summary>
+    private const string FirewallRuleName = "虚拟服务器 P2P 直连";
+
+    private void EnsureFirewallRule()
+    {
+        try
+        {
+            // 已有同名规则就不再加（netsh add 不会去重，重复加会堆积）
+            var check = new System.Diagnostics.ProcessStartInfo("netsh",
+                $"advfirewall firewall show rule name=\"{FirewallRuleName}\"")
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+            };
+            using (var p = System.Diagnostics.Process.Start(check))
+            {
+                var output = p?.StandardOutput.ReadToEnd() ?? "";
+                p?.WaitForExit(10000);
+                if (output.Contains("Rule Name", StringComparison.OrdinalIgnoreCase) ||
+                    output.Contains("规则名称", StringComparison.Ordinal))
+                {
+                    _log.Info($"P2P 直连：防火墙规则已存在（{FirewallRuleName}）");
+                    return;
+                }
+            }
+            var add = new System.Diagnostics.ProcessStartInfo("netsh",
+                $"advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow " +
+                $"protocol=TCP localport={Port}")
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+            };
+            using (var p = System.Diagnostics.Process.Start(add))
+            {
+                var output = p?.StandardOutput.ReadToEnd() ?? "";
+                p?.WaitForExit(10000);
+                _log.Info($"P2P 直连：已自加防火墙入站放行规则（TCP {Port}）→ {(output.Trim())}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"P2P 直连：自加防火墙规则失败（{ex.Message}）——同网主控端将连不上直连端口，" +
+                      "视频继续走中继。可手动放行 TCP " + Port);
         }
     }
 

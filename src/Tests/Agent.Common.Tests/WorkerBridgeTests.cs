@@ -79,10 +79,11 @@ public class WorkerBridgeTests : IDisposable
         _bus.MessageFromCoordinator += m => got.Add(System.Text.Encoding.UTF8.GetString(m.Payload));
 
         _bus.MarkWorkerConnected();               // 模拟引擎上线
-        _bus.SendToWorker(TextMsg(MessageType.ClipboardText, "stale"));
         _bus.MarkWorkerDisconnected("测试");
+        // 离线期间积压的旧指令（键鼠/打开软件）：
+        _bus.SendToWorker(TextMsg(MessageType.ClipboardText, "stale"));
         _bus.MarkWorkerConnected();               // 新引擎上线：stale 应被清掉，不投递
-        Thread.Sleep(500);
+        Thread.Sleep(800);
 
         Assert.DoesNotContain("stale", got);
     }

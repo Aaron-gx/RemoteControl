@@ -330,6 +330,12 @@ public sealed class WorkerBridge : IDisposable
         StartToWorkerPump(initial: false);
     }
 
+    /// <summary>
+    /// 供协调器的金丝雀（BitrateHint 序号断流检测）调用：丢弃旧通道、换全新泵，
+    /// 控制指令立刻改走新通道。与看门狗内部用的是同一套动作。
+    /// </summary>
+    public void RespawnToWorkerTransport() => RespawnToWorkerPump();
+
     /// <summary>Coordinator → Worker（原 IpcServer.Send）</summary>
     public void SendToWorker(ProtocolMessage msg) => _toWorker.Writer.TryWrite(msg);
 

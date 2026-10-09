@@ -205,7 +205,7 @@ public partial class MainWindow : Window
             _ = Task.Run(async () =>
             {
                 var ok = await _direct.TryConnectAsync(list, _cfg.TargetAgentId, _cfg.AgentToken,
-                    TimeSpan.FromSeconds(2));
+                    TimeSpan.FromSeconds(3));   // 2026-10-09：2→3s（SYN 被防火墙静默丢弃时要等满超时；放行后局域网 <10ms）
                 await Dispatcher.InvokeAsync(() =>
                 {
                     ConnInfo.Text = ok ? "" : (LinkMode == "direct"
@@ -943,6 +943,8 @@ public partial class MainWindow : Window
 
     /// <summary>最近一次真正渲染出画面的时刻（用来判断"为什么一直没画面"）</summary>
     private long _lastFrameTick;
+    /// <summary>停摆自愈上次触发时刻（5s 节流，见 UpdateNoPictureNotice）</summary>
+    private long _lastStallResetTick;
     /// <summary>上一份被控端状态里的丢块计数，用来算"每秒丢多少"</summary>
     private long _lastRingDropped, _lastRelayDropped;
     /// <summary>链路是否处于拥塞状态（被控端丢块 / 中继丢弃 / 已降档）</summary>
@@ -1078,6 +1080,21 @@ public partial class MainWindow : Window
         {
             Screen.SetNotice(null);
             return;
+        }
+
+        // 【2026-10-09 停摆自愈】3 秒没解出画面、而被控端采集正常 → 主动请求重建码流（新关键帧）。
+        // 断流/丢块后残帧会一直糊在画面上（部分区域黑块），干等不会好；GOP=1s，重建后 1 秒内出整帧。
+        // 5 秒节流：网络真断了就别刷屏，上面的原因提示已经把情况说清楚了。
+        if (_agentStatus is { CaptureFps: > 3 } && !(_agentStatus.SecureDesktop))
+        {
+            long stall = Environment.TickCount64 - since;
+            if (stall >= 3000 && Environment.TickCount64 - _lastStallResetTick >= 5000)
+            {
+                _lastStallResetTick = Environment.TickCount64;
+                _log.Warn($"已 {stall / 1000.0:F1}s 没有解出画面（被控端采集 {_agentStatus.CaptureFps:F1}fps 正常）" +
+                          "→ 请求被控端重建码流（等新关键帧）");
+                _ws.Queue(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+            }
         }
 
         string reason;

@@ -91,6 +91,10 @@ public sealed class CoordinatorApp : IDisposable
     private long _lastVideoDropped;
     /// <summary>最近一次收到 Worker 状态（0x41）的时刻：引擎每 1s 上报，断流即卡死信号（看门狗用）</summary>
     private long _lastWorkerStatusTick = Environment.TickCount64;
+    /// <summary>已发送的 BitrateHint 序号（金丝雀：与 Worker 回显对照检测单向断流）</summary>
+    private long _hintSeqSent;
+    /// <summary>金丝雀上次触发时刻（60s 节流）</summary>
+    private long _canaryFiredTick;
     /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
     private int _viewerCount;
     /// <summary>上次拉起采集引擎的时间：防止"看护 + 掉线重试"同时拉起两个引擎线程打架（会 0 帧）</summary>
@@ -773,6 +777,7 @@ public sealed class CoordinatorApp : IDisposable
                 // Worker 自己看不到中继这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
                 bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped;
                 _lastVideoDropped = _relay.VideoDropped;
+                long hintSeq = Interlocked.Increment(ref _hintSeqSent);
                 _bus.SendToWorker(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
                 {
                     Congested = congested,
@@ -780,7 +785,25 @@ public sealed class CoordinatorApp : IDisposable
                     VideoDropped = _relay.VideoDropped,
                     // 主控端在线状态（协调器是权威判定方）——引擎据此决定是否回收副屏孤儿窗口
                     ViewerOnline = HasViewer,
+                    Seq = hintSeq,
                 })));
+                // 【2026-10-09 二次卡死事故·金丝雀】现场出现"协调器发得出、Worker 收不到"的单向断流
+                // （心跳回显正常、状态照常流出、但打开软件/剪贴板/切画面全部失灵 40+ 分钟）。
+                // Worker 在状态里回显最近收到的序号：发送-回显差距持续 ≥8（约 8 秒）= 送达断了，
+                // 换桥的 toWorker 通道并硬重启引擎——不管断在哪一层，这两刀都能恢复（60s 节流）。
+                long echoed = st.HintSeq;
+                if (hintSeq - echoed >= 8)
+                {
+                    long nowT = Environment.TickCount64;
+                    if (nowT - Interlocked.Read(ref _canaryFiredTick) >= 60_000)
+                    {
+                        Interlocked.Exchange(ref _canaryFiredTick, nowT);
+                        _log.Error($"⚠⚠ 单向断流检测：已发 BitrateHint 序号 {hintSeq}，Worker 只回显到 {echoed} " +
+                                   $"（差 {hintSeq - echoed}）——换 toWorker 通道并硬重启引擎");
+                        _bus.RespawnToWorkerTransport();
+                        _host.DumpEngineStackAndRequestExit();
+                    }
+                }
                 // 授权状态随状态上报一起发出（界面不展示，供厂商侧排障/工具使用）
                 var lp = _license.Payload;
                 st.LicenseId = lp?.Lic ?? "";

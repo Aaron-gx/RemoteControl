@@ -489,6 +489,9 @@ public sealed class BitrateHintInfo
     /// <summary>主控端当前是否在线（协调器的 HasViewer 判定）。引擎据此决定是否回收副屏孤儿窗口：
     /// 连着但没动鼠标 ≠ 离线（用户可能正在看副屏画面，不能把窗口搬走）。</summary>
     public bool ViewerOnline { get; set; }
+    /// <summary>投递序号（协调器每发一次 +1）：Worker 在状态里回显最近收到的序号，
+    /// 协调器据此发现"发得出去但 Worker 收不到"的单方向断流（2026-10-09 二次卡死事故的盲区）</summary>
+    public long Seq { get; set; }
 }
 
 /// <summary>Worker 状态（0x41，IPC）</summary>
@@ -535,6 +538,9 @@ public sealed class WorkerStatusInfo
 
     /// <summary>直连当前是否已建立</summary>
     public bool DirectActive { get; set; }
+
+    /// <summary>Worker 最近收到的 BitrateHint 序号（协调器对照本地发送序号，判断单向断流）</summary>
+    public long HintSeq { get; set; }
 
     // ---- 授权信息（同样由协调器补上）：主控端据此显示"激活码到期时间" ----
 

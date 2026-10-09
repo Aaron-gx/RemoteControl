@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.14";
+    public const string Version = "1.5.15";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -94,6 +94,8 @@ public sealed class WorkerContext : ApplicationContext
     private long _viewerOfflineSince;
     /// <summary>是否收到过协调器的 BitrateHint（没收到过就绝不敢暂停——老协调器配对时保持旧行为）</summary>
     private volatile bool _everGotViewerHint;
+    /// <summary>最近收到的 BitrateHint 序号（金丝雀回显：协调器对照本地序号判断单向断流）</summary>
+    private long _lastHintSeq;
     private long _lastReclaimTick;
     private long _lastVddRestartTick;
     private long _nextTopoCheckMs;
@@ -249,6 +251,9 @@ public sealed class WorkerContext : ApplicationContext
         // 采集线程
         _captureThread = new Thread(CaptureLoop) { IsBackground = true, Name = "capture" };
         _captureThread.Start();
+
+        // 专用输入线程（2026-10-09：注入类 Win32 调用从消息泵挪到这里，泵永不因输入卡死）
+        StartInputThread();
 
         // 上报就绪
         var ready = new WorkerReadyInfo
@@ -798,82 +803,28 @@ public sealed class WorkerContext : ApplicationContext
             {
                 Interlocked.Exchange(ref _lastRemoteInputTick, Environment.TickCount64);
                 var (x, y) = PayloadCodec.DecodeMouseMove(msg.Payload);
-                _router?.Move(x, y);
+                RunOnInputThread("MouseMove", () => _router?.Move(x, y));
                 break;
             }
             case MessageType.MouseButton:
             {
                 Interlocked.Exchange(ref _lastRemoteInputTick, Environment.TickCount64);
                 var (x, y, btn, up) = PayloadCodec.DecodeMouseButton(msg.Payload);
-                _router?.Button(x, y, btn, up);
+                RunOnInputThread("MouseButton", () => _router?.Button(x, y, btn, up));
                 break;
             }
             case MessageType.MouseWheel:
             {
                 Interlocked.Exchange(ref _lastRemoteInputTick, Environment.TickCount64);
                 var (x, y, d) = PayloadCodec.DecodeMouseWheel(msg.Payload);
-                _router?.Wheel(x, y, d);
+                RunOnInputThread("MouseWheel", () => _router?.Wheel(x, y, d));
                 break;
             }
             case MessageType.KeyEvent:
             {
                 Interlocked.Exchange(ref _lastRemoteInputTick, Environment.TickCount64);
-                // 只有 Win+R 会开启"把运行框挪到外屏"的短窗口期 —— 别的窗口一律不动（产品要求）
-                if (msg.Payload.Length >= 3)
-                {
-                    var (vkRun, upRun, _) = PayloadCodec.DecodeKey(msg.Payload);
-                    long nowTick = Environment.TickCount64;
-                    if (!upRun && (vkRun == 0x5B || vkRun == 0x5C))
-                        Interlocked.Exchange(ref _winKeyDownTick, nowTick);
-                    else if (!upRun && (vkRun == 0x52 /*R*/) &&
-                             nowTick - Interlocked.Read(ref _winKeyDownTick) < 3000)
-                    {
-                        // 按 Win+R = 开一段 25 秒的"会话期"：先给当前窗口拍快照，
-                        // 之后新出现的窗口（运行框本身 + 它启动出来的程序）一律去外屏；
-                        // 快照里原有的窗口一个都不动（"除非我让它过去，否则不准动"）。
-                        _windows.SnapshotBaseline();
-                        Interlocked.Exchange(ref _expectRunDialogUntil, nowTick + 60000);
-                        _log.Info("远端按下 Win+R：接下来 60 秒内新出现的窗口（含它启动的程序）都会摆到外屏");
-                    }
-                }
-                var (vk, up, flags) = PayloadCodec.DecodeKey(msg.Payload);
-                // 键盘焦点在一个会话里同样是"单例"：远端敲的键会进**当前前台窗口**。
-                // 本机用户此刻正在打字时，前台窗口是他的，远端按键就会打进他的文档
-                // （丢字/误操作，比"远端暂时打不了字"严重得多）。所以本机用户刚动过键鼠时
-                // 宁可丢掉远端按键，并把原因明确告诉主控端。
-                Interlocked.Exchange(ref _lastRemoteKeyTick, Environment.TickCount64);
-
-                // **抬起事件一律放行**：丢掉一个抬起 = 那个键在被控端永远按着（Ctrl 卡住会导致"点一个全选"）。
-                if (up)
-                {
-                    lock (_remoteKeysDown) _remoteKeysDown.Remove(vk);
-                    _injector.Key(vk, up, flags);
-                    break;
-                }
-
-                if (_arbiter != null && _arbiter.LocalActiveWithin(RemoteKeyBlockWindowMs))
-                {
-                    long nowB = Environment.TickCount64;
-                    if (nowB - _lastGateSourceLogTick > 1000)
-                    {
-                        _lastGateSourceLogTick = nowB;
-                        _log.Warn($"远端按键被本机活跃闸门拦下：来源={_arbiter.LastPhysicalSource}");
-                    }
-                    NotifyRemoteKeysBlocked();
-                    break;
-                }
-                // 后台注入模式下窗口不会被点击激活，所以要显式把"远端点过的那个窗口"带前台，
-                // 否则这一串按键会打进本机用户的前台窗口（本机用户在忙时上面已经拦掉了）。
-                if (_router != null && !_router.EnsureClaimedForeground())
-                {
-                    NotifyRemoteKeysBlocked();
-                    break;
-                }
-                // 前台窗口输入法英文化（3 秒节流）：真实光标模式下点进已有窗口不会经过
-                // ForceActivateWindow，中文模式的组字框会吃掉后续按键（2026-10-08 现场）
-                _windows.EnsureImeEnglishForForeground();
-                lock (_remoteKeysDown) _remoteKeysDown.Add(vk);
-                _injector.Key(vk, up, flags);
+                var payload = msg.Payload;
+                RunOnInputThread("KeyEvent", () => HandleKeyEvent(payload));
                 break;
             }
             case MessageType.OpenSoftware:
@@ -961,6 +912,7 @@ public sealed class WorkerContext : ApplicationContext
                 _outboundCongested = hint?.Congested ?? false;
                 _viewerOnline = hint?.ViewerOnline ?? false;
                 _everGotViewerHint = true;
+                Interlocked.Exchange(ref _lastHintSeq, hint?.Seq ?? 0);   // 金丝雀回显（单向断流检测）
                 if (_viewerOnline) Interlocked.Exchange(ref _viewerOfflineSince, 0);
                 else if (Interlocked.Read(ref _viewerOfflineSince) == 0)
                     Interlocked.Exchange(ref _viewerOfflineSince, Environment.TickCount64);
@@ -1177,6 +1129,153 @@ public sealed class WorkerContext : ApplicationContext
         }
     }
 
+    // ---------------------------------------------------------------- 专用输入线程（2026-10-09 二次卡死事故）
+
+    /// <summary>输入动作队列（泵线程只入队，绝不在这里跑 Win32 注入）</summary>
+    private System.Threading.Channels.Channel<(string What, Action Work)>? _inputQueue;
+    private Thread? _inputThread;
+    /// <summary>当前输入动作开始时刻（0=空闲）：卡死检测依据</summary>
+    private long _inputBusySinceTick;
+    private string _inputBusyWhat = "";
+    private long _inputThreadReplacedCount;
+    private long _lastInputThreadReplaceTick;
+
+    /// <summary>
+    /// 【2026-10-09 二次卡死事故】SendInput/键鼠路由/前台切换这类 Win32 调用会被同机安全软件、
+    /// 反作弊（ACE 等）或钩子链**无限期卡死**——现场：用户操作过一轮之后，主控端→被控端的
+    /// 打开软件/剪贴板/切画面全部失灵 40+ 分钟（消息泵被注入调用堵死，画面照常）。
+    /// 所以注入类消息一律转交**专用输入线程**串行执行：
+    ///   · 泵线程只入队（永不阻塞）→ 控制通道（打开软件/状态/剪贴板）永不被输入拖死；
+    ///   · 输入线程卡死 &gt; 5s：记日志、丢弃积压、换新线程（旧线程泄漏在内核调用里，可接受）；
+    ///   · 30s 内最多换一次线程（防卡死风暴无限泄漏）。
+    /// </summary>
+    private void RunOnInputThread(string what, Action work)
+    {
+        var q = _inputQueue;
+        if (q == null) return;
+        q.Writer.TryWrite((what, work));
+    }
+
+    private void StartInputThread()
+    {
+        _inputQueue = System.Threading.Channels.Channel.CreateUnbounded<(string, Action)>(
+            new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true });
+        _inputThread = new Thread(InputLoop) { IsBackground = true, Name = "input-exec" };
+        _inputThread.Start();
+    }
+
+    private void InputLoop()
+    {
+        var q = _inputQueue;
+        if (q == null) return;
+        while (!_stop)
+        {
+            (string What, Action Work) item;
+            try
+            {
+                if (!q.Reader.TryRead(out item))
+                {
+                    var wait = q.Reader.WaitToReadAsync().AsTask();
+                    if (!wait.Wait(1000)) continue;
+                    if (!q.Reader.TryRead(out item)) continue;
+                }
+            }
+            catch { return; }
+
+            Interlocked.Exchange(ref _inputBusySinceTick, Environment.TickCount64);
+            _inputBusyWhat = item.What;
+            long start = Environment.TickCount64;
+            try { item.Work(); }
+            catch (Exception ex) { _log.Warn($"输入处理异常（{item.What}）：{ex.Message}"); }
+            finally { Interlocked.Exchange(ref _inputBusySinceTick, 0); }
+            long cost = Environment.TickCount64 - start;
+            if (cost > 1000)
+                _log.Warn($"⚠ 输入动作 {item.What} 耗时 {cost / 1000.0:F1}s（疑似被安全软件/钩子拖住）");
+        }
+    }
+
+    /// <summary>输入线程卡死自愈：由状态线程每秒核一次（5s 卡死 → 换线程；30s 节流）</summary>
+    private void CheckInputThreadHealth()
+    {
+        long busy = Interlocked.Read(ref _inputBusySinceTick);
+        if (busy == 0) return;
+        long stuckMs = Environment.TickCount64 - busy;
+        if (stuckMs < 5000) return;
+        long now = Environment.TickCount64;
+        if (now - Interlocked.Read(ref _lastInputThreadReplaceTick) < 30_000) return;
+        Interlocked.Exchange(ref _lastInputThreadReplaceTick, now);
+        Interlocked.Increment(ref _inputThreadReplacedCount);
+        _log.Error($"⚠⚠ 输入线程卡死 {stuckMs / 1000.0:F0}s（正在执行 {_inputBusyWhat}，累计换线程 " +
+                   $"{_inputThreadReplacedCount} 次）——丢弃积压输入并更换输入线程。常见元凶：反作弊/安全软件" +
+                   "拦截 SendInput、钩子链无响应。控制通道不受影响。");
+        // 旧队列连同积压一起废弃（过期输入没有重放价值），起全新线程
+        try { _inputQueue?.Writer.TryComplete(); } catch { }
+        StartInputThread();
+    }
+
+    /// <summary>
+    /// 键盘事件处理（从 OnMessage 的 KeyEvent case 原样搬来：注入类逻辑统一在专用输入线程上跑）。
+    /// </summary>
+    private void HandleKeyEvent(byte[] payload)
+    {
+        // 只有 Win+R 会开启"把运行框挪到外屏"的短窗口期 —— 别的窗口一律不动（产品要求）
+        if (payload.Length >= 3)
+        {
+            var (vkRun, upRun, _) = PayloadCodec.DecodeKey(payload);
+            long nowTick = Environment.TickCount64;
+            if (!upRun && (vkRun == 0x5B || vkRun == 0x5C))
+                Interlocked.Exchange(ref _winKeyDownTick, nowTick);
+            else if (!upRun && (vkRun == 0x52 /*R*/) &&
+                     nowTick - Interlocked.Read(ref _winKeyDownTick) < 3000)
+            {
+                // 按 Win+R = 开一段"会话期"：先给当前窗口拍快照，
+                // 之后新出现的窗口（运行框本身 + 它启动出来的程序）一律去外屏；
+                // 快照里原有的窗口一个都不动（"除非我让它过去，否则不准动"）。
+                _windows.SnapshotBaseline();
+                Interlocked.Exchange(ref _expectRunDialogUntil, nowTick + 60000);
+                _log.Info("远端按下 Win+R：接下来 60 秒内新出现的窗口（含它启动的程序）都会摆到外屏");
+            }
+        }
+        var (vk, up, flags) = PayloadCodec.DecodeKey(payload);
+        // 键盘焦点在一个会话里同样是"单例"：远端敲的键会进**当前前台窗口**。
+        // 本机用户此刻正在打字时，前台窗口是他的，远端按键就会打进他的文档
+        // （丢字/误操作，比"远端暂时打不了字"严重得多）。所以本机用户刚动过键鼠时
+        // 宁可丢掉远端按键，并把原因明确告诉主控端。
+        Interlocked.Exchange(ref _lastRemoteKeyTick, Environment.TickCount64);
+
+        // **抬起事件一律放行**：丢掉一个抬起 = 那个键在被控端永远按着（Ctrl 卡住会导致"点一个全选"）。
+        if (up)
+        {
+            lock (_remoteKeysDown) _remoteKeysDown.Remove(vk);
+            _injector.Key(vk, up, flags);
+            return;
+        }
+
+        if (_arbiter != null && _arbiter.LocalActiveWithin(RemoteKeyBlockWindowMs))
+        {
+            long nowB = Environment.TickCount64;
+            if (nowB - _lastGateSourceLogTick > 1000)
+            {
+                _lastGateSourceLogTick = nowB;
+                _log.Warn($"远端按键被本机活跃闸门拦下：来源={_arbiter.LastPhysicalSource}");
+            }
+            NotifyRemoteKeysBlocked();
+            return;
+        }
+        // 后台注入模式下窗口不会被点击激活，所以要显式把"远端点过的那个窗口"带前台，
+        // 否则这一串按键会打进本机用户的前台窗口（本机用户在忙时上面已经拦掉了）。
+        if (_router != null && !_router.EnsureClaimedForeground())
+        {
+            NotifyRemoteKeysBlocked();
+            return;
+        }
+        // 前台窗口输入法英文化（3 秒节流）：真实光标模式下点进已有窗口不会经过
+        // ForceActivateWindow，中文模式的组字框会吃掉后续按键（2026-10-08 现场）
+        _windows.EnsureImeEnglishForForeground();
+        lock (_remoteKeysDown) _remoteKeysDown.Add(vk);
+        _injector.Key(vk, up, flags);
+    }
+
     /// <summary>
     /// 把主控端下发的剪贴板文本写入本会话剪贴板。
     /// Clipboard（OLE）要求 STA 线程，而本方法由 IPC 读取线程（MTA）调用，
@@ -1261,6 +1360,7 @@ public sealed class WorkerContext : ApplicationContext
         if (_stop) return;
         try
         {
+            CheckInputThreadHealth();   // 输入线程卡死自愈（每秒核一次，借状态线程的节拍）
             // 安全桌面（UAC 提权弹窗 / 锁屏 / Ctrl+Alt+Del）：这期间采集抓不到、键鼠也进不去，
             // 主控端看到的是一片黑。每秒把状态上报一次，主控端就能说出"为什么黑"，而不是让人干猜。
             bool onInput = DesktopHelper.IsOnInputDesktop();
@@ -1292,6 +1392,7 @@ public sealed class WorkerContext : ApplicationContext
                 FrameRate = _governor?.FrameRate ?? _cfg.FrameRate,
                 AdaptiveLevel = _governor?.Level ?? 0,
                 RingDropped = Interlocked.Read(ref _ringDrops),
+                HintSeq = Interlocked.Read(ref _lastHintSeq),   // 金丝雀：协调器据此发现单向断流
                 // 输入侧的可观测字段：主控端据此显示"远端鼠标点在哪块屏、走的哪条路"，
                 // 现场"看着副屏点、结果点到主屏"这类问题一眼可辨（见 MouseRouter.CursorContested）
                 InputBaseX = _injector.CaptureOrigin.Left,
