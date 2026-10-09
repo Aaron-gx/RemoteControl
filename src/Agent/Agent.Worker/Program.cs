@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.7";
+    public const string Version = "1.5.8";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -90,6 +90,10 @@ public sealed class WorkerContext : ApplicationContext
     private volatile bool _outboundCongested;
     /// <summary>主控端是否在线（协调器每秒通过 IpcBitrateHint 告知——不能用"远端没动鼠标"代替）</summary>
     private volatile bool _viewerOnline;
+    /// <summary>主控端从有到无的时刻（TickCount64；0=当前在线或从未收到过状态）——"无人观看暂停"用</summary>
+    private long _viewerOfflineSince;
+    /// <summary>是否收到过协调器的 BitrateHint（没收到过就绝不敢暂停——老协调器配对时保持旧行为）</summary>
+    private volatile bool _everGotViewerHint;
     private long _lastReclaimTick;
     private long _lastVddRestartTick;
     private long _nextTopoCheckMs;
@@ -337,6 +341,7 @@ public sealed class WorkerContext : ApplicationContext
         long nextDue = 0;
         long lastFpsSample = 0;
         long framesAtLastSample = 0;
+        long nextIdleLogMs = 0;
         int consecutiveFailures = 0;
 
         while (!_stop)
@@ -432,6 +437,23 @@ public sealed class WorkerContext : ApplicationContext
                 {
                     _needStreamReset = false;
                     RestartEncoder("请求重建码流");
+                }
+                // 没人看就别烧机器：主控端全部断开 ≥10 秒后暂停采集与编码。
+                // 被控端在客户机上 7x24 挂着，无人观看还全程跑 WGC+ffmpeg，
+                // 弱机器就"换一台电脑特别卡、断开后开软件都慢"（2026-10-09 现场反馈）。
+                // 暂停期间 ffmpeg 空转等输入（近零开销）、拓扑自愈照常跑；
+                // 一有主控端接入（BitrateHint / 码流重建）立即恢复。
+                var offlineSince = Interlocked.Read(ref _viewerOfflineSince);
+                if (_everGotViewerHint && !_viewerOnline && offlineSince > 0 &&
+                    Environment.TickCount64 - offlineSince > 10_000)
+                {
+                    if (sw.ElapsedMilliseconds >= nextIdleLogMs)
+                    {
+                        nextIdleLogMs = sw.ElapsedMilliseconds + 300_000;
+                        _log.Info("无主控端在线 ≥10 秒，暂停采集编码（有连接立即恢复）");
+                    }
+                    Thread.Sleep(500);
+                    continue;
                 }
                 if (_encoder is not { IsAlive: true })
                 {
@@ -851,6 +873,9 @@ public sealed class WorkerContext : ApplicationContext
             case MessageType.StreamReset:
                 _log.Info("主控端请求重建码流（新 View 接入）");
                 _needStreamReset = true;
+                // 有主控端要接入：立即解除"无人观看暂停"（不等下一个 BitrateHint）
+                _viewerOnline = true;
+                Interlocked.Exchange(ref _viewerOfflineSince, 0);
                 break;
             case MessageType.InputModeHint:
             {
@@ -872,6 +897,10 @@ public sealed class WorkerContext : ApplicationContext
                 var hint = JsonCodec.Decode<BitrateHintInfo>(msg.Payload);
                 _outboundCongested = hint?.Congested ?? false;
                 _viewerOnline = hint?.ViewerOnline ?? false;
+                _everGotViewerHint = true;
+                if (_viewerOnline) Interlocked.Exchange(ref _viewerOfflineSince, 0);
+                else if (Interlocked.Read(ref _viewerOfflineSince) == 0)
+                    Interlocked.Exchange(ref _viewerOfflineSince, Environment.TickCount64);
                 break;
             }
             case MessageType.RequestSoftwareList:

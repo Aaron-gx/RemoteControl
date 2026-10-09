@@ -72,15 +72,28 @@ public sealed unsafe class WgcFrameSource : FrameSource
             // 这样本机用户的屏幕上永远不会出现远端的光标，而远端在任何模式下都能看见自己的指针
             // （后台定向注入模式下，系统光标压根不在外屏上）。
             _session.IsCursorCaptureEnabled = false;
-            // 去掉系统在**被采集的物理屏**四周画的黄色"正在被捕获"指示框（客户反馈"主屏有黄框"）。
-            // 用反射调（API 需 build 20348+，而 TFM 定在 19041 就没有这个属性的编译期绑定）：
-            // 老系统上反射拿不到属性 → 静默跳过（黄色边框仍在但功能不受影响）。
+            // 去掉系统在**被采集的屏**四周画的黄色"正在被捕获"指示框（客户多次反馈"主屏有黄框"）。
+            // 【2026-10-09 复盘】旧实现用反射设 IsBorderRequired，在 CsWinRT 投影对象上
+            // InvokeMember 根本不生效 → 等于从来没关掉过。现在 SDK 投影升到 22621（运行时下限
+            // 仍是 19041），编译期直接绑定；老系统（<20348）没有该属性，ApiInformation 守卫跳过。
+            // 成败都写日志——这台机器黄框到底关没关掉，远程看日志就能确认。
             try
             {
-                _session.GetType().InvokeMember("IsBorderRequired",
-                    System.Reflection.BindingFlags.SetProperty, null, _session, new object[] { false });
+                if (Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+                        "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired"))
+                {
+                    _session.IsBorderRequired = false;
+                    _log.Info("已关闭系统采集黄框（IsBorderRequired=false）");
+                }
+                else
+                {
+                    _log.Info("系统低于 build 20348，无法关闭采集黄框（功能不受影响）");
+                }
             }
-            catch { /* build < 20348 没有此属性 */ }
+            catch (Exception exBorder)
+            {
+                _log.Warn($"关闭采集黄框失败（系统拒绝，黄框仍在）：{exBorder.GetType().Name}: {exBorder.Message}");
+            }
         }
         catch (Exception ex)
         {

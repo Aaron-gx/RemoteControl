@@ -73,23 +73,23 @@ public sealed class FfmpegEncoder : IDisposable
         log.Warn($"编码器降级为软件编码 libx264（原因：{reason}）");
     }
 
-    public static string ResolveEncoder(string ffmpeg, string configured, Logger log)
+    public static string ResolveEncoder(string ffmpeg, string configured, Logger log, int width, int height, int fps)
     {
         if (_forceSoftware)
         {
-            var swKey = $"{ffmpeg}|__software";
+            var swKey = $"{ffmpeg}|__software|{width}x{height}";
             lock (EncoderCache)
             {
                 if (EncoderCache.TryGetValue(swKey, out var cachedSw)) return cachedSw;
             }
-            if (Probe(ffmpeg, "libx264"))
+            if (Probe(ffmpeg, "libx264", width, height, fps))
             {
                 lock (EncoderCache) EncoderCache[swKey] = "libx264";
                 return "libx264";
             }
         }
 
-        var cacheKey = $"{ffmpeg}|{configured}";
+        var cacheKey = $"{ffmpeg}|{configured}|{width}x{height}";
         lock (EncoderCache)
         {
             if (EncoderCache.TryGetValue(cacheKey, out var cached)) return cached;
@@ -98,26 +98,26 @@ public sealed class FfmpegEncoder : IDisposable
         string resolved;
         if (!string.IsNullOrWhiteSpace(configured) && !configured.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
-            if (Probe(ffmpeg, configured)) resolved = configured;
+            if (Probe(ffmpeg, configured, width, height, fps)) resolved = configured;
             else
             {
                 log.Warn($"配置的编码器 {configured} 不可用，回退自动选择");
-                resolved = ProbeInOrder(ffmpeg, log);
+                resolved = ProbeInOrder(ffmpeg, log, width, height, fps);
             }
         }
         else
         {
-            resolved = ProbeInOrder(ffmpeg, log);
+            resolved = ProbeInOrder(ffmpeg, log, width, height, fps);
         }
         lock (EncoderCache) EncoderCache[cacheKey] = resolved;
         return resolved;
     }
 
-    private static string ProbeInOrder(string ffmpeg, Logger log)
+    private static string ProbeInOrder(string ffmpeg, Logger log, int width, int height, int fps)
     {
         foreach (var cand in AutoOrder)
         {
-            if (Probe(ffmpeg, cand))
+            if (Probe(ffmpeg, cand, width, height, fps))
             {
                 log.Info($"自动选择编码器：{cand}");
                 return cand;
@@ -127,12 +127,19 @@ public sealed class FfmpegEncoder : IDisposable
         throw new InvalidOperationException("找不到可用的 H.264 编码器（nvenc/qsv/amf/libx264 都失败）");
     }
 
-    private static bool Probe(string ffmpeg, string encoder)
+    /// <summary>
+    /// 探测编码器是否真的能用。**必须按真实分辨率/帧率探测**（2026-10-09）：
+    /// 旧版用 64x64 小图探测，半残的驱动（尤其 Intel QSV 的 -low_power 硬编码路径）
+    /// 小图能过、1080p30 实跑就反复失败 → 码流无限重建 → "换一台电脑就特别卡"。
+    /// 探测参数与实跑完全一致（同分辨率、同编码参数），探测过 = 实跑能用。
+    /// </summary>
+    private static bool Probe(string ffmpeg, string encoder, int width, int height, int fps)
     {
         try
         {
             var psi = new ProcessStartInfo(ffmpeg,
-                $"-hide_banner -v error -f lavfi -i color=c=black:s=64x64:r=1 -frames:v 1 -c:v {encoder} -f null -")
+                $"-hide_banner -v error -f lavfi -i color=c=black:s={width}x{height}:r={fps} " +
+                $"-frames:v {Math.Max(1, Math.Min(fps, 5))} -c:v {encoder} {EncoderExtraArgs(encoder)} -f null -")
             {
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
@@ -153,12 +160,23 @@ public sealed class FfmpegEncoder : IDisposable
         catch { return false; }
     }
 
+    /// <summary>每个编码器的专属参数（实跑与探测共用同一份，保证"探测过=实跑能用"）</summary>
+    private static string EncoderExtraArgs(string encoder) => encoder switch
+    {
+        "libx264"  => "-preset ultrafast -tune zerolatency -profile:v baseline -level 4.0 " +
+                      "-x264-params \"scenecut=0:rc-lookahead=0:sync-lookahead=0:repeat-headers=1\" ",
+        "h264_nvenc" => "-preset p1 -tune ull -rc cbr -zerolatency 1 -profile:v baseline -delay 0 ",
+        "h264_qsv"  => "-preset veryfast -profile:v baseline -low_power 1 ",
+        "h264_amf"  => "-quality speed -usage lowlatency -rc cbr -profile:v baseline ",
+        _ => "-profile:v baseline ",
+    };
+
     // ---------------------------------------------------------------- 生命周期
 
     public bool Start()
     {
         Stop();
-        EncoderName = ResolveEncoder(_ffmpeg, _configured, _log);
+        EncoderName = ResolveEncoder(_ffmpeg, _configured, _log, _width, _height, _fps);
         var args = BuildArgs(EncoderName);
         _log.Info($"启动 ffmpeg：{EncoderName} {_width}x{_height}@{_fps} {_kbps}kbps");
         _stderrTail.Clear();
@@ -200,25 +218,7 @@ public sealed class FfmpegEncoder : IDisposable
         sb.Append($"-f rawvideo -pixel_format bgra -video_size {_width}x{_height} -framerate {_fps} -i pipe:0 ");
         sb.Append("-an -sn -dn ");
         sb.Append($"-c:v {encoder} ");
-        switch (encoder)
-        {
-            case "libx264":
-                sb.Append("-preset ultrafast -tune zerolatency -profile:v baseline -level 4.0 ");
-                sb.Append("-x264-params \"scenecut=0:rc-lookahead=0:sync-lookahead=0:repeat-headers=1\" ");
-                break;
-            case "h264_nvenc":
-                sb.Append("-preset p1 -tune ull -rc cbr -zerolatency 1 -profile:v baseline -delay 0 ");
-                break;
-            case "h264_qsv":
-                sb.Append("-preset veryfast -profile:v baseline -low_power 1 ");
-                break;
-            case "h264_amf":
-                sb.Append("-quality speed -usage lowlatency -rc cbr -profile:v baseline ");
-                break;
-            default:
-                sb.Append("-profile:v baseline ");
-                break;
-        }
+        sb.Append(EncoderExtraArgs(encoder));
         // GOP 收到 1 秒：一是主控端刚接入/刚重置时能很快等到关键帧，二是丢块之后
         // 最多 1 秒就能靠下一个关键帧自愈（慢链路上 GOP 太长会让画面一直起不来）。
         int gop = Math.Max(1, _fps);
