@@ -691,7 +691,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>主控端自身版本（热更新提示用，2026-10 新增；主控端不做自动应用——数量少、用户是厂商自己人，提示下载即可）</summary>
-    public const string ViewerVersion = "1.2.2";
+    public const string ViewerVersion = "1.2.3";
 
     /// <summary>
     /// 查更新清单：验签通过且版本比自己新 → 状态栏提示"有新版本"，点一下用浏览器打开下载页。
@@ -788,6 +788,15 @@ public partial class MainWindow : Window
                     Screen.ShowPlaceholder($"{mi.Width}×{mi.Height} 等待画面…");
                     // 屏幕布局：全部屏幕模式下，物理屏那几块画成"只读"（看得见、点不到）
                     Screen.SetScreenLayout(mi.Screens, mi.AllScreens);
+
+                    // 【2026-10-09 现场反馈】主屏监视模式下整个画面只读（客户 10-06 定稿：主屏只监视），
+                    // 但没有任何持续提示 —— 用户连上后点什么都没反应，以为鼠标坏了（老板+客户双双反馈）。
+                    // 状态栏明确写出来，日志也留痕。
+                    if (Screen.AllReadOnly)
+                    {
+                        _log.Info("当前为主屏监视模式：画面只读（鼠标/键盘不转发，左键点击=把窗口搬到副屏）");
+                        ConnInfo.Text = "监视模式（主屏只读）：只能看；左键点窗口=搬到副屏，要直接操作请把「画面」切到「副屏」";
+                    }
 
                     // 请求了"全部屏幕"却被控端仍按"仅副屏"在传图 → 说明那边是旧版本（老包不认识这条指令）。
                     // 这类"界面点了没反应"最容易让人以为是软件坏了，所以直接写在画面上。

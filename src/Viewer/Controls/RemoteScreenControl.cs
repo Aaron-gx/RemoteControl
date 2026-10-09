@@ -110,6 +110,18 @@ public sealed class RemoteScreenControl : Image
     /// <summary>物理屏那块是否只读（false = 可直接操作，见 ViewerConfig.PhysicalScreenReadOnly）</summary>
     public bool ReadOnlyPhysicalScreens { get; set; }
 
+    /// <summary>
+    /// 可见画面是否**整块**都是只读屏（主屏监视模式）——主窗口据此提示"只能看，切副屏可操作"。
+    /// 注意不能用 _screens.All(!IsVirtual)：主屏模式下 Screens 里还带着视野外的虚拟屏条目，
+    /// 按"只读区域是否盖满整个可见画面"判定才准。
+    /// </summary>
+    public bool AllReadOnly =>
+        _remoteWidth > 0 && _readOnlyRegions.Any(r =>
+            r.Left <= 0 && r.Top <= 0 && r.Left + r.Width >= _remoteWidth && r.Top + r.Height >= _remoteHeight);
+
+    /// <summary>只读提示节流（点击/按键被拦时每 3 秒最多提示一次，2026-10-09 现场反馈"鼠标点了没反应"）</summary>
+    private long _lastReadOnlyHintTick;
+
     /// <summary>这个画面坐标是不是落在只读区域（物理屏）里</summary>
     private bool InReadOnlyRegion(int rx, int ry)
         => ReadOnlyPhysicalScreens &&
@@ -260,8 +272,26 @@ public sealed class RemoteScreenControl : Image
         var p = e.GetPosition(this);
         if (!TryMapPoint(p, out int x, out int y)) return;
         SetCursor(x, y);
-        // 物理屏区域：**纯监视**——所有鼠标/键盘/滚轮一律不转发
-        if (InReadOnlyRegion(x, y)) return;
+        // 物理屏区域：**纯监视**——鼠标不转发给被控端。
+        // 【修复 2026-10-09】这里以前是静默 return —— RemotePullWindow 从未触发（死代码），
+        // 用户在主屏模式下点什么都没反应、也没有任何提示（现场反馈"鼠标事件不行"，客户同样反馈）。
+        // 现在：左键=把点击处的窗口搬到副屏（原设计意图），并明确提示为什么不能直接操作。
+        if (InReadOnlyRegion(x, y))
+        {
+            if (e.ChangedButton == MouseButton.Left)
+            {
+                RemotePullWindow?.Invoke(x, y);
+                ReadOnlyHint("已请求把这个窗口搬到副屏；要直接操作请把「画面」切到「副屏」");
+            }
+            else
+            {
+                ReadOnlyHint(AllReadOnly
+                    ? "主屏监视模式：只能看不能点；把「画面」切到「副屏」即可直接操作"
+                    : "这里是被控端的本机屏幕（只读）；左键点窗口可搬到副屏，操作请在副屏区域");
+            }
+            e.Handled = true;
+            return;
+        }
         RemoteMouseButton?.Invoke(x, y, ButtonIndex(e.ChangedButton), false);
         e.Handled = true;
     }
@@ -295,6 +325,16 @@ public sealed class RemoteScreenControl : Image
         _ => 0,
     };
 
+    /// <summary>只读拦截提示（3 秒节流）：被拦时必须让用户知道为什么、怎么才能操作</summary>
+    private void ReadOnlyHint(string text)
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastReadOnlyHintTick < 3000) return;
+        _lastReadOnlyHintTick = now;
+        _log.Info($"输入被只读区拦截：{text}");
+        SetLayoutNotice(text);
+    }
+
     // ---------------------------------------------------------------- 键盘
 
     protected override void OnKeyDown(KeyEventArgs e)
@@ -312,10 +352,17 @@ public sealed class RemoteScreenControl : Image
     private void HandleKey(KeyEventArgs e, bool up)
     {
         // 只读视图（主屏纯监视）：键盘不转发。
-        // 【修复 2026-10-07】只在**整个画面都是只读屏**时才拦（PrimaryOnly 模式）。
+        // 【修复 2026-10-07】只在**整个可见画面都是只读屏**时才拦（PrimaryOnly 模式）。
         // 之前检查 _readOnlyRegions.Count > 0 永远为 true（物理屏永远存在于列表里），
         // 导致副屏模式下也打不了字（客户反馈"键盘打不了字过去"）。
-        if (ReadOnlyPhysicalScreens && _screens.Count > 0 && _screens.All(scr => !scr.IsVirtual)) return;
+        // 【修正 2026-10-09】主屏模式下 Screens 里还带视野外的虚拟屏条目，All(!IsVirtual) 判不出，
+        // 补上"只读区盖满可见画面"的判定，两种形态都拦得住（拦住时给提示，不再静默）。
+        if (ReadOnlyPhysicalScreens &&
+            (_screens.Count > 0 && _screens.All(scr => !scr.IsVirtual) || AllReadOnly))
+        {
+            ReadOnlyHint("主屏监视模式下键盘不转发；把「画面」切到「副屏」即可直接操作");
+            return;
+        }
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         if (key is Key.LeftAlt or Key.RightAlt or Key.System)
         {
