@@ -137,6 +137,8 @@ python scripts/_rcp.py run "<cmd>"  # 在被控端跑命令（输出走文件+cl
 
 构建/发布：`scripts/build-all.ps1 -ToolsRoot D:\tools` → `scripts/_publish_update.py build/agent-X.Y.Z.zip X.Y.Z "说明" 100` → 安装包 `build-setup-agent/viewer.ps1 -Token <口令>`（口令内嵌+setup-defaults.ini 双保险）。
 
+⚠ **热更包必须带齐依赖 DLL**（2026-10-09 事故）：包内容是 `Agent.Coordinator.dll + Agent.Worker.dll + Agent.Common.dll + Microsoft.Windows.SDK.NET.dll + WinRT.Runtime.dll` 共 5 个。TFM 从 19041 升到 22621 后只带 3 个业务 DLL → 客户机上旧版 SDK 投影 DLL 加载失败 → WGC 采集静默回退 GDI（变卡）。**凡是动 TFM / NuGet 依赖 / SDK 版本，必须 diff publish 输出的 DLL 清单再定 zip 内容**；发版前用旧安装目录模拟"部分覆盖"验证。另外：**版本号改动必须走完整 publish**（只 build 不 publish 的话 zip 里还是旧版本号 DLL → 升级死循环）。
+
 ⚠ **禁止裸 `dotnet publish -o build/viewer`**（2026-10-08 事故）：build\viewer 是**自包含**发布（免装 .NET 双击即跑）；裸 publish 不清目录，会把框架依赖版 exe/runtimeconfig 盖在自包含运行时上 → 双击弹"必须安装 .NET 8"（开发机上带 DOTNET_ROOT 能跑，极易漏测）。临时验证用 `-o build/viewer-test` 之类独立目录；正式恢复一律带 `-r win-x64 --self-contained true`，或直接跑 build-setup-viewer.ps1（会顺手补 ffmpeg/文档并剔除 config/logs）。本机 dotnet 在 D:\tools\dotnet（非系统路径），本机双击自包含版是唯一可靠回归法。
 
 ## 6. 深入文档（按需读）

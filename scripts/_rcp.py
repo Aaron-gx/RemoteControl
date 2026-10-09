@@ -675,9 +675,9 @@ $ime=[IME6]::ImmGetDefaultIMEWnd($h)
               "$d=Split-Path $p;"
               "$w=Get-ChildItem (Join-Path $d 'logs') -Filter 'worker-*.log' | Sort LastWriteTime | Select -Last 1;"
               "$c=Get-ChildItem (Join-Path $d 'logs') -Filter 'coordinator-*.log' | Sort LastWriteTime | Select -Last 1;"
-              "Get-Content $w.FullName -Tail 150 | Out-String | Set-Clipboard;"
+              "Get-Content $w.FullName -Tail " + str(int(__import__("os").environ.get("RC_TAIL","150"))) + " | Out-String | Set-Clipboard;"
               "Start-Sleep 2;"
-              "Get-Content $c.FullName -Tail 80 | Out-String | Set-Clipboard"
+              "Get-Content $c.FullName -Tail " + str(int(__import__("os").environ.get("RC_TAIL","150"))//2) + " | Out-String | Set-Clipboard"
               "\"")
         ps_exe = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
         asyncio.run(session({"open": (ps_exe, ps)}, 30))
