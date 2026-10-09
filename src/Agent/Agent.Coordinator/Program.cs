@@ -89,6 +89,8 @@ public sealed class CoordinatorApp : IDisposable
     private long _relayVideoChunks;
     /// <summary>上一份状态里"被挤掉的视频块数"，用来判断这一秒有没有真丢</summary>
     private long _lastVideoDropped;
+    /// <summary>最近一次收到 Worker 状态（0x41）的时刻：引擎每 1s 上报，断流即卡死信号（看门狗用）</summary>
+    private long _lastWorkerStatusTick = Environment.TickCount64;
     /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
     private int _viewerCount;
     /// <summary>上次拉起采集引擎的时间：防止"看护 + 掉线重试"同时拉起两个引擎线程打架（会 0 帧）</summary>
@@ -136,6 +138,15 @@ public sealed class CoordinatorApp : IDisposable
         KillStrayWorkers();   // 清理"旧版本残留"的独立 Worker 进程（见方法注释）
         _bus = new WorkerBridge(_cfg.FrameBufferSizeBytes);
         _host = new WorkerHost(_cfg, _log, _bus);
+        // 泵诊断/看门狗接线（2026-10-09 VSAQ 单方向死亡事故）：
+        //  · 泵日志进协调器日志（引擎侧 Logger 在 WorkerHost 里也订阅了一份，谁活着谁记）；
+        //  · toWorker 卡死 → 转储引擎线程栈 + 硬重启引擎（桥自己已先换泵恢复投递）。
+        _bus.PumpLog += s => _log.Warn(s);
+        _bus.PumpWedged += () =>
+        {
+            _log.Error("Worker 消息泵看门狗触发：已换新泵恢复控制指令投递；下面转储引擎线程栈并硬重启引擎");
+            _host.DumpEngineStackAndRequestExit();
+        };
         _relay = new RelayClient(_cfg, _log);
         _vdd = new VirtualDisplayManager(_cfg, _log);
         _sw = new SoftwareEnumerator(_log, _cfg.ReportSoftwareIcons);
@@ -430,6 +441,16 @@ public sealed class CoordinatorApp : IDisposable
                               $"主控端={(HasViewer ? "在线" : "无")}  " +
                               $"直连={(_direct.HasViewer ? $"已建立({_direct.ViewerEndpoint}, {_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB)" : (_direct.UpnpMapped ? "待接入(UPnP已映射)" : "未建立"))}");
                     lastFrames = f; lastQueued = q; lastDropped = d; lastVideoDropped = vd;
+                    // 【2026-10-09 VSAQ 事故】Worker 状态龄监视：正常时引擎每 1s 上报一次状态。
+                    // 状态断流而引擎"看似在跑"= toCoordinator 泵或引擎线程本身卡死
+                    // （现场表现：视频/状态照常或停滞，但主控端点什么都没反应）。
+                    // 连续 45 秒没有状态且引擎在跑 → 转储栈并硬重启引擎（看门狗兜底，桥内另有 15s 泵级看门狗）。
+                    if (_host.IsRunning && Environment.TickCount64 - Volatile.Read(ref _lastWorkerStatusTick) > 45_000)
+                    {
+                        Volatile.Write(ref _lastWorkerStatusTick, Environment.TickCount64);   // 45s 内只触发一次
+                        _log.Error("Worker 状态断流 >45s（引擎疑似卡死）：转储引擎线程栈并硬重启");
+                        _host.DumpEngineStackAndRequestExit();
+                    }
                     // 托盘悬停也能看到服务器与直连状态（右键菜单里还有更详细的）。
                     // 连不上时把**原因**写出来：口令不对和网络不通在用户那里表现完全一样，
                     // 不写清楚就只能靠猜（现场踩过：装完一直不在线）。
@@ -737,6 +758,7 @@ public sealed class CoordinatorApp : IDisposable
 
             case MessageType.WorkerStatus:
             {
+                Volatile.Write(ref _lastWorkerStatusTick, Environment.TickCount64);   // 状态龄监视的喂狗
                 // 补上"视频实际走了哪条路"的计数：主控端据此显示直连/中继，
                 // 验收脚本据此断言 P2P 是否真的生效（中继块数应停止增长）。
                 var st = JsonCodec.Decode<WorkerStatusInfo>(msg.Payload) ?? new WorkerStatusInfo();

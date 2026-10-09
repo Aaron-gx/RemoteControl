@@ -185,6 +185,13 @@ public sealed class DirectLinkServer : IDisposable
     {
         try
         {
+            // 冷却期内拒绝（防"建立→秒断→再建"横跳，见 Send 失败处的注释）
+            if (Environment.TickCount64 < Interlocked.Read(ref _cooldownUntilTick))
+            {
+                _log.Info("P2P 直连：冷却期内（上次发送失败后 2 分钟），拒绝新握手，视频继续走中继");
+                await ReplyAsync(client.GetStream(), HandshakeDeny + " cooldown\n");
+                return false;
+            }
             var stream = client.GetStream();
             var buf = new byte[1];
             var sb = new StringBuilder();
@@ -262,9 +269,16 @@ public sealed class DirectLinkServer : IDisposable
         catch (Exception ex)
         {
             _log.Warn($"P2P 直连发送失败，回落到中继：{ex.Message}");
+            // 【2026-10-09 反震荡】主控端侧的直连探测/重建逻辑不稳时会出现"建立→秒断→再建"横跳，
+            // 每次切换都伴随码流重建，主控端画面反复冻住（OG1H 现场 10 秒内断两次）。
+            // 发送失败后冷却 2 分钟：期间拒绝新直连握手，视频稳定走中继。
+            Interlocked.Exchange(ref _cooldownUntilTick, Environment.TickCount64 + 120_000);
             ClearViewer();
         }
     }
+
+    /// <summary>发送失败后的直连冷却截止时刻（TickCount64；之前拒绝新握手，防建立/断开横跳）</summary>
+    private long _cooldownUntilTick;
 
     private void ClearViewer()
     {

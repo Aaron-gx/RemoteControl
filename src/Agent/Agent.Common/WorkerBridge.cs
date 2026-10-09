@@ -106,18 +106,34 @@ public sealed class FrameChannel : IDisposable
 /// 旧实现里管道读写各自单线程，消息处理器天然串行、永不被发送方阻塞；
 /// 沿用同样的模型，WorkerContext / CoordinatorApp 两侧的处理器就**完全不需要考虑并发**，
 /// 与合并前的行为逐点一致。队列 2048 深 + DropOldest 也与旧 IpcClient/IpcServer 相同。
+///
+/// 【2026-10-09 真机事故加固】WIN-VSAQ 现场：toWorker 泵在一次 dispatch 里卡死
+/// （鼠标/键盘/打开软件/剪贴板指令全部石沉大海，视频与状态照常流出——单方向死亡
+/// 极难察觉，主控端表现为"画面在动但点什么都没反应，软件也调不出来"）。
+/// 旧泵有两个致命点：① ReadAsync 抛非取消异常时 `catch { return; }` 让泵**永久静默死亡**；
+/// ② dispatch 卡死时无任何检测。现在：
+///   · 泵换成显式线程（栈可转储），每条消息带处理计时，>2s 记日志；
+///   · 看门狗线程盯"正在处理"的消息：>15s 判定卡死 → 转储卡死线程栈 → 重建通道换新泵
+///     （旧泵自然退出）→ 触发 PumpWedged 让上层硬重启引擎线程；
+///   · 任何泵退出（正常关闭除外）都记日志并自动重生。
 /// </summary>
 public sealed class WorkerBridge : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
-    private readonly Channel<ProtocolMessage> _toWorker =
-        Channel.CreateBounded<ProtocolMessage>(new BoundedChannelOptions(2048)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-        });
-    private readonly Channel<ProtocolMessage> _toCoordinator =
-        Channel.CreateBounded<ProtocolMessage>(new BoundedChannelOptions(2048)
+    // 通道可变：任一方向卡死后换新通道（旧通道 Complete，卡死的旧泵醒来即退出）
+    private Channel<ProtocolMessage> _toWorker = CreateChannel();
+    private Channel<ProtocolMessage> _toCoordinator = CreateChannel();
+    // 世代号：换泵后旧泵发现自己过时就退出，避免与新泵并发分发
+    private int _toWorkerGeneration;
+    private int _toCoordinatorGeneration;
+    // "正在分发"的现场（0/空 = 空闲）：看门狗据此判定卡死（两个方向各一份）
+    private long _inflightSinceTick;
+    private volatile ProtocolMessage? _inflightMessage;
+    private long _inflightToCoordSinceTick;
+    private volatile ProtocolMessage? _inflightToCoordMessage;
+
+    private static Channel<ProtocolMessage> CreateChannel()
+        => Channel.CreateBounded<ProtocolMessage>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
@@ -135,33 +151,183 @@ public sealed class WorkerBridge : IDisposable
     /// <summary>Worker 引擎线程上线 / 退出（取代旧 IpcServer 的管道连接/断开事件）</summary>
     public event Action? WorkerConnected;
     public event Action<string>? WorkerDisconnected;
+    /// <summary>泵自身的诊断日志（卡死转储/换泵/重生）。两侧 Logger 各自订阅，谁活着谁记。</summary>
+    public event Action<string>? PumpLog;
+    /// <summary>toWorker 分发卡死（已换新泵之后触发）。上层应转储引擎线程栈并硬重启引擎。</summary>
+    public event Action? PumpWedged;
+
+    private static void TryRaise(Action<string>? evt, string text)
+    {
+        try { evt?.Invoke(text); } catch { }
+    }
 
     public WorkerBridge(int frameBufferBytes = 4 * 1024 * 1024)
     {
         Frames = new FrameChannel(frameBufferBytes);
-        _ = Task.Run(() => PumpAsync(_toWorker, _cts.Token, msg => MessageFromCoordinator?.Invoke(msg), workerSide: true));
-        _ = Task.Run(() => PumpAsync(_toCoordinator, _cts.Token, msg =>
-        {
-            if (msg.Type == MessageType.Heartbeat) return;   // 旧 IpcServer 也会滤掉心跳
-            MessageFromWorker?.Invoke(msg);
-        }, workerSide: false));
+        StartToWorkerPump(initial: true);
+        StartToCoordinatorPump();
+        // 看门狗：独立线程，5s 一巡。两个方向谁"正在处理"超时就地处置。
+        var wd = new Thread(WatchdogLoop) { IsBackground = true, Name = "bridge-watchdog" };
+        wd.Start();
     }
 
-    private async Task PumpAsync(Channel<ProtocolMessage> ch, CancellationToken ct, Action<ProtocolMessage> dispatch, bool workerSide)
+    // ---------------------------------------------------------------- 泵实现
+
+    private void StartToWorkerPump(bool initial)
     {
-        while (!ct.IsCancellationRequested)
+        var t = new Thread(ToWorkerPumpLoop) { IsBackground = true, Name = "bridge-to-worker" };
+        t.Start();
+        if (!initial)
+            TryRaise(PumpLog, "toWorker 泵已重建（新通道 + 新线程），控制指令恢复投递");
+    }
+
+    private void StartToCoordinatorPump()
+    {
+        var t = new Thread(ToCoordinatorPumpLoop) { IsBackground = true, Name = "bridge-to-coord" };
+        t.Start();
+    }
+
+    /// <summary>同步读泵（专用线程，续 await 跳线程的问题不存在；WaitToReadAsync 超时醒来便于检查世代号）</summary>
+    private void ToWorkerPumpLoop()
+    {
+        int myGeneration = Volatile.Read(ref _toWorkerGeneration);
+        var ch = _toWorker;
+        while (!_cts.IsCancellationRequested && myGeneration == Volatile.Read(ref _toWorkerGeneration))
         {
             ProtocolMessage msg;
-            try { msg = await ch.Reader.ReadAsync(ct); }
-            catch (OperationCanceledException) { return; }
-            catch { return; }
-            try { dispatch(msg); }
-            catch (Exception)
+            try
             {
-                // 与旧实现一致：单条消息处理失败只记日志不中断通道（这里没有 Logger 引用，静默吞掉；
-                // 真正的处理方（WorkerContext/CoordinatorApp）自己有 try/catch 记日志）
+                if (!ch.Reader.TryRead(out msg))
+                {
+                    var wait = ch.Reader.WaitToReadAsync(_cts.Token).AsTask();
+                    if (!wait.Wait(1000))
+                        continue;   // 周期醒来核对世代号（可能已被看门狗换掉）
+                    if (!ch.Reader.TryRead(out msg))
+                        continue;
+                }
             }
+            catch (OperationCanceledException) { return; }
+            catch
+            {
+                // 通道被看门狗 Complete 换新（ChannelClosedException）属预期；其余也只在日志里留痕
+                return;
+            }
+
+            _inflightMessage = msg;
+            _inflightSinceTick = Environment.TickCount64;
+            long start = _inflightSinceTick;
+            try { MessageFromCoordinator?.Invoke(msg); }
+            catch (Exception ex)
+            {
+                // 与旧实现一致：单条消息处理失败不中断通道；异常文本交给日志（不再静默吞）
+                TryRaise(PumpLog, $"Worker 消息处理异常（{msg.Type}）：{ex.GetType().Name}: {ex.Message}");
+            }
+            finally { _inflightMessage = null; }
+            long cost = Environment.TickCount64 - start;
+            if (cost > 2000)
+                TryRaise(PumpLog, $"⚠ Worker 消息 {msg.Type} 处理耗时 {cost / 1000.0:F1}s（>2s，疑似卡顿源）");
         }
+    }
+
+    private void ToCoordinatorPumpLoop()
+    {
+        int myGeneration = Volatile.Read(ref _toCoordinatorGeneration);
+        var ch = _toCoordinator;
+        while (!_cts.IsCancellationRequested && myGeneration == Volatile.Read(ref _toCoordinatorGeneration))
+        {
+            ProtocolMessage msg;
+            try
+            {
+                if (!ch.Reader.TryRead(out msg))
+                {
+                    var wait = ch.Reader.WaitToReadAsync(_cts.Token).AsTask();
+                    if (!wait.Wait(1000))
+                        continue;
+                    if (!ch.Reader.TryRead(out msg))
+                        continue;
+                }
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex)
+            {
+                TryRaise(PumpLog, $"toCoordinator 泵异常退出（{ex.GetType().Name}: {ex.Message}），1s 后重生");
+                Thread.Sleep(1000);
+                StartToCoordinatorPump();
+                return;
+            }
+            _inflightToCoordMessage = msg;
+            _inflightToCoordSinceTick = Environment.TickCount64;
+            long start = _inflightToCoordSinceTick;
+            try
+            {
+                if (msg.Type == MessageType.Heartbeat) continue;   // 旧 IpcServer 也会滤掉心跳
+                MessageFromWorker?.Invoke(msg);
+            }
+            catch (Exception ex)
+            {
+                TryRaise(PumpLog, $"Coordinator 消息处理异常（{msg.Type}）：{ex.GetType().Name}: {ex.Message}");
+            }
+            finally { _inflightToCoordMessage = null; }
+            long cost = Environment.TickCount64 - start;
+            if (cost > 2000)
+                TryRaise(PumpLog, $"⚠ Coordinator 消息 {msg.Type} 处理耗时 {cost / 1000.0:F1}s（>2s，疑似卡顿源）");
+        }
+    }
+
+    // ---------------------------------------------------------------- 看门狗
+
+    /// <summary>一条消息允许的最长处理时间；超时视为泵卡死（换泵 + 上层硬重启引擎）。测试可调短。</summary>
+    public int DispatchStallMs { get; set; } = 15_000;
+
+    private void WatchdogLoop()
+    {
+        bool workerWedgedReported = false, coordWedgedReported = false;
+        while (!_cts.IsCancellationRequested)
+        {
+            try { Thread.Sleep(5000); } catch { return; }
+
+            // toCoordinator 方向：卡死只换泵（协调器处理器在新泵上继续跑），不动引擎
+            var coordMsg = _inflightToCoordMessage;
+            if (coordMsg == null) coordWedgedReported = false;
+            else if (!coordWedgedReported &&
+                     Environment.TickCount64 - Volatile.Read(ref _inflightToCoordSinceTick) >= DispatchStallMs)
+            {
+                coordWedgedReported = true;
+                var dump = $"⚠⚠ toCoordinator 泵卡死（正在处理 {coordMsg.Type}），换新泵继续投递\n";
+                TryRaise(PumpLog, dump);
+                Interlocked.Increment(ref _toCoordinatorGeneration);
+                var oldCoord = _toCoordinator;
+                _toCoordinator = CreateChannel();
+                try { oldCoord.Writer.TryComplete(); } catch { }
+                StartToCoordinatorPump();
+            }
+
+            // toWorker 方向：卡死换泵（立刻恢复控制投递）+ 上层硬重启引擎
+            var msg = _inflightMessage;
+            if (msg == null) { workerWedgedReported = false; continue; }
+            long stuckMs = Environment.TickCount64 - Volatile.Read(ref _inflightSinceTick);
+            if (stuckMs < DispatchStallMs || workerWedgedReported) continue;
+            workerWedgedReported = true;
+
+            var dump2 = $"⚠⚠ toWorker 泵卡死 {stuckMs / 1000.0:F0}s（正在处理 {msg.Type}，负载前 80 字节=" +
+                        Convert.ToHexString(msg.Payload is { Length: > 0 } ? msg.Payload[..Math.Min(80, msg.Payload.Length)] : Array.Empty<byte>()) +
+                        "）。已换新泵；请拿消息类型对照 OnMessage 各 case 排查该处理器里的阻塞调用。\n";
+            TryRaise(PumpLog, dump2);
+
+            // 1) 先换通道换泵：不等引擎重启，控制指令立刻恢复投递
+            RespawnToWorkerPump();
+            // 2) 再通知上层：转储引擎 STA 线程栈 + 请求硬重启引擎（清掉可能同样卡死的钩子/钩宿主）
+            try { PumpWedged?.Invoke(); } catch { }
+        }
+    }
+
+    private void RespawnToWorkerPump()
+    {
+        Interlocked.Increment(ref _toWorkerGeneration);
+        var old = _toWorker;
+        _toWorker = CreateChannel();
+        try { old.Writer.TryComplete(); } catch { }
+        StartToWorkerPump(initial: false);
     }
 
     /// <summary>Coordinator → Worker（原 IpcServer.Send）</summary>
@@ -179,6 +345,9 @@ public sealed class WorkerBridge : IDisposable
         // 清掉引擎掉线期间积压的旧指令（键鼠/打开软件）：旧管道架构里这些消息会因"管道未连接"直接丢弃，
         // 不清的话会把过期输入投给重启后的新引擎（比如突然打开一个几分钟前点过的程序）。
         while (_toWorker.Reader.TryRead(out _)) { }
+        // 引擎重启伴随换泵：新引擎从头开始，旧泵（若仍卡着）彻底退休
+        Interlocked.Increment(ref _toWorkerGeneration);
+        StartToWorkerPump(initial: true);   // 接管现有通道的全新世代（旧泵醒来即退）
         try { WorkerConnected?.Invoke(); } catch { }
     }
 

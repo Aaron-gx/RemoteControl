@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.13";
+    public const string Version = "1.5.14";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -98,6 +98,11 @@ public sealed class WorkerContext : ApplicationContext
     private long _lastVddRestartTick;
     private long _nextTopoCheckMs;
     private long _topoFailBackoffMs = 30_000;
+    /// <summary>虚拟外屏缺位（驱动故障/被拔）：置位期间**暂停出帧**，绝不把物理屏当外屏拍（2026-10-09 隐私事故）</summary>
+    private bool _virtualMissing;
+    private long _nextVirtualMissingReportMs;
+    /// <summary>最近一次见过的虚拟外屏设备名：缺位看护按它找回设备（_virtualScreen 会被回退成物理屏，名字会丢）</summary>
+    private string _virtualDeviceName = "";
     /// <summary>最近一次健康显示布局的快照（config\display-layout.json）</summary>
     private static string DisplayLayoutPath =>
         Path.Combine(AppContext.BaseDirectory, "config", "display-layout.json");
@@ -304,6 +309,20 @@ public sealed class WorkerContext : ApplicationContext
         var monitors = DisplayHelper.GetMonitors();
         if (monitors.Count == 0) return null;
         _virtualScreen = DisplayHelper.PickCaptureTarget();
+        // 【2026-10-09 隐私事故】"仅副屏"模式下虚拟外屏缺位（VDD 故障/被系统移除）时，
+        // PickCaptureTarget 会退回物理主屏 —— 绝不能把物理屏当成外屏拍下去：
+        // 现场后果是主控端直接看到本机用户屏幕（那次看到的是人家正在打的游戏），
+        // 而且远端开的窗口全部落到物理屏上。置 _virtualMissing：采集循环暂停出帧并
+        // 周期性向主控端报错，拓扑巡检照常自愈（pnputil 拉回 VDD），副屏回来即自动恢复。
+        bool wasMissing = _virtualMissing;
+        _virtualMissing = _cfg.EnableVirtualDisplay && _captureMode == CaptureMode.VirtualOnly
+                          && _virtualScreen is not { IsVirtual: true };
+        // 记住虚拟屏设备名：缺位期间 _virtualScreen 会被回退成物理屏，看护要靠名字找回设备
+        if (_virtualScreen is { IsVirtual: true })
+            _virtualDeviceName = _virtualScreen.DeviceName;
+        if (_virtualMissing && !wasMissing)
+            _log.Error("虚拟外屏缺位（VDD 故障或被移除）：暂停出帧保护本机用户屏幕，自愈进行中；" +
+                       "主控端将看到暂停提示而非物理屏画面");
         if (_captureMode == CaptureMode.PrimaryOnly)
         {
             var primary = monitors.FirstOrDefault(m => m.IsPrimary) ?? monitors[0];
@@ -432,11 +451,44 @@ public sealed class WorkerContext : ApplicationContext
                             }
                         }
                     }
+                    else if (_virtualMissing)
+                    {
+                        // 【2026-10-09 修复】外屏缺位看护：_virtualScreen 已被回退成物理屏，
+                        // 上面那段（含 pnputil 自愈）全被跳过 —— VSAQ 现场虚拟屏就此一去不回。
+                        // 按记住的设备名继续找：回来了就重建采集；还缺着就照旧 pnputil 拉驱动（节流）。
+                        var cur = DisplayHelper.GetMonitors()
+                            .FirstOrDefault(m => m.DeviceName == _virtualDeviceName);
+                        if (cur != null)
+                        {
+                            _log.Info($"虚拟外屏 {_virtualDeviceName} 已恢复，重建采集");
+                            _needCaptureSwitch = true;
+                        }
+                        else if (topoNow - _lastVddRestartTick > 600_000)
+                        {
+                            _lastVddRestartTick = topoNow;
+                            DisplayHelper.TryRestartVirtualDisplayDriver(_cfg.VirtualDisplayDriverId,
+                                msg => _log.Info(msg));
+                        }
+                    }
                 }
                 if (_needStreamReset)
                 {
                     _needStreamReset = false;
                     RestartEncoder("请求重建码流");
+                }
+                // 【2026-10-09 隐私事故】虚拟外屏缺位：暂停出帧（绝不把物理屏当外屏拍），
+                // 每 10s 向主控端报一次错。拓扑巡检在上方照常自愈，副屏回来自动恢复。
+                if (_virtualMissing)
+                {
+                    if (sw.ElapsedMilliseconds >= _nextVirtualMissingReportMs)
+                    {
+                        _nextVirtualMissingReportMs = sw.ElapsedMilliseconds + 10_000;
+                        _log.Warn("虚拟外屏缺位：暂停出帧（保护本机用户屏幕），自愈进行中");
+                        _bridge.SendToCoordinator(new ProtocolMessage(MessageType.Error,
+                            PayloadCodec.EncodeText("虚拟外屏丢失，画面暂停；正在自动恢复，请稍候重试")));
+                    }
+                    Thread.Sleep(500);
+                    continue;
                 }
                 // 没人看就别烧机器：主控端全部断开 ≥10 秒后暂停采集与编码。
                 // 被控端在客户机上 7x24 挂着，无人观看还全程跑 WGC+ffmpeg，
@@ -846,6 +898,17 @@ public sealed class WorkerContext : ApplicationContext
                     }
                 }
                 _log.Info($"收到打开软件指令：{exe} {args}");
+                // 【2026-10-09 隐私事故】虚拟外屏缺位时拒绝启动：此时"外屏坐标"就是物理屏坐标，
+                // 窗口会直接出现在本机用户眼前（现场：远端点开微信，微信弹在人家游戏旁边）。
+                // 拒绝并把原因说给主控端，而不是把窗口开到物理屏上。
+                if (_cfg.EnableVirtualDisplay && _virtualScreen is not { IsVirtual: true })
+                {
+                    _log.Warn($"打开软件被拒绝（{exe}）：虚拟外屏缺位，窗口会落到物理屏上");
+                    SendSoftwareState(exe, -1, false);
+                    _bridge.SendToCoordinator(new ProtocolMessage(MessageType.Error,
+                        PayloadCodec.EncodeText("虚拟外屏未就绪，暂不能打开软件；正在自动恢复，请稍候重试")));
+                    break;
+                }
                 // 「此电脑」（主控端软件列表置顶项）：在资源管理器里打开，窗口摆到外屏
                 int pid = string.Equals(exe, WindowManager.ThisPcMarker, StringComparison.OrdinalIgnoreCase)
                     ? _windows.OpenThisPC()
@@ -926,6 +989,19 @@ public sealed class WorkerContext : ApplicationContext
                 _log.Debug($"忽略消息 0x{(byte)msg.Type:X2}");
                 break;
         }
+    }
+
+    /// <summary>
+    /// 看门狗硬重启入口（2026-10-09）：给引擎 STA 线程投 WM_QUIT。
+    /// 与 Stop 指令同一条路，但可从协调器/桥看门狗直接调用——分发线程卡死时
+    /// 消息进不来，必须有人从外面踢门。线程若卡在钩子回调里收不到消息，
+    /// WM_QUIT 会排队等它回来，栈转储已先落在日志里。
+    /// </summary>
+    public void RequestHardExit()
+    {
+        _log.Warn("收到硬退出请求（泵看门狗/状态断流监视）：投 WM_QUIT 给引擎线程");
+        _stop = true;
+        NativeApi.PostThreadMessage(_staThreadId, NativeApi.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
     }
 
     /// <summary>
