@@ -93,6 +93,36 @@ public sealed class DirectLinkServer : IDisposable
         // 被控端以管理员运行，netsh 可用；失败只记日志不影响其它功能。
         _ = Task.Run(() => EnsureFirewallRule());
 
+        // 【2026-10-10】UPnP 失败后每 10 分钟重试：路由器重启/晚开 UPnP/换网络后，
+        // 只在启动试一次就意味着跨网直连永远没机会（公网候选一直是 null，视频永远绕中继——
+        // 中继 RTT~170ms 是"卡"的主源）。发现逻辑已重写（多网卡+网关单播+IGD:2），命中率高得多。
+        _ = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                try { await Task.Delay(TimeSpan.FromMinutes(10), _cts.Token); } catch { return; }
+                if (_upnp.Mapped || !string.IsNullOrEmpty(PublicAddress)) continue;
+                try
+                {
+                    if (_upnp.TryMap(Port, _log))
+                    {
+                        var ip = _upnp.ExternalIP;
+                        if (!string.IsNullOrEmpty(ip))
+                        {
+                            PublicAddress = $"{ip}:{_upnp.ExternalPort}";
+                            _log.Info($"P2P 公网候选（重试成功）：{PublicAddress}——跨网主控端可直连，" +
+                                      "绕开中继（降延迟、免高峰拥塞）");
+                        }
+                    }
+                    else
+                    {
+                        _log.Debug("UPnP 重试未成功（路由器未开 UPnP？多试无妨，10 分钟后再来）");
+                    }
+                }
+                catch (Exception ex) { _log.Debug($"UPnP 重试异常：{ex.Message}"); }
+            }
+        });
+
         // UPnP 自动映射（失败不影响中继可用）
         if (_cfg.UpnpEnabled)
         {
@@ -153,6 +183,8 @@ public sealed class DirectLinkServer : IDisposable
 
     /// <summary>防火墙放行规则名（产品对外名称用"虚拟服务器"，不出现敏感字样）</summary>
     private const string FirewallRuleName = "虚拟服务器 P2P 直连";
+    /// <summary>程序级入站放行规则名：UPnP 的 SSDP 应答（UDP）靠它进来，TCP 直连也顺带覆盖</summary>
+    private const string FirewallProgramRuleName = "虚拟服务器 网络通信";
 
     private void EnsureFirewallRule()
     {
@@ -188,6 +220,38 @@ public sealed class DirectLinkServer : IDisposable
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
                 p?.WaitForExit(10000);
                 _log.Info($"P2P 直连：已自加防火墙入站放行规则（TCP {Port}）→ {(output.Trim())}");
+            }
+
+            // 程序级放行（幂等同上）：UPnP 发现靠组播/单播 UDP 的**应答**进来，
+            // 防火墙对无名程序的这类入站默认拦——不放行则 SSDP 永远收不到应答（"UPnP 不可用"的主因之一）
+            var checkProg = new System.Diagnostics.ProcessStartInfo("netsh",
+                $"advfirewall firewall show rule name=\"{FirewallProgramRuleName}\"")
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+            };
+            using (var p = System.Diagnostics.Process.Start(checkProg))
+            {
+                var output = p?.StandardOutput.ReadToEnd() ?? "";
+                p?.WaitForExit(10000);
+                if (output.Contains("Rule Name", StringComparison.OrdinalIgnoreCase) ||
+                    output.Contains("规则名称", StringComparison.Ordinal))
+                    return;
+            }
+            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(exe)) return;
+            var addProg = new System.Diagnostics.ProcessStartInfo("netsh",
+                $"advfirewall firewall add rule name=\"{FirewallProgramRuleName}\" dir=in action=allow " +
+                $"program=\"{exe}\"")
+            {
+                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+            };
+            using (var p2 = System.Diagnostics.Process.Start(addProg))
+            {
+                var output = p2?.StandardOutput.ReadToEnd() ?? "";
+                p2?.WaitForExit(10000);
+                _log.Info($"UPnP：已自加程序级入站放行（{FirewallProgramRuleName}）→ {(output.Trim())}");
             }
         }
         catch (Exception ex)
