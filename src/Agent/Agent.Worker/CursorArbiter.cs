@@ -270,6 +270,19 @@ public sealed class CursorArbiter : IDisposable
                 _lastPhysicalSource = $"mouse-armed ({ms.pt.X},{ms.pt.Y}) flags=0x{ms.flags:X} extra=0x{ms.dwExtraInfo.ToInt64():X}";
             }
 
+            // 【2026-10-10 鼠标被拽回根治】任何**软件注入**的移动（含我们自己的——标记可能被
+            // 钩子链上的其它软件改写/剥掉）都绝不是"本机用户的手"，一律放行、绝不触发归还。
+            // 旧逻辑只认 InjectTag：GameViewer 等在钩子链上改写 extraInfo 后，我们自己注入的
+            // 移动被误判成"本机用户上手"，随即被 SetCursorPos 拽回物理屏 + 事件被吃掉——
+            // 远端鼠标进不了副屏（实测光标钉死在归还点）、拖拽每一步全被吞（现场"鼠标不行"根因）。
+            // 人手事件永远没有注入位，物理保护不受影响。
+            if (NativeApi.IsSoftwareInjected(ms.flags))
+            {
+                if (IsOnVirtual(ms.pt.X, ms.pt.Y)) { _seenX = ms.pt.X; _seenY = ms.pt.Y; }
+                else { _seenX = _physX = ms.pt.X; _seenY = _physY = ms.pt.Y; }
+                return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            }
+
             if (!IsOnVirtual(ms.pt.X, ms.pt.Y))
             {
                 _seenX = _physX = ms.pt.X;
