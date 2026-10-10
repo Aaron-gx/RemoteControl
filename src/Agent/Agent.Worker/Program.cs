@@ -29,7 +29,7 @@ public sealed class WorkerContext : ApplicationContext
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
     /// </summary>
-    public const string Version = "1.5.19";
+    public const string Version = "1.5.20";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -803,7 +803,7 @@ public sealed class WorkerContext : ApplicationContext
             {
                 Interlocked.Exchange(ref _lastRemoteInputTick, Environment.TickCount64);
                 var (x, y) = PayloadCodec.DecodeMouseMove(msg.Payload);
-                RunOnInputThread("MouseMove", () => _router?.Move(x, y));
+                QueueCoalescedMove(x, y);
                 break;
             }
             case MessageType.MouseButton:
@@ -1154,6 +1154,41 @@ public sealed class WorkerContext : ApplicationContext
         var q = _inputQueue;
         if (q == null) return;
         q.Writer.TryWrite((what, work));
+    }
+
+    /// <summary>
+    /// 【2026-10-10 拖拽修复】鼠标移动**合并**：主控端以 60~125Hz 发移动事件，串行注入跟不上时
+    /// 队列越积越旧——表现为"整个画面慢一拍"、拖拽时抬起都发生了光标还没走到位（拖拽落点全错）。
+    /// 远程桌面的标准做法：移动事件永远只注入**最新**坐标，中间的过期点直接丢（视觉无差别，
+    /// 光标轨迹本来就画不过来）；按下/抬起/滚轮/键盘仍走队列严格保序。
+    /// 实现：最新坐标存槽位；队列里最多只有一个"移动槽"，处理时取槽内最新值。
+    /// </summary>
+    private readonly object _moveGate = new();
+    private int _latestMoveX, _latestMoveY;
+    private bool _moveSlotQueued;
+
+    private void QueueCoalescedMove(int x, int y)
+    {
+        lock (_moveGate)
+        {
+            _latestMoveX = x;
+            _latestMoveY = y;
+            if (_moveSlotQueued) return;     // 队列里已有移动槽：更新最新坐标即可，过期点自然作废
+            _moveSlotQueued = true;
+        }
+        var q = _inputQueue;
+        if (q == null) { lock (_moveGate) _moveSlotQueued = false; return; }
+        q.Writer.TryWrite(("MouseMove", () =>
+        {
+            int mx, my;
+            lock (_moveGate)
+            {
+                mx = _latestMoveX;
+                my = _latestMoveY;
+                _moveSlotQueued = false;
+            }
+            _router?.Move(mx, my);
+        }));
     }
 
     private void StartInputThread()

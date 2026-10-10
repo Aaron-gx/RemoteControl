@@ -64,6 +64,7 @@ public sealed class RemoteScreenControl : Image
         MouseEnter += (_, _) => { _capturingMouse = true; Focus(); };
         MouseLeave += (_, _) => { _capturingMouse = false; };
         Loaded += (_, _) => Focus();
+        EnsureMoveFlush();   // 移动限频的补发定时器（2026-10-10 拖拽/跟手）
     }
 
     public int RemoteWidth => _remoteWidth;
@@ -261,7 +262,47 @@ public sealed class RemoteScreenControl : Image
         if (!TryMapPoint(p, out int x, out int y)) return;
         SetCursor(x, y);                                         // 本地光标显示保留
         if (InReadOnlyRegion(x, y)) return;                     // 只读区域：移动不转发到被控端
-        RemoteMouseMove?.Invoke(x, y);
+        // 【2026-10-10 拖拽/跟手】移动事件限频：WPF 以显示刷新率触发（60~125Hz），照单全发会在
+        // 慢链路上挤成一串过期小消息，被控端注入跟不上=画面"慢一拍"、拖拽落点漂移。
+        // 8ms 内只保留最新点，到点补发——配合被控端的移动合并，拖拽轨迹始终新鲜。
+        long now = Environment.TickCount64;
+        if (now - _lastMoveSent >= 8)
+        {
+            _lastMoveSent = now;
+            _pendingMove = null;
+            RemoteMouseMove?.Invoke(x, y);
+        }
+        else
+        {
+            _pendingMove = (x, y);
+            _moveFlush?.Stop();
+            _moveFlush?.Start();
+        }
+    }
+
+    private long _lastMoveSent;
+    private (int x, int y)? _pendingMove;
+    private System.Windows.Threading.DispatcherTimer? _moveFlush;
+
+    /// <summary>限频补发：8ms 窗口内积攒的最新移动点，由定时器到点发出</summary>
+    private void EnsureMoveFlush()
+    {
+        if (_moveFlush != null) return;
+        _moveFlush = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(8),
+        };
+        _moveFlush.Tick += (_, _) =>
+        {
+            _moveFlush!.Stop();
+            var m = _pendingMove;
+            _pendingMove = null;
+            if (m != null)
+            {
+                _lastMoveSent = Environment.TickCount64;
+                RemoteMouseMove?.Invoke(m.Value.x, m.Value.y);
+            }
+        };
     }
 
     protected override void OnMouseDown(MouseButtonEventArgs e)
