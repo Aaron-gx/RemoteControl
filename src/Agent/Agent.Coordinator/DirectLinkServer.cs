@@ -190,7 +190,8 @@ public sealed class DirectLinkServer : IDisposable
     {
         try
         {
-            // 已有同名规则就不再加（netsh add 不会去重，重复加会堆积）
+            // TCP 端口规则（幂等：已存在就不重复加——netsh add 不会去重，重复加会堆积）
+            bool tcpRuleExists = false;
             var check = new System.Diagnostics.ProcessStartInfo("netsh",
                 $"advfirewall firewall show rule name=\"{FirewallRuleName}\"")
             {
@@ -201,22 +202,23 @@ public sealed class DirectLinkServer : IDisposable
             {
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
                 p?.WaitForExit(10000);
-                if (output.Contains("Rule Name", StringComparison.OrdinalIgnoreCase) ||
-                    output.Contains("规则名称", StringComparison.Ordinal))
-                {
-                    _log.Info($"P2P 直连：防火墙规则已存在（{FirewallRuleName}）");
-                    return;
-                }
+                tcpRuleExists = output.Contains("Rule Name", StringComparison.OrdinalIgnoreCase) ||
+                                output.Contains("规则名称", StringComparison.Ordinal);
             }
-            var add = new System.Diagnostics.ProcessStartInfo("netsh",
-                $"advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow " +
-                $"protocol=TCP localport={Port}")
+            if (tcpRuleExists)
             {
-                RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
-                StandardOutputEncoding = System.Text.Encoding.UTF8,
-            };
-            using (var p = System.Diagnostics.Process.Start(add))
+                _log.Info($"P2P 直连：防火墙规则已存在（{FirewallRuleName}）");
+            }
+            else
             {
+                var add = new System.Diagnostics.ProcessStartInfo("netsh",
+                    $"advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow " +
+                    $"protocol=TCP localport={Port}")
+                {
+                    RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
+                    StandardOutputEncoding = System.Text.Encoding.UTF8,
+                };
+                using var p = System.Diagnostics.Process.Start(add);
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
                 p?.WaitForExit(10000);
                 _log.Info($"P2P 直连：已自加防火墙入站放行规则（TCP {Port}）→ {(output.Trim())}");
