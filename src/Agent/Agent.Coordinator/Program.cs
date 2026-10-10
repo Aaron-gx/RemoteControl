@@ -157,7 +157,7 @@ public sealed class CoordinatorApp : IDisposable
         _uploader = new FileUploader(_cfg, _log);
         _direct = new DirectLinkServer(_cfg, _log);
         _license = new LicenseGate(Path.Combine(AppContext.BaseDirectory, "config", "license.cache.json"), _log);
-        _updater = new Updater(_cfg, _log, () => HasViewer);
+        _updater = new Updater(_cfg, _log, () => HasViewer, () => _relay.IsConnected);   // 断网不应用（2026-10-09 事故）
         // 直连握手先过授权闸门：授权不可用时不允许任何人通过 P2P 接进来
         _direct.LicenseCheck = () => _license.IsUsable && _cfg.DirectLinkEnabled;
     }

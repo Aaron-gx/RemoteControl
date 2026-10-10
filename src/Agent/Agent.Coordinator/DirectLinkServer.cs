@@ -116,29 +116,6 @@ public sealed class DirectLinkServer : IDisposable
                 }
                 catch (Exception ex) { _log.Debug($"UPnP 异常：{ex.Message}"); }
             });
-            // 【2026-10-09】UPnP 失败后每 10 分钟重试一次：路由器重启/晚开 UPnP/换网络后，
-            // 只在启动试一次就意味着跨网直连永远没机会（公网候选一直是 null，视频永远绕中继）。
-            _ = Task.Run(async () =>
-            {
-                while (!_cts.IsCancellationRequested)
-                {
-                    try { await Task.Delay(TimeSpan.FromMinutes(10), _cts.Token); } catch { return; }
-                    if (_upnp.Mapped || !string.IsNullOrEmpty(PublicAddress)) continue;
-                    try
-                    {
-                        if (_upnp.TryMap(Port, _log))
-                        {
-                            var ip = _upnp.ExternalIP;
-                            if (!string.IsNullOrEmpty(ip))
-                            {
-                                PublicAddress = $"{ip}:{_upnp.ExternalPort}";
-                                _log.Info($"P2P 公网候选（重试成功）：{PublicAddress}——跨网主控端可直连");
-                            }
-                        }
-                    }
-                    catch (Exception ex) { _log.Debug($"UPnP 重试异常：{ex.Message}"); }
-                }
-            });
         }
         return true;
     }

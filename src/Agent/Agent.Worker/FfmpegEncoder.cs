@@ -160,14 +160,24 @@ public sealed class FfmpegEncoder : IDisposable
         catch { return false; }
     }
 
-    /// <summary>每个编码器的专属参数（实跑与探测共用同一份，保证"探测过=实跑能用"）</summary>
+    /// <summary>
+    /// 每个编码器的专属参数（实跑与探测共用同一份，保证"探测过=实跑能用"）。
+    /// 【2026-10-10 显卡调优】围绕"卡"的三处调整：
+    ///  · nvenc：p1→p3。p1 是最差画质档（运动画面糊成块，观感就是"卡"）；
+    ///    p3 仍属快档（NVENC 编 1080p30 余量巨大），画质明显改善，-tune ull 保住低延迟。
+    ///  · amf：speed→balanced，同理；-usage lowlatency 保留。
+    ///  · qsv（含 Arc）：去掉 -low_power 1。low_power（VDENC 直通路径）在 Arc 独显上
+    ///    兼容性差、码控不稳；普通 VME 路径全平台稳定、画质更好；-async_depth 1 压低内部缓冲。
+    /// </summary>
     private static string EncoderExtraArgs(string encoder) => encoder switch
     {
         "libx264"  => "-preset ultrafast -tune zerolatency -profile:v baseline -level 4.0 " +
                       "-x264-params \"scenecut=0:rc-lookahead=0:sync-lookahead=0:repeat-headers=1\" ",
-        "h264_nvenc" => "-preset p1 -tune ull -rc cbr -zerolatency 1 -profile:v baseline -delay 0 ",
-        "h264_qsv"  => "-preset veryfast -profile:v baseline -low_power 1 ",
-        "h264_amf"  => "-quality speed -usage lowlatency -rc cbr -profile:v baseline ",
+        "h264_nvenc" => "-preset p3 -tune ull -rc cbr -zerolatency 1 -profile:v baseline -delay 0 ",
+        "h264_qsv"  => "-preset veryfast -profile:v baseline -async_depth 1 ",
+        // 【A 卡从未用上硬编码的根因】h264_amf 的 profile 只认数字（66=baseline），
+        // 写 "baseline" 会解析失败 → 探测不过 → 一直静默退到 CPU 软编码（更慢更卡）。
+        "h264_amf"  => "-quality balanced -usage lowlatency -rc cbr -profile:v 66 ",
         _ => "-profile:v baseline ",
     };
 
@@ -222,7 +232,10 @@ public sealed class FfmpegEncoder : IDisposable
         // GOP 收到 1 秒：一是主控端刚接入/刚重置时能很快等到关键帧，二是丢块之后
         // 最多 1 秒就能靠下一个关键帧自愈（慢链路上 GOP 太长会让画面一直起不来）。
         int gop = Math.Max(1, _fps);
-        sb.Append($"-b:v {_kbps}k -maxrate {_kbps}k -bufsize {_kbps * 2}k ");
+        // 【2026-10-10 延迟调优】bufsize 从 2 秒压到 0.5 秒：CBR 的平滑缓冲越大，编码器
+        // 攒帧越久（最坏顶着 bufsize 的延迟出帧）——远程操作要的是"立刻出"，不是码率平滑。
+        int bufK = Math.Max(200, _kbps / 2);
+        sb.Append($"-b:v {_kbps}k -maxrate {_kbps}k -bufsize {bufK}k ");
         sb.Append($"-g {gop} -keyint_min {gop} -sc_threshold 0 -pix_fmt yuv420p -bf 0 ");
         sb.Append("-flush_packets 1 -f h264 pipe:1");
         return sb.ToString();

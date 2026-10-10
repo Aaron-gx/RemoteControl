@@ -23,6 +23,7 @@ public sealed class Updater : IDisposable
     private readonly Logger _log;
     private readonly HttpClient _http;
     private readonly Func<bool> _hasViewer;
+    private readonly Func<bool>? _relayConnected;
     private readonly CancellationTokenSource _cts = new();
 
     /// <summary>状态一句话（供状态上报/日志排查）：无更新 / 已最新 / 下载中 / 待应用 / 已应用 / 失败:原因</summary>
@@ -40,11 +41,12 @@ public sealed class Updater : IDisposable
     /// <summary>某版本应用失败（回滚）的标记文件名模式：failed-{版本}.txt（24 小时内不再重试该版本）</summary>
     private string FailedPath(string ver) => Path.Combine(WorkDir, $"failed-{ver}.txt");
 
-    public Updater(AgentConfig cfg, Logger log, Func<bool> hasViewer)
+    public Updater(AgentConfig cfg, Logger log, Func<bool> hasViewer, Func<bool>? relayConnected = null)
     {
         _cfg = cfg;
         _log = log;
         _hasViewer = hasViewer;
+        _relayConnected = relayConnected;
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
     }
 
@@ -243,6 +245,15 @@ public sealed class Updater : IDisposable
                 _state = $"待应用 v{_stagedVersion}（有主控端在线，等空闲）";
                 return;
             }
+            // 【2026-10-09 事故】断网绝不应用：中继断开时 HasViewer 恒为 false（闸门形同虚设），
+            // 更新器会拿着盘上已有的包"盲应用"——新版本起不来时谁也看不见、回滚坏了谁也不知道，
+            // 现场 1.5.14 一路滑坡到 1.5.7。必须连着服务器（能看到世界）才允许动手。
+            if (_relayConnected != null && !_relayConnected())
+            {
+                _idleSince = DateTime.MinValue;
+                _state = $"待应用 v{_stagedVersion}（与服务器断开，恢复连接前不应用）";
+                return;
+            }
             if (_idleSince == DateTime.MinValue)
             {
                 _idleSince = DateTime.UtcNow;
@@ -294,6 +305,11 @@ public sealed class Updater : IDisposable
                   // SDK 投影与 WinRT 运行时（1.5.9 起热更包也带它们——回滚必须一起还原，
                   // 否则"旧业务 DLL + 新 SDK DLL"版本对不上，WGC 直接加载失败）
                   "Copy-Item \"$dir\\Microsoft.Windows.SDK.NET.dll\",\"$dir\\WinRT.Runtime.dll\" $bak -Force -ErrorAction SilentlyContinue;" +
+                  // 【2026-10-09 事故】备份非空校验：备份失败（DLL 被占用/杀毒拦截）时备份目录是空的，
+                  // 此时继续覆盖=一旦新版本起不来，回滚将无东西可还原 → 版本滑坡/残缺安装。
+                  // 备份不足 3 个 DLL 就地中止：重启当前版本，本轮放弃（不写失败标记——不是新版本的错）。
+                  "$bn=(Get-ChildItem $bak -Filter *.dll -ErrorAction SilentlyContinue | Measure-Object).Count;" +
+                  "if($bn -lt 3){Remove-Item $upd -Force -ErrorAction SilentlyContinue;Start-Process (Join-Path $dir 'Agent.Coordinator.exe') -WorkingDirectory $dir;exit 2};" +
                   // 解压重试 ×3：文件偶被杀毒/残留句柄占用，一次失败就回滚太脆
                   "$ok2=$false;for($i=0;$i -lt 3 -and -not $ok2;$i++){try{Expand-Archive $zip $dir -Force -ErrorAction Stop;$ok2=$true}catch{Start-Sleep 3}};" +
                   // 解压失败：回滚 + 记失败标记（24h 内不再重试该版本——否则每 15 分钟死一次）
