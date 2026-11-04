@@ -324,14 +324,16 @@ public sealed class Updater : IDisposable
         var scriptPath = Path.Combine(WorkDir, "apply.ps1");
         File.WriteAllText(scriptPath, ps.ToString(), System.Text.Encoding.UTF8);
 
-        var psi = new ProcessStartInfo("powershell.exe",
-            $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"")
+        // ArgumentList 逐参数传递（不经 shell 拼接，路径含空格也安全；2026-10-14 安全扫描整改）
+        var psi = new ProcessStartInfo("powershell.exe")
         {
             UseShellExecute = true,          // 分离：脚本独立于本进程存活（这是整个方案的关键之一）
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
             WorkingDirectory = WorkDir,
         };
+        foreach (var a in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath })
+            psi.ArgumentList.Add(a);
         _log.Info($"已启动更新应用脚本（v{version}）：停旧 → 备份 → 覆盖 → 启新 → 90 秒内未报平安自动回滚");
         Process.Start(psi);
     }

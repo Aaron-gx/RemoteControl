@@ -56,6 +56,10 @@ public sealed class CursorArbiter : IDisposable
     /// <summary>最近一次"物理输入"的来源描述（排障用：假信号到底是谁发的）</summary>
     private string _lastPhysicalSource = "";
     private long _snapBacks;
+    /// <summary>最近一次"光标归还给本机用户"（礼貌拽回物理屏）的时刻。
+    /// MouseRouter 的光标探针用它区分"自家仲裁器刚归还"与"别的程序真在抢光标"——
+    /// 前者绝不能触发降级锁定（2026-10-10"点不了/副屏废掉"根因，见 MouseRouter.ProbeCursor）</summary>
+    private long _lastReturnTick;
     private int _errors;
     private bool _disposed;
     /// <summary>会话级互斥体：保证一个会话只有一个仲裁器在装钩子（防止两份被控端互相抢光标）</summary>
@@ -63,6 +67,10 @@ public sealed class CursorArbiter : IDisposable
 
     public long LastPhysicalInputTick => Interlocked.Read(ref _lastPhysicalTick);
     public long SnapBackCount => Interlocked.Read(ref _snapBacks);
+
+    /// <summary>最近 ms 毫秒内是否执行过"光标归还"（本机用户上手、光标被从副屏拽回物理屏）</summary>
+    public bool ReturnedRecently(long ms = 1500)
+        => Environment.TickCount64 - Interlocked.Read(ref _lastReturnTick) < ms;
 
     /// <summary>本机用户最近是否在动手（鼠标或键盘）</summary>
     public bool LocalActiveRecently => LocalActiveWithin(IdleBeforeStolenFocusMs);
@@ -141,11 +149,56 @@ public sealed class CursorArbiter : IDisposable
         Armed = true;
         DisarmedByRival = false;
         Current = this;
+        // 归还/重放专职线程（2026-10-12 死锁根治，见 MouseProc 尾部注释）
+        if (_returnThread == null)
+        {
+            _returnSignal = new AutoResetEvent(false);
+            _returnThread = new Thread(ReturnLoop) { IsBackground = true, Name = "rc-cursor-return" };
+            _returnThread.Start();
+        }
         _log.Info($"光标仲裁已启用：外屏=({_virtLeft},{_virtTop})-({_virtRight},{_virtBottom})，" +
                   $"本机物理屏并集=({_physLeft},{_physTop})-({_physRight},{_physBottom})，" +
                   $"回车起点=({_physX},{_physY})");
         return true;
     }
+
+    // ---------------------------------------------------------------- 归还/重放专职线程
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(int msg, uint data, int tx, int ty)> _returnQueue = new();
+    private AutoResetEvent? _returnSignal;
+    private Thread? _returnThread;
+
+    /// <summary>在专职线程上执行"归还光标 + 重放本机用户的事件"。绝不在钩子回调内跑（死锁根源）。</summary>
+    private void ReturnLoop()
+    {
+        while (!_disposed)
+        {
+            try { _returnSignal?.WaitOne(500); } catch { }
+            while (_returnQueue.TryDequeue(out var it))
+            {
+                try
+                {
+                    NativeApi.SetCursorPos(it.tx, it.ty);
+                    if (it.msg != 0) Replay(it.msg, it.data);
+                }
+                catch { }
+            }
+        }
+    }
+
+    private static bool IsReplayable(int msg) => msg switch
+    {
+        NativeApi.WM_MOUSEMOVE => true,
+        NativeApi.WM_LBUTTONDOWN => true,
+        NativeApi.WM_LBUTTONUP => true,
+        NativeApi.WM_RBUTTONDOWN => true,
+        NativeApi.WM_RBUTTONUP => true,
+        NativeApi.WM_MBUTTONDOWN => true,
+        NativeApi.WM_MBUTTONUP => true,
+        NativeApi.WM_MOUSEWHEEL => true,
+        NativeApi.WM_MOUSEHWHEEL => true,
+        _ => false,
+    };
 
     /// <summary>
     /// 停用仲裁：卸掉钩子、放掉互斥体，**退出对系统光标的争夺**。
@@ -294,17 +347,29 @@ public sealed class CursorArbiter : IDisposable
             int dx = ms.pt.X - _seenX, dy = ms.pt.Y - _seenY;
             if (Math.Abs(dx) > 2000 || Math.Abs(dy) > 2000) { dx = 0; dy = 0; }  // 拓扑刚变过，只做归还不补位移
             int tx = ClampX(_physX + dx), ty = ClampY(_physY + dy);
-            NativeApi.SetCursorPos(tx, ty);
             _seenX = _physX = tx;
             _seenY = _physY = ty;
+            Interlocked.Exchange(ref _lastReturnTick, Environment.TickCount64);
 
             long n = Interlocked.Increment(ref _snapBacks);
             if (n == 1 || n % 100 == 0)
                 _log.Info($"光标已从外屏归还给本机用户：({tx},{ty})，累计 {n} 次");
 
-            return Replay(wParam.ToInt32(), ms.mouseData)
-                ? new IntPtr(1)   // 原事件带着外屏坐标，必须吃掉；重放的那条才落在物理屏上
-                : NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            // 【2026-10-12 客户现场"副屏鼠标彻底失灵"根治】归还(SetCursorPos)+重放(SendInput)
+            // 绝不在钩子回调内同步执行：回调内注入会让注入事件在钩子线程上重入钩子链，
+            // 第三方钩子（安全软件/反作弊）一旦卡住，钩子线程被永久锁死，之后**全机**
+            // 的 SendInput 都排队等它——输入线程换了 185 次全部陪葬（7ICQ 实测 94 分钟）。
+            // 现在回调里只记账并吞掉事件，归还和重放交给专职线程在回调外执行（顺序由单队列保证）。
+            int msg = wParam.ToInt32();
+            if (IsReplayable(msg))
+            {
+                _returnQueue.Enqueue((msg, ms.mouseData, tx, ty));
+                _returnSignal?.Set();
+                return new IntPtr(1);   // 原事件带着外屏坐标，必须吃掉；重放的那条才落在物理屏上
+            }
+            _returnQueue.Enqueue((0, 0, tx, ty));   // 不可重放的消息只归还
+            _returnSignal?.Set();
+            return NativeApi.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         }
         catch (Exception ex)
         {

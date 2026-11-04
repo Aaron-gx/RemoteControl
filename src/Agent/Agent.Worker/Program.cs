@@ -20,6 +20,25 @@ public sealed class WorkerContext : ApplicationContext
 {
     /// <summary>
     /// 版本号：改功能时记得+1 —— 主控端会显示它，用来判断现场那台被控端是不是旧包。
+    /// 1.6.0 = 三项升级（对标 UU 远程逆向结论，uu-reverse 报告 §8 抄作业清单）：
+    ///         ① 编码器能力缓存重构（EncoderCapabilityCache，Agent.Common）：键维度补齐
+    ///           ffmpeg+显卡+编码族+是否dda（分辨率出键）；硬件成功落盘持久化（引擎重启
+    ///           不再重付 ~2.5s/候选的探测）、软编仅内存、探测失败 120s TTL 可重试；
+    ///           同族候选并行探测（错峰 300ms）；ForceSoftware 降级记录落盘运维可见。
+    ///         ② UDP 通道 KCP 可靠路径 + RS-FEC 视频抗丢（双端 PunchOffer.Cap AND 协商，
+    ///           旧对端 cap=0 完整走旧路径）：可靠消息走 ikcp（UU dckcp 实测参数：
+    ///           nc=1 关拥塞窗/wnd256/5ms/快重传2/minrto10ms，拥塞让位给码率阶梯），
+    ///           带外 KcpAck 停中继补发计时（400ms 兜底不变）；视频 XOR 升级 GF(256)
+    ///           Cauchy RS（16 片一组，r 随丢包率 1~6 自适应，组内丢 ≤r 片零重传恢复），
+    ///           全片补零+4B 长度前缀裁剪；诊断计数 UdpKcp/UdpFecR/UdpFecRecovered。
+    ///           KCP 源码 vendored 于 Agent.Common/Kcp/（Cysharp KcpTransport 的 ikcp 移植，MIT）。
+    ///         ③ dda 显卡直通升级为 auto 默认第一优先（N/A 卡；Intel 机器自然维持 WGC+qsv）：
+    ///           DXGI 按设备名精确锁定 output_idx（双同分辨率屏也能用）；三个洞修复——
+    ///           编码器起不来透明回退 WGC（引擎不再反复死）、软编强制时跳过 dda（ddagrab→libx*
+    ///           本来就不可能）、draw_mouse=0（与"光标主控端自绘"策略对齐）；
+    ///           零输出停滞看护（10s 零块 → 单帧 ddagrab 探针区分静态桌面/真死，3 连败永久
+    ///           回退 WGC）。另：协调器版本日志引用真实版本（修停在 1.1.0 的遗留）。
+    ///         铁律遵守：UdpPunchEnabled 仍默认 false（打洞大包探针是另一轮工作）。
     /// 1.0.1 = 支持"画面范围切换（仅副屏/全部屏幕）"+ 远端带出来的新窗口自动搬到外屏
     /// 1.1.0 = 进程合并（Worker 并入 Coordinator，IPC 换进程内通道）
     /// 1.1.1 = "此电脑"等常驻进程代开窗口的主屏闪烁修复（钩子常驻 + 武装期 60ms 快扫）
@@ -28,8 +47,37 @@ public sealed class WorkerContext : ApplicationContext
     /// 1.1.4 = 修 CREATE 常量错误（0x8001 是 DESTROY，真正的 CREATE 是 0x8000 —— 预定位从未生效过）；
     ///         状态上报加仲裁器诊断（CursorArbiterArmed/LocalInputIdleMs）
     ///         抢窗判据改为"本机 12 秒内动过即拒"（v1.1.2 的输入先后比较被远端悬停鼠标持续刷新打穿）
+    /// 1.5.23 = H.265 编码协商（主控端上报能力，双端支持才启用；StreamReset 负载带编码字节）
+    ///         + 码率自适应升档探测（升一档观察 10s，再拥塞立即回滚 + 退避）
+    ///         + UDP 直连丢包监控自动切中继/切回（协调器侧配合）
+    /// 1.5.24 = 非客户区点击自动升级真实光标（治"后台注入模式下点窗口关闭按钮没反应"）
+    ///         + 孤儿回收迟滞 10s→5min + 副屏空窗上报提示（治"重连后空副屏以为点不动"）
+    ///         + dda 显卡直通采集后端（CaptureBackend=dda；N/A 卡零拷贝，失败回退 WGC）
+    ///         + 软编探测结果不写缓存 + 对称 NAT 双端跳过打洞 + 输入路由打点
+    /// 1.5.25 = NV12 管道（WGC 采集侧转 NV12，管道流量省 62%，Intel 核显机帧率对症；
+    ///         BT.601 与旧管线同色彩）+ 诊断通道（0x56/0x57 协调器直答 + 0x58 远程重启引擎，
+    ///         引擎卡死也能诊断——"控制面坏死盲区"的解药）+ 视频丢包恢复（XOR 校验片 + NACK 重传）
+    /// 1.5.26 = 会话自愈（SessionHandover）：SYSTEM 会话实例启动时发现控制台有登录用户
+    ///         （锁屏也算）→ 迁移到用户会话，治"看门狗/热更新把实例永久卡在 session 0"的事故
+    /// 1.5.27 = 会话迁移子进程显式指定 winsta0\default 桌面（NULL 继承服务桌面，跨会话起不来）
+    /// 1.5.28 = NV12 管道回退为默认关闭（PixelPipeline=bgra）：真机（nvenc/1080p）发现底部条带
+    ///         持续性色度损坏（out of range intra chroma pred mode），原因待查；修复前 opt-in
+    /// 1.5.31 = 光标仲裁器归还/重放移出钩子回调（客户现场"本机动一下鼠标→副屏鼠标永久失灵"
+    ///         根治：回调内 SetCursorPos+SendInput 会重入钩子链，第三方钩子一卡钩子线程锁死、
+    ///         全机 SendInput 排队等它——7ICQ 实测卡死 94 分钟、换线程 185 次全陪葬）
+    ///         + 钩子链中毒保险丝（5 分钟内 ≥3 次输入线程卡死 → 鼠标熔断切后台注入保命）
+    ///         + 孤儿回收 5min→10s 回退（客户要求"断开就回主屏"，5 分钟滞留被当成时好时坏）
+    ///         + 主控端安装器升级时覆盖旧配置里的服务器地址（换服务器事故：旧地址永远赢）
+    /// 1.5.30 = 编码器缓存键补编码族：H.264 会话缓存住的 h264_qsv 会被 H.265 协商错用
+    ///         （hevc 封装 + h264 编码器 → ffmpeg 秒退循环 0 帧，主控端黑屏）。
+    ///         首个真实 H.265 主控端（新装 1.2.7 主控端带能力上报）触发。
+    /// 1.5.29 = UDP 打洞直连默认停用（UdpPunchEnabled=false，可配置开回）：客户现场发现
+    ///         同局域网打洞秒成后视频/输入切到 UDP，但"被控端→主控端"方向是单向黑洞
+    ///         （小包通、视频分片双向全丢，SendVideo 又不校验送达）——表现为画面全黑、
+    ///         点击全部无反应。根因未查明前统一走 TCP（直连/中继）。
+    ///         + 诊断行补 UDP 收发计数（本次排查的关键盲区）
     /// </summary>
-    public const string Version = "1.5.21";
+    public const string Version = "1.6.0";
 
     private readonly AgentConfig _cfg;
     private readonly Logger _log;
@@ -82,8 +130,31 @@ public sealed class WorkerContext : ApplicationContext
     private long _lastRemoteKeyTick;
     /// <summary>编码器连续重启失败次数（到阈值就把硬件编码器降级成 libx264）</summary>
     private int _encoderRestartFails;
+    // ---- H.265 编码协商（2026-10-10，对标 UU 的双端能力协商）----
+    /// <summary>主控端上报"能解 H.265"（收到 Capabilities 前保持 false → 旧主控端永远 H.264）</summary>
+    private volatile bool _viewerH265Cap;
+    /// <summary>当前码流用的编码族（"h264"/"h265"）；重建编码器时以此为准</summary>
+    private volatile string _currentCodec = CodecPolicy.H264;
+    /// <summary>协商结果要求切换编码族（非空 = 采集线程要重建编码器；编码器归采集线程所有）</summary>
+    private volatile string? _pendingCodec;
     /// <summary>码率/帧率自适应（拥塞就降档），见 BitrateGovernor</summary>
     private BitrateGovernor? _governor;
+    // ---- DDA 显卡直通（2026-10-10；2026-10-14 auto 默认先试 + 透明回退）----
+    /// <summary>当前是否 ffmpeg 自采集（ddagrab，帧不过 CPU）</summary>
+    private bool _ddaSelf;
+    /// <summary>ddagrab 的 DXGI 输出索引（-1 = 未启用）</summary>
+    private int _ddaOutputIdx = -1;
+    /// <summary>
+    /// 本引擎周期内永久禁用 dda（停滞看护 3 连败 / dda 下编码器起不来时置位），
+    /// 引擎重启后重置——对标 UU 的"采集失败自动回退"而不是让引擎反复死给协调器看。
+    /// </summary>
+    private bool _ddaDisabled;
+    /// <summary>dda 零输出看护的连败计数（单帧探针判"真死"才算一次）</summary>
+    private int _ddaStallStrikes;
+    /// <summary>最近一次 dda 停滞单帧探针的时刻（TickCount64；零输出期间每 10s 最多探一次）</summary>
+    private long _lastDdaStallProbeTick;
+    /// <summary>最近一次收到编码块的时刻（dda 停滞看护：活着但零输出 ≠ 死——静态桌面 DDA 不产帧）</summary>
+    private long _lastEncodedChunkTick;
     /// <summary>因帧缓冲写不进去而丢弃的块数（拥塞信号）</summary>
     private long _ringDrops;
     /// <summary>协调器回报的"中继出口拥塞"（IPC 每秒更新一次）</summary>
@@ -100,6 +171,9 @@ public sealed class WorkerContext : ApplicationContext
     private long _lastVddRestartTick;
     private long _nextTopoCheckMs;
     private long _topoFailBackoffMs = 30_000;
+    /// <summary>副屏空窗检测的节拍（每 3 秒枚举一次窗口，随状态上报给主控端）</summary>
+    private long _nextVirtualCountCheckMs;
+    private int _virtualWindowCount = -1;
     /// <summary>虚拟外屏缺位（驱动故障/被拔）：置位期间**暂停出帧**，绝不把物理屏当外屏拍（2026-10-09 隐私事故）</summary>
     private bool _virtualMissing;
     private long _nextVirtualMissingReportMs;
@@ -227,8 +301,8 @@ public sealed class WorkerContext : ApplicationContext
 
         _source = CreateSource(_target, _cfg.CaptureBackend);
         _governor = new BitrateGovernor(_log, _cfg.BitrateKbps, _cfg.FrameRate);
-        _encoder = new FfmpegEncoder(ResolveFfmpeg(), _cfg.Encoder, _source.Width, _source.Height,
-            _governor.FrameRate, _governor.BitrateKbps, _log);
+        _currentCodec = ChooseCodec(_source.Width, _source.Height);
+        _encoder = CreateEncoderFor(_source.Width, _source.Height, _governor.FrameRate, _governor.BitrateKbps, _currentCodec);
         _encoder.Chunk += OnEncodedChunk;
         if (!_encoder.Start())
         {
@@ -290,13 +364,58 @@ public sealed class WorkerContext : ApplicationContext
     ///    主控端按 MonitorInfo.Screens 里每块屏的偏移把它画出来（物理屏那块是只读的，点了不打扰机器前面的人）。
     /// 注意：窗口摆放 / 光标仲裁**永远以虚拟外屏为准**（_virtualScreen），与采集范围无关。
     /// </summary>
-    /// <summary>
-    /// 创建采集源：画布模式用"每块屏各采 + 拼接"（见 CompositeFrameSource 的注释：
+    /// <summary>创建采集源：画布模式用"每块屏各采 + 拼接"（见 CompositeFrameSource 的注释：
     /// 一次性 BitBlt 抓整个虚拟桌面在跨显卡的机器上会抓回全黑，现场踩到）。
+    /// dda（显卡直通，2026-10-10；**2026-10-14 起为 auto 的第一优先**）：ffmpeg 自己采集
+    /// （帧不过 CPU），仅单屏模式支持。可行性 = 没被运行期禁用 + 编码族没被降级软编 +
+    /// dda 候选编码器（nvenc/amf）探测通过 + 能锁定输出（设备名精确匹配优先）。
+    /// 任一不满足 → 透明落到 WGC/GDI（Intel 核显机器自然维持 WGC+qsv）。
     /// </summary>
     private FrameSource CreateSource(DisplayInfo target, string backend)
     {
-        if (!_captureAll) return FrameSourceFactory.Create(backend, target, _log);
+        // dda 决策每次重建采集都重新评估（拓扑可能变了）
+        _ddaSelf = false;
+        _ddaOutputIdx = -1;
+        bool wantDda = (backend == "dda" || backend == "auto") && !_captureAll && !_ddaDisabled;
+        if (wantDda)
+        {
+            // 软编族强制时不能用 dda（ddagrab 的 d3d11 帧软编消费不了）
+            if (FfmpegEncoder.SoftwareForced(_currentCodec))
+            {
+                if (backend == "dda")
+                    _log.Warn("当前编码族已降级软件编码，ddagrab 直采不可用，回退 WGC/GDI");
+            }
+            else
+            {
+                var ffmpeg = ResolveFfmpeg();
+                if (ffmpeg == null)
+                {
+                    _log.Warn("找不到 ffmpeg，跳过 dda 显卡直通");
+                }
+                else if (!FfmpegEncoder.DdaEncoderAvailable(ffmpeg, _currentCodec, target.Width, target.Height,
+                             _governor?.FrameRate ?? _cfg.FrameRate, _log))
+                {
+                    // N/A 卡没有、或 dda 候选探测都失败（Intel 核显机器的正常归宿）
+                    if (backend == "dda") _log.Warn("dda 候选编码器（nvenc/amf）不可用，回退 WGC/GDI");
+                }
+                else
+                {
+                    var idx = FfmpegEncoder.ResolveDdaOutput(ffmpeg, target.Width, target.Height, _log, target.DeviceName);
+                    if (idx >= 0)
+                    {
+                        _ddaOutputIdx = idx;
+                        _ddaSelf = true;
+                        _ddaStallStrikes = 0;
+                        Interlocked.Exchange(ref _lastEncodedChunkTick, Environment.TickCount64);
+                        _log.Info($"采集后端：DDA 显卡直通（output_idx={idx}，{target.DeviceName} {target.Width}x{target.Height}）—— 帧全程留在显卡，不过 CPU");
+                        return new DdaStubSource(target);
+                    }
+                    if (backend == "dda") _log.Warn("dda 显卡直通不可用（定位不到目标输出），回退 WGC/GDI");
+                }
+            }
+            if (backend == "dda") backend = "auto";   // 显式 dda 失败也要有下家
+        }
+        if (!_captureAll) return FrameSourceFactory.Create(backend, target, _log, _cfg.PixelPipeline);
         var screens = DisplayHelper.GetMonitors();
         try
         {
@@ -307,6 +426,21 @@ public sealed class WorkerContext : ApplicationContext
             _log.Warn($"画布拼接采集创建失败（{ex.Message}），退回单次 BitBlt 抓整个桌面");
             return FrameSourceFactory.Create("gdi", target, _log);
         }
+    }
+
+    /// <summary>
+    /// dda 显卡直通永久回退（本引擎周期内）：停滞看护 3 连败 / dda 下编码器反复起不来时调用。
+    /// 重建采集（auto 此时跳过 dda → WGC）+ 编码器 + StreamReset，引擎不死。
+    /// </summary>
+    private void FallBackFromDda(string reason)
+    {
+        if (_ddaDisabled) return;
+        _ddaDisabled = true;
+        _ddaSelf = false;
+        _ddaOutputIdx = -1;
+        _log.Warn($"DDA 显卡直通回退为 WGC 管道（{reason}）；引擎重启前不再尝试");
+        try { SwitchCaptureTarget(); }
+        catch (Exception ex) { _log.Error($"dda 回退重建异常：{ex.Message}"); }
     }
 
     private DisplayInfo? BuildCaptureTarget()
@@ -481,6 +615,14 @@ public sealed class WorkerContext : ApplicationContext
                     _needStreamReset = false;
                     RestartEncoder("请求重建码流");
                 }
+                // 编码协商要求换编码族（H.264 ⇄ H.265）：编码器归采集线程所有，由这里执行重建
+                var pendingCodec = _pendingCodec;
+                if (pendingCodec != null)
+                {
+                    _pendingCodec = null;
+                    if (!string.Equals(pendingCodec, _currentCodec, StringComparison.OrdinalIgnoreCase))
+                        RebuildEncoderForCodec(pendingCodec);
+                }
                 // 【2026-10-09 隐私事故】虚拟外屏缺位：暂停出帧（绝不把物理屏当外屏拍），
                 // 每 10s 向主控端报一次错。拓扑巡检在上方照常自愈，副屏回来自动恢复。
                 if (_virtualMissing)
@@ -526,6 +668,53 @@ public sealed class WorkerContext : ApplicationContext
                 if (_source != null && (_encoder.Width != _source.Width || _encoder.Height != _source.Height))
                 {
                     RebuildEncoderForSize(_source.Width, _source.Height);
+                    continue;
+                }
+
+                // 【DDA 显卡直通】ffmpeg 自己采集（ddagrab，帧不过 CPU）：没有喂帧动作、
+                // 也不需要采集节拍 —— 这里只保留每秒的帧率统计与拥塞判定（帧数由 OnEncodedChunk 累加）。
+                bool selfCap = _encoder is { SelfCapture: true };
+                if (selfCap)
+                {
+                    // 【停滞看护 2026-10-14】ffmpeg 活着但 0 输出 ≠ 死 —— 静态桌面 DDA 不产帧
+                    // （没有画面变化就没有帧，这是 DDA 的语义）。零输出持续 10s 时跑一次单帧
+                    // ddagrab 探针（同 output_idx，~300ms）：探针成功 = 只是静态屏（不动它）；
+                    // 探针失败 = 采集链真死了 → 重建编码器；3 连败 → 永久回退 WGC（引擎不死）。
+                    long lastChunk = Interlocked.Read(ref _lastEncodedChunkTick);
+                    long nowTick = Environment.TickCount64;
+                    if (lastChunk > 0 && nowTick - lastChunk > 10_000 && nowTick - _lastDdaStallProbeTick > 10_000)
+                    {
+                        _lastDdaStallProbeTick = nowTick;   // 零输出期间每 10s 最多探一次
+                        var ffmpeg = ResolveFfmpeg();
+                        var (ok, _, _) = FfmpegEncoder.ProbeDdaOutput(ffmpeg, _ddaOutputIdx);
+                        if (ok)
+                        {
+                            _log.Debug("dda 零输出 10s，单帧探针通过 —— 静态桌面（DDA 无变化不产帧），保持");
+                        }
+                        else
+                        {
+                            if (++_ddaStallStrikes >= 3)
+                            {
+                                FallBackFromDda($"零输出且单帧探针连续 {_ddaStallStrikes} 次失败");
+                            }
+                            else
+                            {
+                                _log.Warn($"dda 零输出 10s 且单帧探针失败（第 {_ddaStallStrikes} 次），重建编码器");
+                                RestartEncoder("dda 零输出（探针失败）");
+                            }
+                        }
+                    }
+                    long nowS = sw.ElapsedMilliseconds;
+                    if (nowS - lastFpsSample >= 1000)
+                    {
+                        long total = Interlocked.Read(ref _framesCaptured);
+                        _captureFps = (total - framesAtLastSample) * 1000.0 / Math.Max(1, nowS - lastFpsSample);
+                        framesAtLastSample = total;
+                        lastFpsSample = nowS;
+                        if (_governor != null && _governor.Report(Interlocked.Read(ref _ringDrops), _outboundCongested))
+                            ApplyGovernorChange();
+                    }
+                    Thread.Sleep(100);
                     continue;
                 }
 
@@ -631,6 +820,17 @@ public sealed class WorkerContext : ApplicationContext
     /// 刻意**不发 StreamReset** —— 分辨率没变、编码器带内会重复 SPS/PPS，主控端不需要
     /// 重置解码器（重置一次就要重新等关键帧，那正是我们要避免的）。
     /// </summary>
+    /// <summary>
+    /// 统一创建编码器（dda 状态与采集源的像素格式在这里带入，各创建点共用）。
+    /// NV12 管道：WGC 源输出 nv12（管道流量省 62%），GDI/画布/DDA 仍 bgra/nv12 由源自报。
+    /// </summary>
+    private FfmpegEncoder CreateEncoderFor(int width, int height, int fps, int kbps, string codec)
+    {
+        var fmt = _source?.PixelFormat ?? "bgra";
+        return new FfmpegEncoder(ResolveFfmpeg(), _cfg.Encoder, width, height, fps, kbps, _log,
+            codec, _ddaSelf, _ddaOutputIdx, fmt);
+    }
+
     private void ApplyGovernorChange()
     {
         if (_source == null || _governor == null) return;
@@ -639,8 +839,7 @@ public sealed class WorkerContext : ApplicationContext
             var old = _encoder;
             old?.Stop();
             old?.Dispose();
-            var enc = new FfmpegEncoder(ResolveFfmpeg(), _cfg.Encoder, _source.Width, _source.Height,
-                _governor.FrameRate, _governor.BitrateKbps, _log);
+            var enc = CreateEncoderFor(_source.Width, _source.Height, _governor.FrameRate, _governor.BitrateKbps, _currentCodec);
             enc.Chunk += OnEncodedChunk;
             _encoder = enc;
             if (!enc.Start())
@@ -651,6 +850,82 @@ public sealed class WorkerContext : ApplicationContext
         catch (Exception ex)
         {
             _log.Error("自适应换档异常", ex);
+        }
+    }
+
+    /// <summary>
+    /// 协商后的编码族（2026-10-10 H.265）：配置 VideoCodec + 主控端能力 + 本机硬件编码器三方共同决定，
+    /// 规则见 <see cref="CodecPolicy.Decide"/>（auto = 主控端能解且本机有硬编才用 H.265）。
+    /// </summary>
+    private string ChooseCodec(int width, int height)
+    {
+        var ffmpeg = ResolveFfmpeg();
+        bool hw265 = false;
+        try
+        {
+            hw265 = FfmpegEncoder.H265HardwareAvailable(ffmpeg, width, height,
+                _governor?.FrameRate ?? _cfg.FrameRate, _log);
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"H.265 硬件编码探测失败（按不支持处理）：{ex.Message}");
+        }
+        var codec = CodecPolicy.Decide(_cfg.VideoCodec, _viewerH265Cap, hw265);
+        if (CodecPolicy.IsH265(codec))
+            _log.Info($"视频编码协商：H.265（配置={_cfg.VideoCodec}，主控端H.265解码={_viewerH265Cap}，本机硬编={hw265}）");
+        else
+            _log.Info($"视频编码协商：H.264（配置={_cfg.VideoCodec}，主控端H.265解码={_viewerH265Cap}，本机硬编={hw265}）");
+        return codec;
+    }
+
+    /// <summary>
+    /// 切换编码族（H.264 ⇄ H.265）。码流格式变了，主控端必须用对应格式重建解码器 ——
+    /// 所以 StreamReset 的负载带上新编码字节（旧主控端忽略负载，但协商已保证它根本不会收到 H.265）。
+    /// </summary>
+    private void RebuildEncoderForCodec(string codec)
+    {
+        if (_source == null) return;
+        try
+        {
+            _log.Info($"视频编码切换：{_currentCodec.ToUpperInvariant()} → {codec.ToUpperInvariant()}");
+            var old = _encoder;
+            old?.Stop();
+            old?.Dispose();
+            _currentCodec = codec;
+            var enc = CreateEncoderFor(_source.Width, _source.Height,
+                _governor?.FrameRate ?? _cfg.FrameRate, _governor?.BitrateKbps ?? _cfg.BitrateKbps, codec);
+            enc.Chunk += OnEncodedChunk;
+            _encoder = enc;
+            if (!enc.Start())
+            {
+                // H.265 建不起来（协商后驱动又出状况）：退回 H.264，绝不能没有码流。
+                // dda 模式下还要顺手回退 WGC 管道 —— 软编降级与 ddagrab 不兼容，且
+                // 编码器问题不该让"采集路径"跟着陪葬（2026-10-14）
+                _log.Error($"H.265 编码器启动失败：{enc.LastError}，退回 H.264");
+                FfmpegEncoder.ForceSoftware($"H.265 编码器启动失败：{enc.LastError}", _log, codec);
+                _currentCodec = CodecPolicy.H264;
+                if (_ddaSelf)
+                {
+                    FallBackFromDda($"H.265 编码器启动失败：{enc.LastError}");
+                    _pendingCodec = null;
+                    _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset,
+                        PayloadCodec.EncodeStreamReset(false)));
+                    return;
+                }
+                var fb = CreateEncoderFor(_source.Width, _source.Height,
+                    _governor?.FrameRate ?? _cfg.FrameRate, _governor?.BitrateKbps ?? _cfg.BitrateKbps, CodecPolicy.H264);
+                fb.Chunk += OnEncodedChunk;
+                _encoder = fb;
+                if (!fb.Start())
+                    _log.Error($"退回 H.264 也失败：{fb.LastError}");
+                _pendingCodec = null;
+            }
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset,
+                PayloadCodec.EncodeStreamReset(CodecPolicy.IsH265(_currentCodec))));
+        }
+        catch (Exception ex)
+        {
+            _log.Error("切换编码族异常", ex);
         }
     }
 
@@ -673,8 +948,8 @@ public sealed class WorkerContext : ApplicationContext
             var old = _encoder;
             old?.Stop();
             old?.Dispose();
-            var enc = new FfmpegEncoder(ResolveFfmpeg(), _cfg.Encoder, width, height,
-                _governor?.FrameRate ?? _cfg.FrameRate, _governor?.BitrateKbps ?? _cfg.BitrateKbps, _log);
+            var enc = CreateEncoderFor(width, height,
+                _governor?.FrameRate ?? _cfg.FrameRate, _governor?.BitrateKbps ?? _cfg.BitrateKbps, _currentCodec);
             enc.Chunk += OnEncodedChunk;
             _encoder = enc;
             if (!enc.Start())
@@ -682,8 +957,9 @@ public sealed class WorkerContext : ApplicationContext
                 _log.Error($"编码器按 {width}x{height} 重建失败：{enc.LastError}");
                 Thread.Sleep(500);
             }
-            // 通知主控端也重建解码器，避免半帧污染
-            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+            // 通知主控端也重建解码器，避免半帧污染（负载带上当前编码，主控端用对应格式重建）
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset,
+                PayloadCodec.EncodeStreamReset(CodecPolicy.IsH265(_currentCodec))));
         }
         catch (Exception ex)
         {
@@ -700,23 +976,47 @@ public sealed class WorkerContext : ApplicationContext
             _encoder?.Stop();
             Thread.Sleep(150);
             var enc = _encoder;
-            if (enc != null && !enc.Start())
+            string? startEx = null;
+            bool started;
+            try
             {
-                _log.Error($"编码器重启失败：{enc.LastError}");
+                // Start 内部先 ResolveEncoder：dda 候选全军覆没会直接抛异常（2026-10-14 前这个
+                // 异常会绕过失败计数，引擎反复盲重启）。这里接住，按启动失败统一处理。
+                started = enc is not null && enc.Start();
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"编码器启动抛异常：{ex.Message}");
+                started = false;
+                startEx = ex.Message;
+            }
+            if (!started)
+            {
+                var err = enc?.LastError is { Length: > 0 } l ? l : startEx ?? "编码器实例不存在";
+                _log.Error($"编码器重启失败：{err}");
+                // dda 模式下失败优先回退 WGC 管道（软编降级在 dda 下不可用），引擎重启前不再试 dda
+                if (_ddaSelf)
+                {
+                    FallBackFromDda($"编码器重启失败：{err}");
+                    return;
+                }
                 // 硬件编码器被"打开的应用"抢走 GPU 会话后，重启多少次都是同一个错。
                 // 到阈值就降级到软件编码，否则画面永远回不来（就是用户说的"黑屏卡死"）。
                 if (++_encoderRestartFails >= 3)
                 {
                     FfmpegEncoder.ForceSoftware(
-                        $"编码器 {enc.EncoderName} 连续 {_encoderRestartFails} 次重启失败：{enc.LastError}", _log);
+                        $"编码器 {enc?.EncoderName} 连续 {_encoderRestartFails} 次重启失败：{err}",
+                        _log, _currentCodec);
                     _encoderRestartFails = 0;
                 }
                 Thread.Sleep(1000);
                 return;
             }
             _encoderRestartFails = 0;
-            // 通知主控端也重建解码器，避免半帧污染
-            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+            Interlocked.Exchange(ref _lastEncodedChunkTick, Environment.TickCount64);
+            // 通知主控端也重建解码器，避免半帧污染（负载带上当前编码）
+            _bridge.SendToCoordinator(new ProtocolMessage(MessageType.StreamReset,
+                PayloadCodec.EncodeStreamReset(CodecPolicy.IsH265(_currentCodec))));
         }
         catch (Exception ex)
         {
@@ -726,6 +1026,12 @@ public sealed class WorkerContext : ApplicationContext
 
     /// <summary>本机用户刚动过键鼠多久之内，远端按键先不放行（够短，不会影响正常远端打字）</summary>
     private const long RemoteKeyBlockWindowMs = 300;   // 收紧：800ms 假阳性面太大（2026-10-08 现场：无真人的机器持续被拦）
+
+    /// <summary>主控端离线多久后才把副屏孤儿窗口搬回主屏（见 HousekeepingLoop 的说明）</summary>
+    // 【2026-10-12 回退】曾改成 5 分钟（想给"断开又马上重连"保窗口布局），客户实测反馈：
+    // 断开后本机用户要用机器，窗口滞留副屏 5 分钟太碍事（"时好时坏"的错觉也来自它）。
+    // 回到 10 秒：断开 → 副屏窗口很快回主屏，本机用户无感。
+    private const long ReclaimDelayMs = 10_000;
 
     /// <summary>远端按键因为本机用户正在操作而被丢弃 → 限流告知主控端（10s 最多一条）</summary>
     private void NotifyRemoteKeysBlocked()
@@ -744,6 +1050,11 @@ public sealed class WorkerContext : ApplicationContext
     {
         try
         {
+            Interlocked.Exchange(ref _lastEncodedChunkTick, Environment.TickCount64);
+            // DDA 自采集模式：没有采集调用，编码块即"采集帧"（帧率统计用；块≈16KB，
+            // 与"帧"不是一比一——诊断口径如此，状态里 CaptureFps 是块率）
+            if (_encoder is { SelfCapture: true })
+                Interlocked.Increment(ref _framesCaptured);
             // 帧环写不进去 = 链路承载不住当前码率。**刻意不重建码流**：
             // 重建会让主控端重置解码器、重新等关键帧，在慢链路上等于永远出不来画面
             // （实测：被控端一直 23fps 在发，主控端却一帧都解不出来）。这里只丢这一块并计数，
@@ -918,6 +1229,20 @@ public sealed class WorkerContext : ApplicationContext
                     Interlocked.Exchange(ref _viewerOfflineSince, Environment.TickCount64);
                 break;
             }
+            case MessageType.Capabilities:
+            {
+                // 主控端能力（2026-10-10 H.265 协商）：只在"结论会变"时触发编码切换
+                var caps = JsonCodec.Decode<CapabilitiesInfo>(msg.Payload);
+                bool h265 = caps?.H265Decode ?? false;
+                if (h265 != _viewerH265Cap)
+                {
+                    _viewerH265Cap = h265;
+                    var want = ChooseCodec(_source?.Width ?? 1920, _source?.Height ?? 1080);
+                    if (!string.Equals(want, _currentCodec, StringComparison.OrdinalIgnoreCase))
+                        _pendingCodec = want;   // 采集线程执行重建（编码器归它所有）
+                }
+                break;
+            }
             case MessageType.RequestSoftwareList:
             {
                 // 上报自己启动过的进程状态
@@ -1046,10 +1371,11 @@ public sealed class WorkerContext : ApplicationContext
                 // 副屏孤儿窗口回收：主控端离线时，把所有"整块落在副屏上"的可见窗口搬回主屏。
                 // 为什么需要这个（除了 SHOW 事件上的反向抓取）：Telegram 等从托盘恢复**不触发 SHOW**
                 // （窗口一直是"可见"的，只是不在前台），SHOW 路径抓不到 → 客户反馈"tg 第一次打开不回主屏"。
-                // 周期检查每秒跑一次，条件更严（要求主控端离线 ≥10 秒），避免跟远端操作打架。
-                // 孤儿回收：主控端离线时把副屏窗口搬回主屏（客户反馈"断开后此电脑留在副屏"）。
-                // 【2026-10-07 重新启用】改为 10 秒一轮 + 只在主控端离线时跑（性能可控）。
-                if (!_viewerOnline && now - _lastReclaimTick > 10_000)
+                // 【2026-10-10 迟滞修正】回收门槛从 10 秒放宽到 5 分钟：10 秒太激进 ——
+                // "关掉主控端马上重开""厂商测完交接给客户"都是正常使用姿势，却会触发回收，
+                // 客户重连看到空副屏（黑壁纸+无任务栏），"点什么都没反应"（当天现场踩了三次，
+                // 远程复现实锤）。5 分钟内重连不再搬走窗口；真正的孤儿（人走屏空）照样回收。
+                if (!_viewerOnline && now - _lastReclaimTick > ReclaimDelayMs)
                 {
                     _lastReclaimTick = now;
                     _windows.ReclaimOrphanWindowsFromVirtual();
@@ -1085,6 +1411,14 @@ public sealed class WorkerContext : ApplicationContext
                     int n = _windows.SweepNewWindowsFromPhysical(remoteActive: true, localActive: false);
                     if (n > 0) _log.Info($"Win+R 期间把 {n} 个新窗口摆到了外屏");
                 }
+
+                // 【1.5.22 右键菜单跑主屏】右键随时发生（不在 Win+R 会话期）：远端 5 秒内动过键鼠、
+                // 本机没在动手时，每秒把落在物理屏上的菜单/下拉弹窗搬回外屏（只碰弹窗，轻量）。
+                // 本机用户动键鼠时一个不碰——那是他自己的菜单。
+                bool remoteActiveNow = Math.Max(Interlocked.Read(ref _lastRemoteInputTick),
+                                                Interlocked.Read(ref _lastRemoteKeyTick)) > now - 5000;
+                if (remoteActiveNow && !localBusy)
+                    _windows.SweepPopupsFromPhysical();
 
                 // 本机用户点任务栏把外屏窗口叫起来 → 搬回主屏（默认关闭，见 AgentConfig.ReturnWindowOnLocalClick：
                 // 开着会把远端正在用的窗口抢回主屏，现场反馈过，所以做成开关且默认关）
@@ -1243,10 +1577,29 @@ public sealed class WorkerContext : ApplicationContext
         _log.Error($"⚠⚠ 输入线程卡死 {stuckMs / 1000.0:F0}s（正在执行 {_inputBusyWhat}，累计换线程 " +
                    $"{_inputThreadReplacedCount} 次）——丢弃积压输入并更换输入线程。常见元凶：反作弊/安全软件" +
                    "拦截 SendInput、钩子链无响应。控制通道不受影响。");
+        // 【2026-10-12 保险丝】5 分钟内 ≥3 次换线程 = 换多少个都一样卡死（7ICQ 实测连卡 94 分钟、
+        // 换了 185 次）——钩子链已被毒死，SendInput 这条路彻底堵了。熔断：鼠标改走后台定向注入
+        //（PostMessage 不经过钩子链），保住"能用"；直到进程重启。
+        long windowStart = now - 300_000;
+        lock (_replaceTickGate)
+        {
+            _recentReplaceTicks.RemoveAll(t => t < windowStart);
+            _recentReplaceTicks.Add(now);
+            if (_recentReplaceTicks.Count >= 3 && _router is { HooksPoisoned: false })
+            {
+                _router.HooksPoisoned = true;
+                _log.Error("⚠⚠ 连续多次输入线程卡死：判定钩子链中毒，鼠标已熔断切换到后台定向注入" +
+                           "（不经过钩子链）。多数应用可正常点击，少数自绘应用（微信/Chromium 系）可能不响应。" +
+                           "重启本机或关闭拦截输入的安全软件后，重启被控端可恢复真实光标。");
+            }
+        }
         // 旧队列连同积压一起废弃（过期输入没有重放价值），起全新线程
         try { _inputQueue?.Writer.TryComplete(); } catch { }
         StartInputThread();
     }
+
+    private readonly object _replaceTickGate = new();
+    private readonly List<long> _recentReplaceTicks = new();
 
     /// <summary>
     /// 键盘事件处理（从 OnMessage 的 KeyEvent case 原样搬来：注入类逻辑统一在专用输入线程上跑）。
@@ -1396,6 +1749,13 @@ public sealed class WorkerContext : ApplicationContext
         try
         {
             CheckInputThreadHealth();   // 输入线程卡死自愈（每秒核一次，借状态线程的节拍）
+            // 副屏空窗检测（3 秒一次：枚举全部顶层窗口，别每秒都跑）
+            long nowTick = Environment.TickCount64;
+            if (nowTick >= _nextVirtualCountCheckMs)
+            {
+                _nextVirtualCountCheckMs = nowTick + 3000;
+                _virtualWindowCount = _windows.CountVisibleWindowsOnVirtual();
+            }
             // 安全桌面（UAC 提权弹窗 / 锁屏 / Ctrl+Alt+Del）：这期间采集抓不到、键鼠也进不去，
             // 主控端看到的是一片黑。每秒把状态上报一次，主控端就能说出"为什么黑"，而不是让人干猜。
             bool onInput = DesktopHelper.IsOnInputDesktop();
@@ -1426,6 +1786,7 @@ public sealed class WorkerContext : ApplicationContext
                 BitrateKbps = _governor?.BitrateKbps ?? _cfg.BitrateKbps,
                 FrameRate = _governor?.FrameRate ?? _cfg.FrameRate,
                 AdaptiveLevel = _governor?.Level ?? 0,
+                Codec = _currentCodec,
                 RingDropped = Interlocked.Read(ref _ringDrops),
                 HintSeq = Interlocked.Read(ref _lastHintSeq),   // 金丝雀：协调器据此发现单向断流
                 // 输入侧的可观测字段：主控端据此显示"远端鼠标点在哪块屏、走的哪条路"，
@@ -1438,6 +1799,7 @@ public sealed class WorkerContext : ApplicationContext
                 AllScreens = _captureAll,
                 InputPath = _router?.CurrentPath == InputPath.Background ? "background" : "real",
                 CursorContested = _router?.CursorContested ?? false,
+                VirtualScreenEmpty = _viewerOnline && _virtualWindowCount == 0,
                 // 有同类软件在跑（哪怕此刻点击是好的）也要上报：主控端据此显示"与它共用光标"
                 CursorBlockerHint = _router?.BlockerHint ?? "",
                 // 抢窗闸门的诊断：仲裁器在不在岗 + 本机物理输入空闲多久（-1=无仲裁器 → 闸门失效）

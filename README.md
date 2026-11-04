@@ -9,7 +9,7 @@
 一台 Windows 电脑上，**本机用户与远程用户各用一块屏幕、同时操作、互不干扰**的远程控制软件。
 已按客户需求定稿为共享模式，完成真机端到端验收，支持**热更新**自动升级。
 
-**当前版本：被控端 1.5.21 / 主控端 1.2.4**（2026-10-09，流畅性修复：P2P 直连自加防火墙放行【同网不再绕香港中继】、键鼠注入挪专用线程【反作弊卡死不再拖死控制通道】、单向断流金丝雀自愈、主控端画面停摆 3 秒自动重建码流【治黑屏】）
+**当前版本：被控端 1.6.0 / 主控端 1.2.8**（2026-10-14：**对标 UU 三项升级**——编码器能力缓存重构（键含显卡/编码族/ffmpeg、硬编落盘 config/encoder-cache.json、软编不落盘、失败 120s 重试、同族并行探测）；UDP 通道 KCP 可靠路径（UU dckcp 实测参数 nc=1/wnd256/5ms/minrto10）+ RS-FEC 视频抗丢（GF256 Cauchy 16 片一组、r 随丢包自适应 1~6，双端 Cap 协商、旧主控端零影响）；dda 显卡直通升为 auto 默认（DXGI 设备名精确定位、编码器失败透明回退 WGC、停滞看护））（2026-10-11 补充：**会话自愈**【SYSTEM 会话实例启动时发现控制台有登录用户（锁屏也算）→ 自动迁移到用户会话，治"看门狗/热更新把实例永久卡在 session 0、远控变废"的事故——迁移前补写报平安标记，不触发热更新回滚，10 分钟节流防循环】；第三批 1.5.25：NV12 管道【WGC 采集侧就地转 NV12，管道流量 250→93MB/s 省 62%，BT.601 同色彩】、诊断通道【0x56/0x57/0x58 协调器直答 + `_rcp.py diag`，引擎卡死也能拿日志】、视频丢包恢复【XOR 校验片 + NACK 重传】）
 
 ---
 
@@ -83,7 +83,7 @@ RemoteControl\
 
 **本机调试：**
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "ws://__RELAY_HOST__:18080/ws"
+powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "ws://<中继地址>:18080/ws"
 ```
 
 ### 3.2 中继服务器
@@ -120,8 +120,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "w
 | `AutoUpdateEnabled` | `true` | 热更新开关 |
 | `UpdateCheckIntervalHours` | `6` | 检查更新的间隔（小时） |
 | `FrameRate` / `BitrateKbps` | `30` / `4000` | 视频帧率 / 码率 |
-| `Encoder` | `auto` | 自动探测 nvenc→qsv→amf→libx264 |
-| `CaptureBackend` | `auto` | 先试 WGC 失败退 GDI |
+| `VideoCodec` | `auto` | `auto`=协商后优先 H.265（主控端能解+本机有硬编才启用）；`h264`/`h265` 强制 |
+| `Encoder` | `auto` | 自动探测 nvenc→qsv→amf→libx264（H.265 时用 hevc_* 家族） |
+| `CaptureBackend` | `auto` | `auto`/`wgc`/`gdi`/`dda`（1.6.0 起 **auto 第一优先尝试 dda 显卡直通**：ffmpeg 用 ddagrab 在显卡上采集+编码帧不过 CPU，N 卡 nvenc/A 卡 amf；不可用（如 Intel 核显）自动落 WGC；dda 失败透明回退 WGC，显式 wgc/gdi 仍是逃生开关） |
+| `UdpQualitySwitchEnabled` | `true` | UDP 直连丢包监控：持续超标自动切中继、恢复自动切回 |
+| `UdpPunchEnabled` | `false` | **UDP 打洞直连总开关**（1.5.29 起默认关闭）：同局域网环境曾出现"被控端→主控端"单向黑洞（视频分片/输入消息全丢而小包通畅），根因未查明前统一走 TCP（直连/中继）；查明后可开回 |
+| `PixelPipeline` | `bgra` | `nv12`=WGC 采集侧转 NV12（管道流量省 62%）——真机曾现色度损坏（1.5.28 回退），修复前 opt-in |
 | `CursorArbitrationEnabled` | `true` | 光标仲裁（本机用户独占真实光标） |
 
 ### 主控端 `config\viewer.json`
@@ -136,16 +140,19 @@ powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "w
 
 | 类型 | 名称 | 负载 |
 |------|------|------|
-| 0x01 | 视频帧 | `[8B 时间戳][N 字节 H.264]` |
+| 0x01 | 视频帧 | `[8B 时间戳][N 字节 H.264/H.265]` |
 | 0x02/0x03/0x04 | 鼠标移动/按键/滚轮 | 坐标+按键 |
 | 0x05 | 键盘 | `[2B vkCode][1B 抬落][1B 扩展]` |
 | 0x10 / 0x16 | 软件列表 / 运行状态 | JSON |
 | 0x11 / 0x12 | 打开 / 关闭软件 | UTF-8 路径（兼容 `{"exePath","args"}`）/ `[4B pid]` |
-| 0x13 | 重建码流 | 空 |
+| 0x13 | 重建码流 | 被控端→主控端带 `[1B 编码]`（0=H.264，1=H.265；空=H.264，旧版兼容）；主控端→被控端为空 |
 | 0x14 | 显示器信息 | JSON |
 | 0x15 | 请求软件列表 | 空 |
 | 0x20 / 0x21 | 剪贴板文本 / 文件(含文件夹)通知 | UTF-8 / JSON（`IsFolder`+`FolderName`） |
 | 0x30 | 心跳 | `[8B 时间戳]` |
+| 0x53 | 能力协商（主控端→被控端） | JSON `{capVer, h265Decode}`：双端都支持才启用 H.265（对标 UU 的 min/AND 协商语义） |
+| 0x56 / 0x57 | 诊断请求 / 报告 | 空 / JSON DiagnosticsInfo（引擎活性+链路+两份日志尾部；协调器直答，引擎卡死可用） |
+| 0x58 | 重启采集引擎 | 空（协调器直答：转储引擎栈+WM_QUIT，看门狗拉起新引擎） |
 | 0x61 | 画面范围切换 | `[1B CaptureMode]` |
 | 0xFE / 0xFF | 错误 / 断开 | UTF-8 / 空 |
 
@@ -191,6 +198,9 @@ powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "w
 | 7 | 光标仲裁（被同类远控挤掉时保留被动监听） | UU远程等共存时不丢"本机用户在场"判定 |
 | 8 | 热更新安全 | 更新码 ECDSA 签名 + sha256 双重比对 + 新版本 90s 未报平安自动回滚 |
 | 9 | 灰度发布 | 服务器按 AgentId 哈希 × rolloutPercent 决定哪台机器本轮看到新版本 |
+| 10 | H.265 编码协商（2026-10-10） | 主控端连上后上报能力（0x53），被控端"双端都支持才启用"（对标 UU 的 min/AND 语义）：auto 模式还要求本机有 H.265 硬件编码器（软编 libx265 太重不用）；切换时 StreamReset 带编码字节，主控端解码器按 hevc/h264 重建。灰度期间新旧版本互连自动落到 H.264 |
+| 11 | 码率升档探测（2026-10-10） | 自适应升档改为"探测式"：升一档 → 10 秒观察窗 → 再拥塞立即回滚 + 指数退避（1→2→5 分钟封顶），连续 5 分钟干净才清退避；帧率从第 2 档起一起降（30fps→22→20→…），档位表修了小码率配置下"降档反而升码率"的单调性 bug |
+| 12 | UDP 直连质量监控（2026-10-10） | 保活 ping 无应答率（10s 滑窗、发送侧可测）≥30% 持续 10s → 视频/控制切回中继（直连保活继续探测）；≤10% 持续 30s → 自动切回。拥塞判定同时纳入 ping 丢包；以前只有 3.5s 彻底断流才回落 |
 
 详见 `docs/架构-单会话共享与双光标.md` §9~§12。
 
@@ -200,12 +210,14 @@ powershell -ExecutionPolicy Bypass -File scripts\install-agent.ps1 -ServerUrl "w
 
 | 验收项 | 结果 |
 |--------|------|
-| 单元测试 | **80/80 通过** |
+| 单元测试 | **143/143 通过**（1.6.0：+EncoderCapability 9、+RsFec 10、+UdpKcpFec 9） |
 | 中继服务器（Go） | **全绿**（含热更新灰度/穿越防护/形状校验） |
 | 主控端侧集成测试 | 列表含「此电脑」置顶 ✔ / 文件夹接收进剪贴板 ✔ |
 | 帧级闪烁验证 | **198 帧零变化**（1.2.5 冷路径打开此电脑，主屏绝对零帧） |
 | 热更新真机闭环 | 1.2.1→1.2.2 全自主（检查→验签→下载→空闲→应用→报平安）✔ |
 | 伪造签名拒绝 | 真机收到伪造清单 → 拒绝并保持不动 ✔ |
+| 生产热更闭环 ×6 | 1.5.22→25→27→28→**29→30** 全自主应用（29/30 为 2026-10-11 客户现场事故当日双发，含客户自己机器）✔ |
+| 客户同网段环境 | UDP 打洞黑洞（1.5.29 停用）+ H.265 编码器错配（1.5.30 修缓存键）后，视频/点击恢复 ✔ |
 
 ---
 
@@ -223,7 +235,7 @@ python scripts\_rcp.py status
 python scripts\_publish_update.py build\agent-X.X.X.zip X.X.X "更新说明" 100
 
 # 中继
-Invoke-WebRequest http://__RELAY_HOST__:18080/healthz
+Invoke-WebRequest http://<中继地址>:18080/healthz
 ```
 
 ---

@@ -25,6 +25,11 @@ public partial class MainWindow : Window
     private VideoDecoder? _decoder;
     private readonly DirectLinkClient _direct = new(Logger.Current ?? new Logger("viewer"));
     private bool _directActive;
+    /// <summary>UDP 打洞直连通道（跨网络不走中继：STUN 自省 + 双向 HELLO 打洞）。
+    /// 连接时按当前口令创建，断开时销毁——通道本身绑定一次会话的随机数。</summary>
+    private UdpPunchChannel? _udp;
+    private bool _udpActive;
+    private CancellationTokenSource? _punchCts;
     private long _relayVideoBytes;
     private WorkerStatusInfo? _agentStatus;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(8) };
@@ -55,6 +60,8 @@ public partial class MainWindow : Window
     private const string OfflineHint = "被控端不在线：点「刷新」看看还有哪台在线";
     /// <summary>被控端是否正处于安全桌面（UAC 提权/锁屏）——只在状态翻转时提示一次</summary>
     private bool _secureDesktop;
+    /// <summary>本机 ffmpeg 能否解 H.265（启动时探测一次；能力协商上报给被控端，双端都支持才启用 H.265）</summary>
+    private bool _hevcDecodeOk;
 
     public MainWindow()
     {
@@ -100,9 +107,60 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         InstallClipboardListener();
+        _ = Task.Run(ProbeHevcDecodeAsync);
         _ = RefreshAgentsAsync();
         if (_cfg.AutoConnect && !string.IsNullOrWhiteSpace(AgentBox.Text))
             Connect();
+    }
+
+    /// <summary>
+    /// 探测本机 ffmpeg 是否带 hevc 解码器（一次 `ffmpeg -decoders`，几百毫秒）。
+    /// 探测结果用于能力协商：被控端只有收到"主控端能解 H.265"才会编 H.265（同画质带宽约省一半）。
+    /// 探测晚于连接完成时补发一次能力上报（晚一拍只会让本会话维持 H.264，重连即升级）。
+    /// </summary>
+    private void ProbeHevcDecodeAsync()
+    {
+        try
+        {
+            var ffmpeg = FfmpegLocator.Resolve(_cfg.FfmpegPath);
+            if (ffmpeg == null)
+            {
+                _log.Warn("未找到 ffmpeg.exe：能力协商按「不支持 H.265」上报（远端将保持 H.264）");
+                return;
+            }
+            var psi = new ProcessStartInfo(ffmpeg, "-hide_banner -decoders")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return;
+            var text = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(5000);
+            _hevcDecodeOk = text.Contains(" hevc", StringComparison.Ordinal);
+            _log.Info($"本机解码能力：H.265/hevc 解码 {(_hevcDecodeOk ? "可用" : "不可用")}（协商结果将上报被控端）");
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"hevc 解码探测失败（按不支持上报）：{ex.Message}");
+        }
+        try
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (_ws.IsConnected) SendCaps();
+            });
+        }
+        catch { }
+    }
+
+    /// <summary>向被控端上报本端能力（H.265 协商用，对标 UU 的双端 min/AND 协商语义）</summary>
+    private void SendCaps()
+    {
+        if (!_ws.IsConnected) return;
+        _ws.Queue(new ProtocolMessage(MessageType.Capabilities,
+            JsonCodec.Encode(new CapabilitiesInfo { CapVer = 1, H265Decode = _hevcDecodeOk })));
     }
 
     private void WireEvents()
@@ -152,10 +210,13 @@ public partial class MainWindow : Window
             ConnInfo.Text = "";
             Screen.ShowPlaceholder("等待画面…");
             ShowEmptyHint(_agentOffline ? OfflineHint : "已连接，正在读取被控端软件列表…");
+            // 中继自动重连成功后重建 UDP 打洞通道（首次连接时 Connect 里已建过，这里判空跳过）
+            if (_udp == null) StartUdpPunch();
             // 请求软件列表
             _ws.Queue(new ProtocolMessage(MessageType.RequestSoftwareList, PayloadCodec.Empty()));
             SendInputMode();       // 每次连上都重新告知鼠标模式（被控端可能刚重启）
             SendCaptureMode();     // 画面范围同理
+            SendCaps();            // 本端能力（H.265 协商；探测未完成时先按 H.264 上报，完成后补发）
             _ = CheckUpdateAsync();   // 顺带查一次更新（清单没有/验签不过=安静无事）
         });
 
@@ -167,10 +228,11 @@ public partial class MainWindow : Window
             StatusDot.Text = "🔴";
             ConnectBtn.Content = "连接";
             ConnInfo.Text = "";   // 断开的原因进日志，界面上不铺技术细节
-            // P2P 直连只在"中继在线"期间才合法：中继断了（含授权到期被服务器踢掉）就停掉直连，
-            // 否则画面会在没有中继/没有授权的情况下继续走直连。
+            // P2P 直连（TCP/UDP 打洞）只在"中继在线"期间才合法：中继断了（含授权到期被服务器踢掉）
+            // 就停掉直连，否则画面会在没有中继/没有授权的情况下继续走直连。
             _direct.Stop();
             _directActive = false;
+            StopUdpPunch();
             _agentStatus = null;
             _secureDesktop = false;
             UpdateLinkModeText();
@@ -259,9 +321,28 @@ public partial class MainWindow : Window
         _ws.LatencyMeasured += ms => Dispatcher.Invoke(() =>
         {
             _lastLatency = ms;
-            LatencyText.Text = $"延迟: {ms}ms";
+            // UDP 直连已建立时优先显示直连 RTT（中继心跳的 170ms+ 不再代表实际链路）
+            var udp = _udp;
+            if (udp is { IsLive: true } && udp.RttMs > 0)
+                LatencyText.Text = $"延迟: {udp.RttMs}ms";
+            else
+                LatencyText.Text = $"延迟: {ms}ms";
         });
         _ws.MessageReceived += OnRemoteMessage;
+        _ws.PunchInfoReceived += payload =>
+        {
+            // 被控端的 UDP 打洞候选到了（含它生成的会话随机数 + 对称 NAT 标志）→ 对着它的候选开打。
+            // 任一侧是对称 NAT 都无望：直接不打（走中继），别开 20 秒白费窗口。
+            var udp = _udp;
+            if (udp == null || LinkMode == "relay") return;   // 用户选了"仅中继"：不打洞
+            var (nonce, eps, peerSym, peerCap) = UdpPunchChannel.DecodeOffer(payload);
+            if (peerSym)
+            {
+                _log.Info("被控端上报疑似对称 NAT：UDP 直连无望，本次走中继");
+                return;
+            }
+            if (eps.Count > 0) udp.OfferPeers(eps, nonce, peerCap);   // 能力位随 offer 一起进通道（KCP/RS-FEC 的 AND 协商）
+        };
 
         Screen.RemoteMouseMove += (x, y) => SendInputMessage(MessageType.MouseMove, PayloadCodec.EncodeMouseMove((ushort)x, (ushort)y));
         Screen.RemoteMouseButton += (x, y, b, up) => SendInputMessage(MessageType.MouseButton, PayloadCodec.EncodeMouseButton((ushort)x, (ushort)y, b, up));
@@ -324,7 +405,78 @@ public partial class MainWindow : Window
         _vm.AgentText = _cfg.TargetAgentId;
         EnsureDecoder();
         _ws.Token = _cfg.AgentToken;
+        StartUdpPunch();
         _ws.Start(_cfg.ServerUrl, _cfg.TargetAgentId, _cfg.ServerUrlFallbacks);
+    }
+
+    /// <summary>
+    /// 【2026-10-10 UU 式直连】启动 UDP 打洞：创建通道（绑定当前口令）、接消息、
+    /// 起一个 10 秒节奏的泵——收集本端候选（STUN 公网映射+内网）并把 PunchInfo 经中继发给被控端，
+    /// 直到打洞成功或断开。被控端收到后对发 HELLO，锥形 NAT 上双向一通即直连。
+    /// </summary>
+    private void StartUdpPunch()
+    {
+        StopUdpPunch();
+        var udp = new UdpPunchChannel(_log, PunchRole.Viewer, _cfg.AgentToken);
+        _udp = udp;
+        _udpActive = false;
+        // 直连上的一切消息走与中继/TCP直连**完全相同**的处理（视频快路径 + 状态/列表/剪贴板）
+        udp.MessageReceived += msg =>
+        {
+            if (msg.Type == MessageType.VideoFrame)
+            {
+                var (_, data) = PayloadCodec.DecodeVideoFrame(msg.Payload);
+                _lastBytes += data.Length;              // 直连字节计入码率统计
+                EnsureDecoder();
+                _decoder!.Feed(data, 0, data.Length);
+                return;
+            }
+            OnRemoteMessage(msg);
+        };
+        udp.Live += () => Dispatcher.BeginInvoke(() =>
+        {
+            _udpActive = true;
+            UpdateLinkModeText();
+            _log.Info($"UDP 打洞直连已建立（{udp.PeerEndpoint}，RTT≈{udp.RttMs}ms）：输入/视频改走直连，中继保底");
+        });
+        udp.Dead += () => Dispatcher.BeginInvoke(() =>
+        {
+            if (!_udpActive) return;
+            _udpActive = false;
+            UpdateLinkModeText();
+            _log.Info("UDP 直连判死：输入/视频回落中继（通道会自动尝试重新打洞）");
+        });
+
+        var cts = new CancellationTokenSource();
+        _punchCts = cts;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!cts.IsCancellationRequested && _ws.IsRunning && ReferenceEquals(_udp, udp))
+                {
+                    // 本端对称 NAT 时不再发候选：对端拿这些地址打不进来，别让它白开打洞窗口
+                    if (_ws.IsConnected && !udp.IsLive && !udp.SymmetricNat && LinkMode != "relay")
+                    {
+                        await udp.EnsureCandidatesAsync();
+                        if (_ws.IsConnected && !udp.IsLive && !udp.SymmetricNat && LinkMode != "relay")
+                            _ws.Queue(new ProtocolMessage(MessageType.PunchInfo, udp.OfferPayload()));
+                    }
+                    await Task.Delay(TimeSpan.FromSeconds(10), cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { _log.Debug($"UDP 打洞泵结束：{ex.Message}"); }
+        });
+    }
+
+    private void StopUdpPunch()
+    {
+        try { _punchCts?.Cancel(); } catch { }
+        _punchCts = null;
+        _udpActive = false;
+        try { _udp?.Dispose(); } catch { }
+        _udp = null;
     }
 
     /// <summary>创建解码器并接上"积压丢块 → 重建解码器 + 请求被控端重建码流"的反馈环</summary>
@@ -344,6 +496,7 @@ public partial class MainWindow : Window
     {
         _direct.Stop();
         _directActive = false;
+        StopUdpPunch();
         _agentStatus = null;
         _ws.Stop();
         _decoder?.Stop();
@@ -357,8 +510,13 @@ public partial class MainWindow : Window
     /// </summary>
     private void UpdateLinkModeText()
     {
-        // 只显示"当前链路"这一件事；帧数等实现细节不面向用户展示
-        LinkModeText.Text = _directActive ? "连接: 直连" : "连接: 中继";
+        // 只显示"当前链路"这一件事；帧数等实现细节不面向用户展示。
+        // UDP 打洞直连也归"直连"（用户不需要区分 TCP/UDP 两种打法）。
+        // 被控端因丢包把直连暂停时（路径质量监控），明确说出"已临时切换"，免得看着像直连坏了。
+        if (_agentStatus?.UdpSuspended == true)
+            LinkModeText.Text = "连接: 中继（直连丢包，已自动切换）";
+        else
+            LinkModeText.Text = (_udpActive || _directActive) ? "连接: 直连" : "连接: 中继";
     }
 
     /// <summary>左侧软件列表为空时给一句话：空面板不解释的话，用户只会以为坏了</summary>
@@ -473,14 +631,19 @@ public partial class MainWindow : Window
         LinkModeBox.SelectedIndex = idx;
     }
 
-    /// <summary>应用链路偏好：切到"仅中继"时立刻断开已有的直连；切回来则等下一次候选推送重试</summary>
+    /// <summary>应用链路偏好：切到"仅中继"时立刻断开已有的直连（TCP/UDP）；切回来则等下一次候选推送重试</summary>
     private void ApplyLinkMode()
     {
-        if (LinkMode == "relay" && _directActive)
+        if (LinkMode == "relay" && (_directActive || _udpActive))
         {
             _direct.Stop();
             _directActive = false;
-            _log.Info("已切到仅中继：断开 P2P 直连，视频改走中继");
+            StopUdpPunch();
+            _log.Info("已切到仅中继：断开直连（含 UDP 打洞），视频/输入改走中继");
+        }
+        else if (LinkMode != "relay" && _udp == null && _ws.IsConnected)
+        {
+            StartUdpPunch();   // 从"仅中继"切回自动/仅直连：重新开始 UDP 打洞
         }
         UpdateLinkModeText();
     }
@@ -691,7 +854,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>主控端自身版本（热更新提示用，2026-10 新增；主控端不做自动应用——数量少、用户是厂商自己人，提示下载即可）</summary>
-    public const string ViewerVersion = "1.2.4";
+    public const string ViewerVersion = "1.2.8";
 
     /// <summary>
     /// 查更新清单：验签通过且版本比自己新 → 状态栏提示"有新版本"，点一下用浏览器打开下载页。
@@ -751,6 +914,20 @@ public partial class MainWindow : Window
 
     private void SendInputMessage(MessageType type, byte[] payload)
     {
+        // 【2026-10-10 UU 式直连】UDP 打洞直连优先：输入是"手感"的第一来源（点一下要 ~170ms
+        // 才到被控端就是"慢一拍"的元凶）。移动=单包尽力而为（旧位置重传无意义），
+        // 点击/按键/滚轮=可靠分片（250ms 没确认自动走中继补发，被控端按序号去重不会双击）。
+        var udp = _udp;
+        if (udp is { IsLive: true })
+        {
+            if (type == MessageType.MouseMove)
+            {
+                udp.SendMove(new ProtocolMessage(type, payload));
+                return;
+            }
+            udp.Send(new ProtocolMessage(type, payload), m => { if (_ws.IsConnected) _ws.Queue(m); });
+            return;
+        }
         if (!_ws.IsConnected) return;
         _ws.Queue(new ProtocolMessage(type, payload));
     }
@@ -764,11 +941,11 @@ public partial class MainWindow : Window
             case MessageType.VideoFrame:
             {
                 var (_, data) = PayloadCodec.DecodeVideoFrame(msg.Payload);
-                if (_directActive || LinkMode == "direct")
+                if (_directActive || _udpActive || LinkMode == "direct")
                 {
                     // 直连已启用（或用户选了"仅直连"）：忽略中继来的视频
                     _relayVideoBytes += data.Length;
-                    if (!_directActive)
+                    if (!_directActive && !_udpActive)
                         Dispatcher.Invoke(() => Screen.ShowPlaceholder("仅直连模式：等待 P2P 直连建立…"));
                     break;
                 }
@@ -822,8 +999,16 @@ public partial class MainWindow : Window
                 break;
             }
             case MessageType.StreamReset:
-                _decoder?.Reset("对端重建码流");
+            {
+                // 负载带编码字节（2026-10-10 H.265 协商）：空/0 = H.264，1 = H.265。
+                // 旧被控端发的重置没有负载 → 维持 H.264，天然兼容。
+                bool h265 = PayloadCodec.DecodeStreamReset(msg.Payload);
+                EnsureDecoder();
+                _decoder!.SetCodec(h265 ? "h265" : "h264");
+                _decoder.Reset(h265 ? "对端重建码流（H.265）" : "对端重建码流");
+                if (h265) _log.Info("被控端已切换为 H.265 码流（解码器已按 hevc 重建）");
                 break;
+            }
 
             case MessageType.SoftwareList:
             {
@@ -958,6 +1143,8 @@ public partial class MainWindow : Window
     private long _lastRingDropped, _lastRelayDropped;
     /// <summary>链路是否处于拥塞状态（被控端丢块 / 中继丢弃 / 已降档）</summary>
     private bool _congested;
+    /// <summary>上一次"副屏空窗"提示状态（翻转时显示/清除画面提示）</summary>
+    private bool _virtualEmptyShown;
     /// <summary>上一次上报的"光标被抢/采集屏是虚拟外屏"状态（只在翻转时记日志）</summary>
     private bool _cursorContested, _captureIsVirtual = true;
     private static readonly System.Windows.Media.Brush AgentStateWarn =
@@ -984,10 +1171,29 @@ public partial class MainWindow : Window
         _lastRelayDropped = ws.RelayDropped;
         _congested = ringDelta > 0 || relayDelta > 0 || ws.AdaptiveLevel > 0;
 
+        // 副屏空窗提示（2026-10-10）：被控端报告"副屏上没有任何窗口"——多半是断开较久后
+        // 孤儿回收把窗口搬回了主屏。明确说出来并给路径，而不是让人对着空屏以为点击失灵。
+        bool emptyNow = ws.VirtualScreenEmpty;
+        if (emptyNow != _virtualEmptyShown)
+        {
+            _virtualEmptyShown = emptyNow;
+            if (emptyNow)
+            {
+                _log.Warn("被控端报告：副屏上当前没有任何窗口（可能已被搬回主屏）");
+                Screen.SetLayoutNotice("副屏上没有窗口：断开较久时窗口会自动搬回主屏 —— " +
+                                       "切到「主屏」画面点一下窗口即可搬回，或从左侧列表打开软件");
+            }
+            else
+            {
+                Screen.SetLayoutNotice(null);
+            }
+        }
+
         // 状态栏宽度有限（窗口 1280 宽），这里只放最关键的一行；完整细节进悬停提示
         var brief = new System.Text.StringBuilder();
         brief.Append($"被控端 {ws.CaptureFps:F0}fps");
         if (ws.AdaptiveLevel > 0) brief.Append($" / {ws.BitrateKbps}k×{ws.AdaptiveLevel}档");
+        if (CodecPolicy.IsH265(ws.Codec)) brief.Append(" H.265");
         if (ringDelta > 0 || relayDelta > 0) brief.Append($" ⚠丢 {Math.Max(ringDelta, relayDelta)} 块/s");
 
         // 输入落在哪块屏、走的哪条路 —— 现场"看着副屏点、结果点到主屏"就是靠这一行定位的。
@@ -1015,8 +1221,12 @@ public partial class MainWindow : Window
         detail.AppendLine($"被控端采集：{ws.CaptureFps:F1}fps（编码 {ws.EncodeFps:F1}fps）");
         if (!string.IsNullOrEmpty(ws.Backend)) detail.AppendLine($"采集后端：{ws.Backend}");
         detail.AppendLine($"当前码率：{ws.BitrateKbps}kbps / {ws.FrameRate}fps（自适应档位 {ws.AdaptiveLevel}）");
+        if (!string.IsNullOrEmpty(ws.Codec)) detail.AppendLine($"视频编码：{(CodecPolicy.IsH265(ws.Codec) ? "H.265（带宽约省一半）" : "H.264")}");
         detail.AppendLine($"累计发送：{ws.FramesSent} 帧 / {ws.BytesSent / 1048576}MB");
         detail.AppendLine($"链路：帧环丢块 {ws.RingDropped}，中继积压 {ws.RelayQueued}，中继丢弃 {ws.RelayDropped}");
+        if (ws.UdpActive)
+            detail.AppendLine($"UDP 直连：RTT {ws.UdpRtt}ms，视频残帧率 {ws.UdpLoss}%，保活丢包 {ws.UdpPingLoss}%" +
+                              (ws.UdpSuspended ? "（⚠ 丢包超标，视频已临时切中继，恢复后自动切回）" : ""));
         detail.AppendLine($"输入换算基准：({ws.InputBaseX},{ws.InputBaseY})" +
                           (ws.CaptureIsVirtual ? "（虚拟外屏）" : "（⚠ 物理屏：虚拟外屏没装上或被关掉了）"));
         detail.AppendLine($"远端鼠标路径：{(string.Equals(ws.InputPath, "background", StringComparison.OrdinalIgnoreCase) ? "后台定向注入" : "真实光标")}" +

@@ -4,7 +4,7 @@ using Agent.Common;
 namespace Agent.Worker;
 
 /// <summary>
-/// 画面采集抽象：把一帧 BGRA 像素写入目标流（尺寸 = Width×Height）
+/// 画面采集抽象：把一帧像素写入目标流（尺寸 = Width×Height）
 /// </summary>
 public abstract class FrameSource : IDisposable
 {
@@ -12,7 +12,14 @@ public abstract class FrameSource : IDisposable
     public int Height { get; protected set; }
     public abstract string Backend { get; }
 
-    /// <summary>采集一帧并写入 output（BGRA32，行序自上而下，无 padding）</summary>
+    /// <summary>
+    /// 输出像素格式（"bgra" / "nv12"，2026-10-10 NV12 管道）：编码器据此定 ffmpeg 的
+    /// -pixel_format。NV12 管道流量比 BGRA 省 62%（1080p30：250MB/s → 93MB/s），
+    /// 且 qsv/nvenc/amf 的原生输入就是 NV12（ffmpeg 内不再做色彩转换）。
+    /// </summary>
+    public virtual string PixelFormat => "bgra";
+
+    /// <summary>采集一帧并写入 output（按 <see cref="PixelFormat"/> 的布局，行序自上而下，无 padding）</summary>
     public abstract bool Capture(Stream output, out string error);
 
     public virtual void Dispose() { }
@@ -95,10 +102,35 @@ public sealed unsafe class GdiFrameSource : FrameSource
     }
 }
 
+/// <summary>
+/// DDA 显卡直通的占位采集源（2026-10-10）：ffmpeg 自己用 ddagrab 在显卡上采集，
+/// 外部不需要也不应该喂帧 —— 这个类只为让 WorkerContext 的"采集目标尺寸"逻辑照常工作。
+/// </summary>
+public sealed class DdaStubSource : FrameSource
+{
+    public override string Backend => "DDA";
+
+    public DdaStubSource(DisplayInfo target)
+    {
+        Width = target.Width;
+        Height = target.Height;
+    }
+
+    public override bool Capture(Stream output, out string error)
+    {
+        // 正常流程不会调到这里（采集循环对 SelfCapture 编码器跳过喂帧）
+        error = "DDA 自采集模式：ffmpeg 内部采集，外部不喂帧";
+        return false;
+    }
+}
+
+// PixelFormat 说明：GDI/画布拼接输出 BGRA（基类默认），WGC 输出 NV12（见 WgcFrameSource）。
+
 public static class FrameSourceFactory
 {
-    /// <summary>按配置创建采集源：auto → 先试 WGC，失败退 GDI</summary>
-    public static FrameSource Create(string backend, DisplayInfo target, Logger log)
+    /// <summary>按配置创建采集源：auto → 先试 WGC，失败退 GDI。
+    /// pixelPipeline：bgra（默认）/ nv12（opt-in，见 AppConfig.PixelPipeline 的真机问题说明）。</summary>
+    public static FrameSource Create(string backend, DisplayInfo target, Logger log, string pixelPipeline = "bgra")
     {
         backend = (backend ?? "auto").Trim().ToLowerInvariant();
         if (backend == "gdi")
@@ -110,7 +142,7 @@ public static class FrameSourceFactory
         {
             try
             {
-                var wgc = new WgcFrameSource(target, log);
+                var wgc = new WgcFrameSource(target, log, nv12Pipeline: string.Equals(pixelPipeline, "nv12", StringComparison.OrdinalIgnoreCase));
                 log.Info("使用 Windows.Graphics.Capture 采集");
                 return wgc;
             }

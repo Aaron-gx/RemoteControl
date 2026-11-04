@@ -134,6 +134,13 @@ public sealed class WindowManager
                 if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd") return true;
                 NativeApi.GetWindowThreadProcessId(h, out int pid);
                 if (pid == 0 || pid == Environment.ProcessId) return true;
+
+                // 【2026-10-10 右键菜单跑主屏·另一半】菜单/下拉弹窗：跳过所有"进程基线"判据
+                // （菜单属于早已在跑的进程，baselinePids 必然包含它，以前因此永远没人搬）。
+                // 远端在操作、本机没动手的时段里出现在**物理屏**上的菜单，就是远端点出来却被
+                // 系统摆错位置的 —— 夹进外屏让它回到远端看得见的地方（位置就近平移，不改大小）。
+                if (TrySweepPopup(h, target)) return true;
+
                 // 只搬"快照之后新起来的进程"的窗口：本机用户原来开着的程序一个都不动
                 if (baselinePids.Count > 0 && baselinePids.Contains(pid)) return true;
                 if (!NativeApi.GetWindowRect(h, out var r)) return true;
@@ -198,6 +205,43 @@ public sealed class WindowManager
             }, IntPtr.Zero);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// 虚拟外屏上当前有多少个可见的应用窗口（-1 = 没有虚拟屏）。
+    /// 0 = 空屏：主控端据此提示"窗口可能都已被搬回主屏"，而不是让人对着黑壁纸猜软件坏了
+    /// （2026-10-10 现场：客户重连后看到空副屏，以为"点击失灵"）。
+    /// </summary>
+    public int CountVisibleWindowsOnVirtual()
+    {
+        var virt = VirtualScreenProvider?.Invoke();
+        if (virt is not { IsVirtual: true }) return -1;
+        int count = 0;
+        try
+        {
+            NativeApi.EnumWindows((h, _) =>
+            {
+                try
+                {
+                    if (!NativeApi.IsWindow(h) || !NativeApi.IsWindowVisible(h)) return true;
+                    if (NativeApi.GetAncestor(h, NativeApi.GA_ROOT) != h) return true;
+                    if (IsShellWindow(h)) return true;
+                    if (!IsSaneWindow(h)) return true;
+                    NativeApi.GetWindowThreadProcessId(h, out int pid);
+                    if (pid == 0 || pid == Environment.ProcessId) return true;
+                    if (!NativeApi.GetWindowRect(h, out var r)) return true;
+                    if (r.Right <= r.Left || r.Bottom <= r.Top) return true;
+                    // 与孤儿回收同判据：整块落在虚拟外屏上才算"在这块屏上"
+                    if (r.Left >= virt.Left && r.Right <= virt.Right &&
+                        r.Top >= virt.Top && r.Bottom <= virt.Bottom)
+                        count++;
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+        return count;
     }
 
     /// <summary>
@@ -433,9 +477,88 @@ public sealed class WindowManager
         return set;
     }
 
-    /// <summary>在远程会话中启动软件，返回 pid</summary>
-    public int Open(string exePath, string? arguments = null)
+    /// <summary>
+    /// 是不是"菜单/下拉"这类**瞬态弹窗**：#32768（经典右键菜单/系统菜单）、Win11 新版右键菜单
+    /// （XamlExplorerHostIslandWindow）、或有属主的无标题栏 WS_POPUP（下拉框/组合框列表）。
+    /// 【2026-10-10 右键菜单跑主屏】它们出现在哪由"点击发生在哪"决定，不由进程归属决定：
+    /// 菜单属于早已在跑的进程（explorer/应用本体），按 pid 基线一刀切会把远端点出来的菜单漏掉
+    /// （落到物理屏就没人搬）；反过来把出现在外屏的菜单当"本机用户开的窗口"搬回主屏也不对
+    /// —— 本机用户的物理点击永远落在物理屏（仲裁器保证），出现在外屏的菜单必是远端点出来的。
+    /// </summary>
+    private static bool IsTransientPopup(IntPtr h)
     {
+        try
+        {
+            var cls = NativeApi.GetClassName(h);
+            if (cls is "#32768" or "XamlExplorerHostIslandWindow") return true;
+            int style = NativeApi.GetWindowStyle(h);
+            const int WS_POPUP = unchecked((int)0x80000000);
+            const int WS_CAPTION = 0x00C00000;
+            return (style & WS_POPUP) != 0 && (style & WS_CAPTION) == 0
+                   && NativeApi.GetWindow(h, NativeApi.GW_OWNER) != IntPtr.Zero;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// 弹窗搬移的公共实现（SweepNewWindowsFromPhysical 的弹窗分支与 SweepPopupsFromPhysical 共用）：
+    /// h 是瞬态弹窗且落在物理屏上 → 就近平移夹进外屏。返回"是否已处理"（是弹窗就算处理完，
+    /// 调用方不必再走普通窗口的判据）。菜单生命周期极短，按句柄记账防反复搬。
+    /// </summary>
+    private bool TrySweepPopup(IntPtr h, DisplayInfo target)
+    {
+        if (!IsTransientPopup(h)) return false;
+        if (!NativeApi.IsWindow(h) || !NativeApi.IsWindowVisible(h)) return true;
+        if (_swept.Contains(h)) return true;
+        if (NativeApi.GetWindowRect(h, out var mr))
+        {
+            bool menuOnVirtual = mr.Left >= target.Left && mr.Left < target.Right &&
+                                 mr.Top >= target.Top && mr.Top < target.Bottom;
+            if (!menuOnVirtual)
+            {
+                int mw = mr.Right - mr.Left, mh = mr.Bottom - mr.Top;
+                int mx = Math.Clamp(mr.Left, target.Left, Math.Max(target.Left, target.Right - mw));
+                int my = Math.Clamp(mr.Top, target.Top, Math.Max(target.Top, target.Bottom - mh));
+                if (NativeApi.SetWindowPos(h, IntPtr.Zero, mx, my, 0, 0,
+                        NativeApi.SWP_NOSIZE | NativeApi.SWP_NOZORDER | NativeApi.SWP_NOACTIVATE))
+                {
+                    long n = Interlocked.Increment(ref _menuSweepLog);
+                    if (n <= 2 || n % 20 == 0)
+                        _log.Info($"远端的菜单/下拉落在了物理屏 ({mr.Left},{mr.Top}) → 已搬回外屏 ({mx},{my})，累计 {n} 次");
+                }
+            }
+        }
+        _swept.Add(h);
+        return true;
+    }
+
+    /// <summary>
+    /// 菜单/下拉弹窗专扫（2026-10-10 右键菜单跑主屏）：**通用** Sweep 只在 Win+R 会话期跑，
+    /// 而右键随时发生。远端在操作、本机没动键鼠的时段里，每秒扫一遍顶层窗口，
+    /// 把落在物理屏上的瞬态弹窗（#32768/XAML 菜单/有属主的下拉）搬回外屏。
+    /// 只碰弹窗、不碰普通窗口，开销极小（EnumWindows + 类名/样式判断）。
+    /// </summary>
+    public int SweepPopupsFromPhysical()
+    {
+        var target = _captureTarget;
+        if (target == null) return 0;
+        if (_swept.Count > 400) _swept.Clear();
+        int moved = 0;
+        NativeApi.EnumWindows((h, _) =>
+        {
+            try
+            {
+                if (h == IntPtr.Zero) return true;
+                if (TrySweepPopup(h, target)) moved++;
+            }
+            catch { }
+            return true;
+        }, IntPtr.Zero);
+        return moved;
+    }
+
+    /// <summary>在远程会话中启动软件，返回 pid</summary>
+    public int Open(string exePath, string? arguments = null)    {
         if (!File.Exists(exePath))
         {
             _log.Error($"打开失败：文件不存在 {exePath}");
@@ -725,6 +848,11 @@ public sealed class WindowManager
             if (!NativeApi.IsWindow(hwnd) || !NativeApi.IsWindowVisible(hwnd)) return;
             if (NativeApi.GetAncestor(hwnd, NativeApi.GA_ROOT) != hwnd) return;
             if (IsShellWindow(hwnd)) return;
+            // 【2026-10-10 右键菜单跑主屏】菜单/下拉永远不反向搬：出现在外屏的菜单必是远端
+            // 在外屏点出来的（本机用户的物理点击被仲裁器留在物理屏）。以前误用"最近 15 秒本机
+            // 动过键鼠"判断 —— 机器上装有向日葵/GameViewer 等会剥掉注入位的钩子链时，远端的
+            // 右键被记成"本机输入"，菜单刚在外屏弹出就被搬去主屏（现场：副屏右键菜单跑主屏）。
+            if (IsTransientPopup(hwnd)) return;
             var cls = NativeApi.GetClassName(hwnd);
             bool console = cls.Contains("ConsoleWindow") || cls.Contains("CASCADIA_HOSTING");
             if (!console && !IsSaneWindow(hwnd)) return;
@@ -762,6 +890,8 @@ public sealed class WindowManager
     /// <summary>虚拟外屏信息提供者（由 WorkerContext 注入：副屏判定跟随采集拓扑，而非仅捕获目标）</summary>
     public Func<DisplayInfo?>? VirtualScreenProvider;
     private long _reversePullLog;
+    /// <summary>菜单搬回外屏的日志计数（限流用）</summary>
+    private long _menuSweepLog;
 
     /// <summary>
     /// CREATE 事件的**预定位**（零闪烁的关键）：窗口刚创建、还没显示 —— explorer 这类程序创建窗口时

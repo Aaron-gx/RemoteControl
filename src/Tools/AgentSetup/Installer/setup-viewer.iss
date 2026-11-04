@@ -205,10 +205,17 @@ end;
 
 { ---- 文件就位后写预置值 ----
   程序启动时会把 config\viewer.json 里**为空**的项用这份文件补齐（已有配置优先），
-  所以它既保证"装完即用"，又不会覆盖用户自己填过的值。 }
+  所以它既保证"装完即用"，又不会覆盖用户自己填过的值。
+  【2026-10-12 换服务器事故补充】服务器地址/口令例外：它们是分发方随包指定的，不是用户
+  手填的个人偏好——已有配置里的旧地址若不覆盖，客户装了新包还是连老服务器（本次换服务器
+  多台机器踩中、设备列表全空）。所以升级安装时把这两项直接写进已有 viewer.json。 }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Lines: TArrayOfString;
+  CfgLines: TArrayOfString;
+  NewSrv: string;
+  NewTok: string;
+  I: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -217,6 +224,24 @@ begin
     Lines[1] := 'ServerUrl=ws://' + GetRelayServer('') + '/ws';
     Lines[2] := 'Token=' + GetToken('');
     SaveStringsToUTF8File(ExpandConstant('{app}\viewer-defaults.txt'), Lines, False);
+
+    if FileExists(ExpandConstant('{app}\config\viewer.json')) then
+    begin
+      if LoadStringsFromFile(ExpandConstant('{app}\config\viewer.json'), CfgLines) then
+      begin
+        NewSrv := 'ws://' + GetRelayServer('') + '/ws';
+        NewTok := GetToken('');
+        for I := 0 to GetArrayLength(CfgLines) - 1 do
+        begin
+          if Pos('"ServerUrl"', CfgLines[I]) > 0 then
+            CfgLines[I] := '  "ServerUrl": "' + NewSrv + '",'
+          else if (NewTok <> '') and (Pos('"AgentToken"', CfgLines[I]) > 0) then
+            CfgLines[I] := '  "AgentToken": "' + NewTok + '",';
+        end;
+        SaveStringsToUTF8File(ExpandConstant('{app}\config\viewer.json'), CfgLines, False);
+        Log('已把新服务器地址写进已有 config\viewer.json（换服务器升级覆盖）');
+      end;
+    end;
   end;
 end;
 

@@ -85,10 +85,25 @@ public sealed class AgentConfig
     // ---- 视频 ----
     public int FrameRate { get; set; } = 30;
     public int BitrateKbps { get; set; } = 4000;
+    /// <summary>
+    /// 视频编码族（2026-10-10，H.265 支持）：auto（默认）| h264 | h265。
+    /// auto = 能力协商后优先 H.265（主控端能解 + 本机有硬件 H.265 编码器才启用，
+    /// 同画质带宽约省一半）；显式 h264 可用于排查编码问题。
+    /// </summary>
+    public string VideoCodec { get; set; } = "auto";
     /// <summary>auto | libx264 | h264_nvenc | h264_qsv | h264_amf | h264_mf</summary>
     public string Encoder { get; set; } = "auto";
-    /// <summary>视频采集后端：auto | wgc | gdi</summary>
+    /// <summary>视频采集后端：auto | wgc | gdi | dda（2026-10-10 显卡直通：ffmpeg 用 ddagrab 在显卡上
+    /// 采集+编码，帧不过 CPU，对标 UU 的零拷贝管线；仅 N 卡 nvenc / A 卡 amf 可用，
+    /// 探测失败自动回退 WGC）</summary>
     public string CaptureBackend { get; set; } = "auto";
+    /// <summary>
+    /// 采集→编码像素管道（2026-10-11）：bgra（默认，久经验证）| nv12（管道流量省 62%）。
+    /// 【默认 bgra 的原因】nv12 在真机（nvenc/1920x1080）上发现底部条带持续性色度损坏
+    /// （解码器报 out of range intra chroma pred mode），原因待查——修复前 opt-in，
+    /// 不带病交付。单测/本机冒烟均通过，问题仅在真机编码链路复现。
+    /// </summary>
+    public string PixelPipeline { get; set; } = "bgra";
     public string FfmpegPath { get; set; } = "";
     /// <summary>码流帧通道容量（字节）。旧架构里是跨进程共享内存的大小，现在只是进程内队列的限容。</summary>
     public int FrameBufferSizeBytes { get; set; } = 4 * 1024 * 1024;
@@ -102,6 +117,23 @@ public sealed class AgentConfig
     public bool UpnpEnabled { get; set; } = true;
     /// <summary>手动指定公网地址（已做端口映射时填，如 1.2.3.4:47890）</summary>
     public string DirectLinkPublicAddress { get; set; } = "";
+
+    /// <summary>
+    /// UDP 直连质量监控（2026-10-10，对标 UU 的 filter_network_monitor）：ping 丢包持续超标时
+    /// 自动把视频/控制切回中继（直连保活并继续探测），恢复后自动切回。以前只有
+    /// "3.5 秒彻底断流"才回落，高丢包但不断的链路会一直糊在直连上。
+    /// </summary>
+    public bool UdpQualitySwitchEnabled { get; set; } = true;
+
+    /// <summary>
+    /// UDP 打洞直连总开关。【2026-10-11 客户现场事故】客户机与被控端同局域网时打洞秒成，
+    /// 视频/输入随即切到 UDP 直连 —— 但该路径"被控端→主控端"方向从未真正送达过
+    /// （ping/HELLO 小包通、视频分片与输入消息双向全丢），而 SendVideo 不校验送达、
+    /// RTT 显示值又是跨机器 TickCount64 相减出来的假 0，导致通道"看着活着"实际是黑洞：
+    /// 现场表现为画面全丢、点击全部无反应。根因（疑似路径 MTU/防火墙对大 UDP 单向拦截）
+    /// 未查明前默认关闭，走 TCP 直连/中继（局域网内 TCP 直连带宽同样够用）。
+    /// </summary>
+    public bool UdpPunchEnabled { get; set; } = false;
 
     // ---- 行为 ----
     public bool AutoStartOnBoot { get; set; } = true;

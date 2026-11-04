@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Agent.Common;
@@ -178,13 +178,23 @@ public static class DisplayHelper
         if (string.IsNullOrWhiteSpace(driverId)) return false;
         try
         {
-            var psi = new System.Diagnostics.ProcessStartInfo("pnputil", $"/restart-device \"{driverId}\"")
+            // 设备 ID 白名单校验（值来自本地配置，仍按不可信输入对待；只放行设备标识合法字符）
+            bool idOk = driverId.All(c => char.IsLetterOrDigit(c) || " .-()/".Contains(c) || c == (char)92);
+            if (!idOk)
+            {
+                log?.Invoke($"忽略非法的驱动设备 ID：{driverId}");
+                return false;
+            }
+            // ArgumentList 逐参数传递（不经 shell 拼接；2026-10-14 安全扫描整改）
+            var psi = new System.Diagnostics.ProcessStartInfo("pnputil")
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
+            psi.ArgumentList.Add("/restart-device");
+            psi.ArgumentList.Add(driverId);
             using var p = System.Diagnostics.Process.Start(psi);
             if (p == null) return false;
             var output = p.StandardOutput.ReadToEnd();

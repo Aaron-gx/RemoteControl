@@ -15,8 +15,30 @@ namespace LicenseKeygen;
 
 public partial class MainWindow : Window
 {
-    private const string DefaultKeyPath = @"E:\RemoteControl\license\private.pem";
-    private const string DefaultServer = "202.60.232.209:8080";
+    private const string DefaultKeyPath = @"E:\RemoteControl\license\private.pem";   // 旧机器布局，兜底用
+    private const string DefaultServer = "154.94.226.92:18080";
+
+    /// <summary>
+    /// 私钥自动发现（2026-10-29）：老版本把路径写死成 E:\RemoteControl（旧机器布局），
+    /// 换机器后"未找到私钥文件"。按候选顺序找仓库里的 license\private.pem：
+    /// 发布布局 build	ools → 上两级 = 仓库根；再兜底旧路径。
+    /// </summary>
+    internal static string DiscoverPrivateKeyPath()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "license", "private.pem"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "license", "private.pem"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "license", "private.pem"),
+            DefaultKeyPath,
+        };
+        foreach (var c in candidates)
+        {
+            try { if (File.Exists(Path.GetFullPath(c))) return Path.GetFullPath(c); }
+            catch { }
+        }
+        return DefaultKeyPath;
+    }
 
     /// <summary>启动时读到令牌的那句状态（默认的"正在读取服务器状态…"会把它冲掉，所以留一份）</summary>
     private string _tokenStatusAtStartup = "";
@@ -36,7 +58,7 @@ public partial class MainWindow : Window
         EnsureHistoryLoaded(force: true);
         StatusText.Text = _tokenStatusAtStartup.Length > 0
             ? _tokenStatusAtStartup
-            : File.Exists(DefaultKeyPath) ? "正在读取服务器状态…" : "未找到私钥文件";
+            : File.Exists(DiscoverPrivateKeyPath()) ? "正在读取服务器状态…" : "未找到私钥文件";
         UpdateInstallLink();    // 令牌/服务器都可能来自本机设置，先把安装入口链接填好
         SignBtn.Click += (_, _) => Sign();
         CopyBtn.Click += (_, _) =>
@@ -111,6 +133,8 @@ public partial class MainWindow : Window
 
         /// <summary>中继令牌（撤销/恢复/同步要用来调管理接口）。存在本机设置里，明文。</summary>
         public string Token { get; set; } = "";
+        /// <summary>厂商私钥路径（2026-10-29 进设置：以前不持久化，换机器/重启就要重选）。</summary>
+        public string Key { get; set; } = "";
     }
 
     private Settings _settings = new();
@@ -130,6 +154,7 @@ public partial class MainWindow : Window
         catch { _settings = new Settings(); }
 
         ServerBox.Text = string.IsNullOrWhiteSpace(_settings.Server) ? DefaultServer : _settings.Server;
+        KeyBox.Text = string.IsNullOrWhiteSpace(_settings.Key) ? DiscoverPrivateKeyPath() : _settings.Key;
         SubBox.Text = _settings.Sub;
         MaxViewBox.Text = _settings.MaxViewers.ToString();
         SetToken(_settings.Token ?? "");
@@ -194,6 +219,7 @@ public partial class MainWindow : Window
                 _settings.ValidDays = (int)Math.Round((ExpPicker.SelectedDate.Value - NbfPicker.SelectedDate.Value).TotalDays);
             _settings.LastLic = LicBox.Text.Trim();
             _settings.Token = TokenBox.Text.Trim();
+            _settings.Key = KeyBox.Text.Trim();
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(_settings,
                 new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -727,7 +753,7 @@ public partial class MainWindow : Window
         try
         {
             // 只填文件名时补成绝对路径：否则下面 GetDirectoryName 会拿到空串，CreateDirectory 直接抛异常
-            var keyPath = string.IsNullOrWhiteSpace(KeyPath) ? DefaultKeyPath : Path.GetFullPath(KeyPath);
+            var keyPath = string.IsNullOrWhiteSpace(KeyPath) ? DiscoverPrivateKeyPath() : Path.GetFullPath(KeyPath);
             if (File.Exists(keyPath) &&
                 MessageBox.Show("私钥已存在，覆盖会导致旧激活码全部失效。确定覆盖？", "激活码生成器",
                     MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)

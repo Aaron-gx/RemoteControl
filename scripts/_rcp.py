@@ -16,8 +16,29 @@ import sys
 
 import aiohttp
 
-RELAY = "__RELAY_HOST__:18080"
-TOKEN = "__RELAY_TOKEN__"
+# 中继地址与口令从 config\relay-token.txt 读（gitignore 已排除，绝不入版本库；2026-10-14 推 GitHub 前清密）
+# 格式：relay=IP:端口 / token=口令 / admin=管理口令；环境变量 RC_RELAY/RC_TOKEN 可覆盖
+_rcfg = {"relay": "", "token": ""}
+_rcfgPath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "config", "relay-token.txt")
+try:
+    for _raw in open(_rcfgPath, encoding="utf-8-sig"):
+        _line = _raw.strip()
+        if not _line or _line.startswith("#"):
+            continue
+        if "=" in _line:
+            _k, _v = _line.split("=", 1)
+            if _k.strip().lower() in _rcfg:
+                _rcfg[_k.strip().lower()] = _v.strip()
+        elif not _rcfg["token"]:
+            _rcfg["token"] = _line   # 旧格式兼容：整行就是中继口令
+except OSError:
+    pass
+RELAY = os.environ.get("RC_RELAY") or _rcfg["relay"]   # 换服务器：set RC_RELAY=新IP:端口
+TOKEN = os.environ.get("RC_TOKEN") or _rcfg["token"]
+if not RELAY or not TOKEN:
+    sys.exit("缺少中继地址/口令：请在 config\\relay-token.txt 里填 relay= 与 token=（该文件不入 git），"
+             "或设 RC_RELAY / RC_TOKEN 环境变量")
 
 import urllib.request
 agents = json.loads(urllib.request.urlopen(
@@ -30,6 +51,16 @@ if not AGENT:
 
 def frame(t: int, payload: bytes) -> bytes:
     return bytes([t]) + struct.pack(">I", len(payload)) + payload
+
+
+def safe_out_path(p) -> str:
+    """输出路径守卫（2026-10-14 安全扫描整改）：拒绝 .. 穿越——
+    诊断产物只写显式给定的绝对路径；路径里任何一段是 .. 直接拒绝。"""
+    raw = str(p).strip()
+    parts = raw.replace("/", os.sep).split(os.sep)
+    if ".." in parts:
+        raise SystemExit(f"拒绝穿越路径: {raw}")
+    return os.path.abspath(raw)
 
 async def session(cmd_args, seconds: float = 12.0):
     """连上被控端，保持 seconds 秒：期间执行 cmd_args 给出的动作，打印收到的所有关键消息"""
@@ -266,7 +297,7 @@ def main():
                     print(f"剪贴板出现 HELLO（Ctrl+C 生效）: {'✓' if hellos else '✗'}", flush=True)
                     if b64s:
                         try:
-                            open(r"D:\tools\vsk.png", "wb").write(_b.b64decode(b64s[-1]))
+                            open(safe_out_path(r"D:\tools\vsk.png"), "wb").write(_b.b64decode(b64s[-1]))
                             print("截图已存 D:\\tools\\vsk.png", flush=True)
                         except Exception as e:
                             print("截图解码失败:", e, flush=True)
@@ -440,7 +471,7 @@ Get-Content ($env:TEMP+'\kb3.txt') | clip
                             await ws.send_bytes(frame(0x30, payload))
                         elif t == 0x01:
                             buf.extend(payload)
-                    open(out_path, "wb").write(bytes(buf))
+                    open(safe_out_path(out_path), "wb").write(bytes(buf))
                     print(f"[saved {len(buf)} bytes -> {out_path}]", flush=True)
         asyncio.run(_cap())
     elif mode == "kbtest4":
@@ -508,7 +539,7 @@ Get-Content ($env:TEMP+'\kb3.txt') | clip
                             await ws.send_bytes(frame(0x30, payload))
                         elif t == 0x01:
                             buf.extend(payload)
-                    open(out_path, "wb").write(bytes(buf))
+                    open(safe_out_path(out_path), "wb").write(bytes(buf))
                     print(f"[saved {len(buf)} bytes -> {out_path}]", flush=True)
         asyncio.run(_kb4())
     elif mode == "kbtest5":
@@ -584,7 +615,7 @@ Get-Content ($env:TEMP+'\kb3.txt') | clip
                             txt = payload.decode("utf-8", "replace").strip()
                             clips.append(txt)
                             print(f"[CLIP#{len(clips)}] len={len(txt)} {txt[:60]!r}", flush=True)
-                    open(out_path, "wb").write(bytes(buf))
+                    open(safe_out_path(out_path), "wb").write(bytes(buf))
                     hellos = [c for c in clips if "HELLO" in c and len(c) < 100]
                     print("=" * 56, flush=True)
                     print(f"剪贴板出现 HELLO: {'✓ Ctrl+C/复制生效' if hellos else '✗ 未生效'}  clips={[c[:20] for c in clips]}", flush=True)
@@ -660,11 +691,58 @@ $ime=[IME6]::ImmGetDefaultIMEWnd($h)
                             await ws.send_bytes(frame(0x30, payload))
                         elif t == 0x01:
                             buf.extend(payload)
-                    open(out_path, "wb").write(bytes(buf))
+                    open(safe_out_path(out_path), "wb").write(bytes(buf))
                     print(f"[saved {len(buf)}B -> {out_path}]", flush=True)
         asyncio.run(_kb6())
     elif mode == "thispc":
         asyncio.run(session({"open": ("::this-pc", "")}, 15))
+    elif mode == "diag":
+        # 诊断（2026-10-11 healthd 式）：协调器直接应答（不经过引擎），引擎卡死也能用。
+        # 用法：python scripts\_rcp.py diag [tail行数]
+        tail_lines = int(sys.argv[2]) if len(sys.argv) > 2 else 40
+        async def _diag():
+            async with aiohttp.ClientSession() as s:
+                url = f"ws://{RELAY}/ws?role=viewer&target={AGENT}&token={TOKEN}"
+                async with s.ws_connect(url, max_msg_size=64 * 1024 * 1024) as ws:
+                    print(f"[connected -> {AGENT}]", flush=True)
+                    await ws.send_bytes(frame(0x15, b""))
+                    await asyncio.sleep(0.3)
+                    await ws.send_bytes(frame(0x56, b""))   # DiagnosticsRequest
+                    print("[sent DiagnosticsRequest]", flush=True)
+                    end = asyncio.get_event_loop().time() + 10
+                    while asyncio.get_event_loop().time() < end:
+                        try:
+                            msg = await ws.receive(timeout=max(0.1, end - asyncio.get_event_loop().time()))
+                        except asyncio.TimeoutError:
+                            break
+                        if msg.type != aiohttp.WSMsgType.BINARY:
+                            continue
+                        data = msg.data
+                        t, n = data[0], struct.unpack(">I", data[1:5])[0]
+                        payload = data[5:5 + n]
+                        if t == 0x30:
+                            await ws.send_bytes(frame(0x30, payload))
+                        elif t == 0x57:   # DiagnosticsReport
+                            d = json.loads(payload.decode("utf-8"))
+                            print("=" * 62, flush=True)
+                            for k in ("Timestamp", "AgentVersion", "EngineConnected", "EngineThreadAlive",
+                                      "StatusAgeMs", "ViewerCount", "RelayConnected", "RelayQueued", "RelayDropped",
+                                      "UdpActive", "UdpEndpoint", "UdpRtt", "UdpLoss", "UdpPingLoss", "UdpSuspended",
+                                      "ConfigSummary"):
+                                print(f"{k:20} = {d.get(k)}", flush=True)
+                            print("-" * 62, flush=True)
+                            wt = (d.get("WorkerLogTail") or "").splitlines()
+                            ct = (d.get("CoordinatorLogTail") or "").splitlines()
+                            print(f"--- WorkerLogTail（最后 {tail_lines} 行 / 共 {len(wt)} 行）---", flush=True)
+                            for line in wt[-tail_lines:]:
+                                print("  " + line, flush=True)
+                            print(f"--- CoordinatorLogTail（最后 {tail_lines} 行 / 共 {len(ct)} 行）---", flush=True)
+                            for line in ct[-tail_lines:]:
+                                print("  " + line, flush=True)
+                            print("=" * 62, flush=True)
+                            return
+                    print("!! 10 秒内没等到诊断报告（协调器不响应？）", flush=True)
+        asyncio.run(_diag())
     elif mode == "run":
         cmd = sys.argv[2]
         asyncio.run(session({"open": ("C:\\Windows\\System32\\cmd.exe", f"/c {cmd}")}, 15))
@@ -813,7 +891,7 @@ $ime=[IME6]::ImmGetDefaultIMEWnd($h)
                             buf += pl[8:]                             # 去 8B 时间戳 -> 裸 H.264 码流
                         elif t == 0x30:
                             await ws.send_bytes(frame(0x30, pl))
-                    open(out_h264, "wb").write(bytes(buf))
+                    open(safe_out_path(out_h264), "wb").write(bytes(buf))
                     print(f"[saved {out_h264} {len(buf)} bytes]", flush=True)
         asyncio.run(_rec())
     else:

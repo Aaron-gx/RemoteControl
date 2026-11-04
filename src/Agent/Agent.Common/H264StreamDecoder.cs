@@ -39,6 +39,9 @@ public class H264StreamDecoder : IDisposable
     private readonly object _poolLock = new();
     private readonly Stack<byte[]> _pool = new();
 
+    /// <summary>输入码流的封装格式（h264 / hevc，2026-10-10 H.265 支持；影响 ffmpeg 的 -f 参数）</summary>
+    private string _codec = CodecPolicy.H264;
+
     /// <summary>需要重建解码器 + 请求对端重建码流</summary>
     public event Action<string>? StreamResetNeeded;
 
@@ -48,6 +51,17 @@ public class H264StreamDecoder : IDisposable
     public bool NeedsStreamReset => _needsReset;
     public int Width => _width;
     public int Height => _height;
+    public string Codec => _codec;
+
+    /// <summary>
+    /// 设置输入码流格式（"h264"/"h265"）。在 <see cref="Reset"/>/<see cref="Configure"/> 之前调用；
+    /// 被控端切换编码时会经 StreamReset（负载带编码字节）通知过来。
+    /// </summary>
+    public void SetCodec(string codec)
+    {
+        var c = CodecPolicy.IsH265(codec) ? CodecPolicy.H265 : CodecPolicy.H264;
+        _codec = c;
+    }
 
     public H264StreamDecoder(string ffmpegPath, Logger log)
     {
@@ -67,8 +81,10 @@ public class H264StreamDecoder : IDisposable
     private bool Start()
     {
         Stop();
+        // Annex-B 裸流的封装名：H.264 是 h264，H.265 是 hevc（ffmpeg 对裸 HEVC ES 的 demuxer 名）
+        var format = CodecPolicy.IsH265(_codec) ? "hevc" : "h264";
         var args = "-hide_banner -loglevel error -fflags nobuffer -flags low_delay " +
-                   "-probesize 32 -analyzeduration 0 -f h264 -i pipe:0 " +
+                   $"-probesize 32 -analyzeduration 0 -f {format} -i pipe:0 " +
                    $"-an -sn -vf format=bgra,scale={_width}:{_height} -f rawvideo pipe:1";
         try
         {
@@ -92,7 +108,7 @@ public class H264StreamDecoder : IDisposable
             _writer = new Thread(WriteLoop) { IsBackground = true, Name = "decoder-in" };
             _writer.Start();
             _ = Task.Run(() => ReadStderr(p));
-            _log.Info($"解码器已启动：{_width}x{_height}（{Path.GetFileName(_ffmpeg)}）");
+            _log.Info($"解码器已启动：{_width}x{_height} {_codec.ToUpperInvariant()}（{Path.GetFileName(_ffmpeg)}）");
             return true;
         }
         catch (Exception ex)

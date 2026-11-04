@@ -20,7 +20,7 @@
 param(
     [string]$RepoRoot = "",
     [string]$ToolsRoot = "E:\tools",
-    [string]$ServerUrl = "",       # 形如 __RELAY_HOST__:18080（不带 ws:// 与 /ws）
+    [string]$ServerUrl = "",       # 形如 IP:端口（不带 ws:// 与 /ws）；空 = 从 config\relay-token.txt 的 relay= 行读
     [string]$Token = "",           # 预置连接口令
     [switch]$SkipViewerBuild       # 跳过 dotnet publish（用现有 build\viewer）
 )
@@ -54,8 +54,32 @@ if ((-not $ServerUrl -or -not $Token) -and (Test-Path -LiteralPath $cfgPath)) {
         Write-Host "预置值来源：$cfgPath" -ForegroundColor Green
     } catch { Write-Host "读取 $cfgPath 失败（继续用命令行参数/默认值）：$_" -ForegroundColor Yellow }
 }
-if (-not $ServerUrl) { $ServerUrl = "__RELAY_HOST__:18080" }
-if (-not $Token) { Write-Host "⚠ 没有可用的连接口令：装出来的主控端在启用鉴权的中继上连不上（可用 -Token 指定）" -ForegroundColor Yellow }
+if (-not $ServerUrl) {
+    # 中继地址从 config\relay-token.txt 读（relay= 行；gitignore 已排除，绝不入版本库）
+    $rcRelayFile = Join-Path $RepoRoot "config\relay-token.txt"
+    if (Test-Path -LiteralPath $rcRelayFile) {
+        foreach ($line in Get-Content -LiteralPath $rcRelayFile) {
+            if ($line -match '^\s*relay\s*=\s*(.+?)\s*$') { $ServerUrl = $Matches[1] }
+        }
+    }
+}
+# 口令兜底：上次打包用的 setup-defaults.ini（安装程序同目录预置文件，仓库 build 目录里留了一份）
+if (-not $Token) {
+    $iniPath = Join-Path $out "setup-defaults.ini"
+    if (Test-Path -LiteralPath $iniPath) {
+        $iniToken = (Get-Content $iniPath | Where-Object { $_ -match '^\s*token\s*=' }) -replace '^\s*token\s*=\s*', ''
+        if ($iniToken) {
+            $Token = $iniToken.Trim()
+            Write-Host "口令兜底来源：$iniPath" -ForegroundColor Green
+        }
+    }
+}
+# 【2026-10-10 客户装完连不上的事故】口令为空绝不能出包：生产中继开着鉴权，
+# 空口令的主控端刷新列表就是 401，客户那边表现为"软件用不了"，而打包的人本机
+# 部署着带口令的旧主控端测不出来。这里直接失败，逼着打包时把口令带上。
+if (-not $Token) {
+    throw "没有可用的连接口令：E:\RemoteControl\viewer\config\viewer.json 不存在且未传 -Token。生产中继启用鉴权时空口令包装出去客户必连不上 —— 用 -Token <口令> 重新打包，或把 token= 写进 build\setup-viewer\setup-defaults.ini"
+}
 Write-Host "预置服务器：$ServerUrl    口令长度：$($Token.Length)"
 
 # ---------------------------------------------------------------- 2. 发布主控端

@@ -27,7 +27,12 @@ public enum MessageType : byte
     OpenSoftware = 0x11,
     /// <summary>关闭软件： [4B pid]</summary>
     CloseSoftware = 0x12,
-    /// <summary>重置视频流（请求对端重建编解码器；空负载）</summary>
+    /// <summary>
+    /// 重置视频流（请求对端重建编解码器）。
+    /// 被控端 → 主控端时负载带编码字节（2026-10-10）：空/0 = H.264，1 = H.265 —— 主控端据此
+    /// 用对应格式重建解码器（编码协商切换，旧主控端忽略负载即维持 H.264，天然向后兼容）。
+    /// 主控端 → 被控端仍发空负载（只是"请重出一个关键帧"）。
+    /// </summary>
     StreamReset = 0x13,
     /// <summary>显示器信息： JSON {left,top,width,height,dpi,count}</summary>
     MonitorInfo = 0x14,
@@ -68,6 +73,33 @@ public enum MessageType : byte
 
     /// <summary>P2P 直连候选地址（被控端 → 主控端，JSON {port,tcp[],public}）</summary>
     DirectCandidates = 0x50,
+
+    /// <summary>UDP 打洞信息（双向，JSON PunchOffer {nonce, udp[]}）：双方经中继交换
+    /// STUN 公网映射+内网地址后互发 HELLO 打洞，成功则视频/输入走直连（2026-10-10 UU 式直连）</summary>
+    PunchInfo = 0x52,
+
+    /// <summary>
+    /// 端点能力协商（主控端 → 被控端，JSON CapabilitiesInfo，2026-10-10 对标 UU 的 SDP min/AND 协商）：
+    /// 主控端连上后上报自己支持的编码能力；被控端据此决定 H.264/H.265（双方都支持才启用）。
+    /// 旧被控端不认识这条消息会直接忽略 —— 自动维持 H.264，新旧版本永远互通。
+    /// </summary>
+    Capabilities = 0x53,
+
+    /// <summary>
+    /// 诊断请求（主控端 → 被控端，空负载，2026-10-11 对标 UU 的 healthd）。
+    /// 由**协调器直接应答**（不经过采集引擎）—— 引擎卡死/消息泵坏死时照样能用，
+    /// 这正是"控制面坏死两小时盲区"事故的解药。
+    /// </summary>
+    DiagnosticsRequest = 0x56,
+
+    /// <summary>诊断报告（被控端 → 主控端，JSON DiagnosticsInfo，见 0x56）</summary>
+    DiagnosticsReport = 0x57,
+
+    /// <summary>
+    /// 请求硬重启采集引擎（主控端 → 被控端，空负载）：转储引擎线程栈并投 WM_QUIT，
+    /// 看门狗会自动拉起新引擎。同样由协调器直接处理。
+    /// </summary>
+    EngineRestart = 0x58,
 
     /// <summary>错误： UTF-8 message</summary>
     Error = 0xFE,
@@ -310,6 +342,12 @@ public static class PayloadCodec
         return BinaryPrimitives.ReadInt64BigEndian(p);
     }
 
+    // 0x13 StreamReset（被控端 → 主控端）[可选 1B 编码]：无负载/0 = H.264，1 = H.265
+    public static byte[] EncodeStreamReset(bool h265) => h265 ? new byte[] { 1 } : Array.Empty<byte>();
+
+    /// <summary>空负载 = H.264（旧被控端/主控端发的重置请求都没有编码信息）</summary>
+    public static bool DecodeStreamReset(byte[] p) => p.Length > 0 && p[0] == 1;
+
     // 0x22 文件块 [16B fileId][4B offset][N data]
     public static byte[] EncodeFileChunk(string fileId, int offset, ReadOnlySpan<byte> data)
     {
@@ -515,6 +553,9 @@ public sealed class WorkerStatusInfo
     /// <summary>码率自适应档位（0 = 未降档）</summary>
     public int AdaptiveLevel { get; set; }
 
+    /// <summary>当前视频编码（"h264" / "h265"，2026-10-10 协商后可能是 H.265；空 = 旧版被控端）</summary>
+    public string Codec { get; set; } = "";
+
     /// <summary>因帧缓冲写不进去而丢弃的块数（被控端→中继这条链路拥塞的信号，单调递增）</summary>
     public long RingDropped { get; set; }
 
@@ -538,6 +579,47 @@ public sealed class WorkerStatusInfo
 
     /// <summary>直连当前是否已建立</summary>
     public bool DirectActive { get; set; }
+
+    // ---- UDP 打洞直连（2026-10-10）：跨网络不走中继的那条路 ----
+
+    /// <summary>UDP 打洞直连是否已建立（视频/输入走它，中继兜底）</summary>
+    public bool UdpActive { get; set; }
+
+    /// <summary>UDP 直连对端地址（ip:port，空 = 未建立）</summary>
+    public string UdpEndpoint { get; set; } = "";
+
+    /// <summary>UDP 直连 RTT（ms，0 = 未知）——主控端状态栏"延迟"优先显示它</summary>
+    public int UdpRtt { get; set; }
+
+    /// <summary>UDP 直连视频帧不完整率（%，0-100）</summary>
+    public int UdpLoss { get; set; }
+
+    /// <summary>
+    /// UDP 直连视频帧 ping 无应答率（%，近 10 秒窗口，2026-10-10 路径质量监控）。
+    /// 与 UdpLoss 的区别：这个只看保活 ping 的丢包，**不依赖视频流量** —— 视频被切到中继期间
+    /// 仍能持续评估直连质量（恢复判定就靠它）。
+    /// </summary>
+    public int UdpPingLoss { get; set; }
+
+    /// <summary>
+    /// UDP 直连被路径质量监控暂停（丢包持续超标 → 视频/控制已切回中继，恢复后自动切回）。
+    /// 对标 UU 的 filter_network_monitor：以前只有"3.5 秒彻底断流才回落"，高丢包但不断的链路
+    /// 会一直糊在直连上。
+    /// </summary>
+    public bool UdpSuspended { get; set; }
+
+    /// <summary>KCP 可靠路径生效（2026-10-14，双端协商成功才有；旧对端 = false 走旧 ARQ）</summary>
+    public bool UdpKcp { get; set; }
+    /// <summary>RS-FEC 当前每组冗余片数 r（0 = 旧 XOR/无 FEC）</summary>
+    public int UdpFecR { get; set; }
+    /// <summary>RS-FEC 累计零重传恢复分片数</summary>
+    public long UdpFecRecovered { get; set; }
+
+    /// <summary>
+    /// 虚拟外屏上当前没有任何可见应用窗口（2026-10-10）：主控端据此提示
+    /// "窗口可能都已被搬回主屏"，而不是让人对着空屏猜"点击失灵"。
+    /// </summary>
+    public bool VirtualScreenEmpty { get; set; }
 
     /// <summary>Worker 最近收到的 BitrateHint 序号（协调器对照本地发送序号，判断单向断流）</summary>
     public long HintSeq { get; set; }
@@ -635,4 +717,58 @@ public sealed class FileDropInfo
 
     /// <summary>这条是**目录**而不是文件（文件夹复制，2026-10 新增）：协调器要打包成 zip 再上传</summary>
     public bool IsFolder { get; set; }
+}
+
+/// <summary>
+/// 端点能力（0x53，主控端 → 被控端，2026-10-10 H.265 协商用）。
+/// 语义对标 UU 的 SDP 自定义属性（mix_kcp=min(v1,v2)、quic=v1&v2）：
+/// 一个能力只有**双端都报支持**才会被启用 —— 热更新灰度期间新旧版本混连时自动落到公共能力集。
+/// </summary>
+public sealed class CapabilitiesInfo
+{
+    /// <summary>能力集版本：加新能力位时 +1，旧端按自己认识的位解释</summary>
+    public int CapVer { get; set; } = 1;
+
+    /// <summary>主控端能解 H.265（ffmpeg 探测出 hevc 解码器才报 true）</summary>
+    public bool H265Decode { get; set; }
+}
+
+/// <summary>
+/// 诊断报告（0x57，2026-10-11 对标 UU healthd）：协调器**绕过采集引擎**直接收集，
+/// 引擎卡死时也能拿到 —— 引擎活性、链路状态、两份日志的尾部，一次看清"死在哪"。
+/// </summary>
+public sealed class DiagnosticsInfo
+{
+    /// <summary>被控端程序版本（引擎上报过的；引擎从未就绪则空）</summary>
+    public string AgentVersion { get; set; } = "";
+    /// <summary>引擎桥在不在（协调器视角）</summary>
+    public bool EngineConnected { get; set; }
+    /// <summary>引擎线程活着吗</summary>
+    public bool EngineThreadAlive { get; set; }
+    /// <summary>距引擎上一次状态上报过了多少毫秒（正常 ~1000；持续增长 = 引擎半死）</summary>
+    public long StatusAgeMs { get; set; }
+    public int ViewerCount { get; set; }
+    public bool RelayConnected { get; set; }
+    public long RelayQueued { get; set; }
+    public long RelayDropped { get; set; }
+    public bool UdpActive { get; set; }
+    public string UdpEndpoint { get; set; } = "";
+    public int UdpRtt { get; set; }
+    public int UdpLoss { get; set; }
+    public int UdpPingLoss { get; set; }
+    public bool UdpSuspended { get; set; }
+    /// <summary>KCP 可靠路径生效（2026-10-14，双端协商成功才有）</summary>
+    public bool UdpKcp { get; set; }
+    /// <summary>RS-FEC 当前每组冗余片数 r（0 = 旧 XOR/无 FEC）</summary>
+    public int UdpFecR { get; set; }
+    /// <summary>RS-FEC 累计零重传恢复分片数</summary>
+    public long UdpFecRecovered { get; set; }
+    /// <summary>关键配置摘要（backend/编码/帧率码率/授权状态）</summary>
+    public string ConfigSummary { get; set; } = "";
+    /// <summary>引擎日志尾部（logs\worker-*.log 最新一份的最后 N 行；从文件读，引擎死了也能拿到）</summary>
+    public string WorkerLogTail { get; set; } = "";
+    /// <summary>协调器日志尾部</summary>
+    public string CoordinatorLogTail { get; set; } = "";
+    /// <summary>采集时间（本地时间，一眼看出报告新旧）</summary>
+    public string Timestamp { get; set; } = "";
 }

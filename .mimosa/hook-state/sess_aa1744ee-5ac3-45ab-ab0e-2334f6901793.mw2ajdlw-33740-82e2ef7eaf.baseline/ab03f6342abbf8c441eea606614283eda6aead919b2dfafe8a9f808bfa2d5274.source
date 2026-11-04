@@ -1,0 +1,1498 @@
+using System.Diagnostics;
+using System.Text;
+using Agent.Common;
+using Agent.Worker;
+
+namespace Agent.Coordinator;
+
+internal static class Program
+{
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        DisplayHelper.EnablePerMonitorDpiAwareness();
+
+        using var mutex = new Mutex(true, @"Global\RemoteControlAgentCoordinator", out bool isNew);
+        if (!isNew)
+        {
+            // 已有实例在跑：静默退出（可通过日志确认）
+            var l = new Logger("coordinator", minLevel: LogLevel.Info);
+            l.Warn("Agent Coordinator 已在运行，本次启动退出");
+            return 2;
+        }
+
+        ApplicationConfiguration.Initialize();
+
+        // 崩溃转储要最早挂（比任何可能崩的初始化都早）。dump 落在 logs\crash\，保留 5 份；
+        // 上次崩溃的 dump 顺带报出来，提醒去捞（2026-10-08，对标 UU crashpad 的轻量版）。
+        try
+        {
+            var earlyLog = new Logger("coordinator", minLevel: LogLevel.Info);
+            var dumpDir = Path.Combine(AppContext.BaseDirectory, "logs", "crash");
+            CrashDumper.Install(dumpDir, earlyLog);
+            CrashDumper.ReportPreviousCrashes(earlyLog);
+        }
+        catch { }
+
+        CoordinatorApp? app = null;
+        try
+        {
+            app = new CoordinatorApp(args);
+            app.Start();
+            Application.Run();   // 托盘消息循环
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                Logger.Current?.Error("未处理异常导致退出", ex);
+                MessageBox.Show($"Agent Coordinator 启动失败：\n{ex.Message}", "远程控制 Agent",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch { }
+            return 1;
+        }
+        finally
+        {
+            try { app?.Dispose(); } catch { }
+            try { mutex.ReleaseMutex(); } catch { }
+        }
+    }
+}
+
+/// <summary>
+/// Coordinator 主逻辑（被控端单进程）：
+/// 托盘 → 虚拟副屏 → 采集引擎（WorkerHost 线程）→ 中继 WebSocket ↔ 进程内桥 双向桥接。
+/// 2026-10 进程合并：原 Agent.Worker.exe 并入本进程（见 WorkerHost），
+/// 旧的"Named Pipe + 共享内存"跨会话 IPC 换成进程内 WorkerBridge；多会话（RDPWrap/RemoteWorker）代码已删除。
+/// </summary>
+public sealed class CoordinatorApp : IDisposable
+{
+    private readonly AgentConfig _cfg;
+    private readonly Logger _log;
+    private readonly WorkerBridge _bus;
+    private readonly WorkerHost _host;
+    private readonly RelayClient _relay;
+    private readonly VirtualDisplayManager _vdd;
+    private readonly SoftwareEnumerator _sw;
+    private readonly FileUploader _uploader;
+    private readonly DirectLinkServer _direct;
+    private readonly UdpPunchChannel _udp;
+    private readonly LicenseGate _license;
+    private readonly Updater _updater;
+    private TrayIcon? _tray;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly string[] _args;
+    private Thread? _framePump;
+
+    private int _workerSessionId = -1;
+    /// <summary>经中继发出的视频块数（直连生效后应停止增长；上报给主控端用于显示与验收）</summary>
+    private long _relayVideoChunks;
+    /// <summary>上一份状态里"被挤掉的视频块数"，用来判断这一秒有没有真丢</summary>
+    private long _lastVideoDropped;
+    /// <summary>最近一次收到 Worker 状态（0x41）的时刻：引擎每 1s 上报，断流即卡死信号（看门狗用）</summary>
+    private long _lastWorkerStatusTick = Environment.TickCount64;
+    /// <summary>已发送的 BitrateHint 序号（金丝雀：与 Worker 回显对照检测单向断流）</summary>
+    private long _hintSeqSent;
+    /// <summary>金丝雀上次触发时刻（60s 节流）</summary>
+    private long _canaryFiredTick;
+    /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
+    private int _viewerCount;
+    // ---- UDP 直连路径质量监控（2026-10-10，对标 UU 的 filter_network_monitor）----
+    // 以前只有"3.5 秒彻底断流"才回落中继：高丢包但不断的链路（晚高峰国际段、WiFi 干扰）会
+    // 一直糊在直连上 —— 视频残帧、点击丢失，而中继（TCP 无损）其实更稳。
+    // 现在按保活 ping 的丢包率做决策：持续超标 → 视频/控制切回中继（直连保活继续探测），
+    // 恢复达标 → 自动切回。被控端侧可测（数自己 ping 的应答），不需要主控端配合。
+    /// <summary>UDP 直连视频路径被质量监控暂停（true 期间视频/控制走中继）</summary>
+    private volatile bool _udpVideoSuspended;
+    /// <summary>ping 丢包持续超标的起点（0 = 当前不超标）</summary>
+    private long _udpBadSince;
+    /// <summary>暂停后丢包恢复达标的起点（0 = 尚未达标）</summary>
+    private long _udpGoodSince;
+    /// <summary>本会话累计切换次数（日志/状态观测用）</summary>
+    private long _udpSuspendCount;
+    /// <summary>“对端是对称 NAT”只提示一次（每次 PunchInfo 都带标志，别刷日志）</summary>
+    private bool _udpSymNoticeLogged;
+    /// <summary>上次拉起采集引擎的时间：防止"看护 + 掉线重试"同时拉起两个引擎线程打架（会 0 帧）</summary>
+    private DateTime _lastWorkerLaunchUtc = DateTime.MinValue;
+    /// <summary>操作系统描述（缓存，避免每秒都查注册表）</summary>
+    private string? _osVersion;
+    private MonitorInfo? _monitor;
+    private WorkerReadyInfo? _workerReady;
+    private DateTime _lastViewerActivity = DateTime.MinValue;
+    private DateTime _lastInputWarn = DateTime.MinValue;
+    private readonly object _workerLock = new();
+    /// <summary>单实例互斥体（持有到进程退出；两个被控端同时跑会各装一个全局鼠标钩子互相打架）</summary>
+    private Mutex? _singleInstance;
+
+    public CoordinatorApp(string[] args)
+    {
+        _args = args;
+        _cfg = AgentConfig.Load();
+        if (_args.Contains("--no-vdd")) _cfg.EnableVirtualDisplay = false;
+
+        _log = new Logger("coordinator", minLevel: _cfg.MinLogLevel, echoConsole: false);
+        _log.Info("========== Agent Coordinator 启动（单进程：采集引擎已内置）==========");
+
+        // 单实例保护：同一台机器只允许一个被控端在跑。
+        // 为什么必须有：两个实例会各装一个全局鼠标钩子（光标仲裁）、各自注入输入 ——
+        // 实测症状就是"在副屏点击，主屏的鼠标也跟着点、按钮点不到、拖不动"，
+        // 而且互相抢窗口与帧通道，极难排查（升级时装到了另一个目录就会有这种局面）。
+        // 用 Global 前缀覆盖所有会话；WaitOne(0) 拿不到说明已有活着的实例。
+        _singleInstance = new Mutex(false, @"Global\RemoteControlCoordinator");
+        bool firstInstance;
+        try { firstInstance = _singleInstance.WaitOne(0, false); }
+        catch (AbandonedMutexException) { firstInstance = true; }   // 上一个实例异常退出，我们接管
+        if (!firstInstance)
+        {
+            _log.Warn("已有被控端在运行，本次启动退出（单实例保护）。请先从托盘退出旧实例，再启动这个。");
+            Console.Error.WriteLine("已有被控端在运行，本次启动退出（单实例保护）。");
+            Environment.Exit(0);
+        }
+        _log.Info($"版本 {WorkerContext.Version}（协调器外壳，引擎见 worker 日志） / AgentId={_cfg.AgentId} / 进程会话={SessionInfo.CurrentId} / 管理员={SessionInfo.IsElevated}");
+        _log.Info($"配置：EnableVirtualDisplay={_cfg.EnableVirtualDisplay} Server={_cfg.ServerUrl} " +
+                  $"FPS={_cfg.FrameRate} 编码器={_cfg.Encoder}");
+        if (!string.IsNullOrEmpty(_cfg.ConfigNotice))
+            _log.Warn(_cfg.ConfigNotice);
+
+        KillStrayWorkers();   // 清理"旧版本残留"的独立 Worker 进程（见方法注释）
+        _bus = new WorkerBridge(_cfg.FrameBufferSizeBytes);
+        _host = new WorkerHost(_cfg, _log, _bus);
+        // 泵诊断/看门狗接线（2026-10-09 VSAQ 单方向死亡事故）：
+        //  · 泵日志进协调器日志（引擎侧 Logger 在 WorkerHost 里也订阅了一份，谁活着谁记）；
+        //  · toWorker 卡死 → 转储引擎线程栈 + 硬重启引擎（桥自己已先换泵恢复投递）。
+        _bus.PumpLog += s => _log.Warn(s);
+        _bus.PumpWedged += () =>
+        {
+            _log.Error("Worker 消息泵看门狗触发：已换新泵恢复控制指令投递；下面转储引擎线程栈并硬重启引擎");
+            _host.DumpEngineStackAndRequestExit();
+        };
+        _relay = new RelayClient(_cfg, _log);
+        _vdd = new VirtualDisplayManager(_cfg, _log);
+        _sw = new SoftwareEnumerator(_log, _cfg.ReportSoftwareIcons);
+        _uploader = new FileUploader(_cfg, _log);
+        _direct = new DirectLinkServer(_cfg, _log);
+        // 【2026-10-10 UU 式直连】UDP 打洞通道：跨网络（双方都没开 UPnP）时视频/输入不走中继，
+        // RTT 从 ~170ms（香港中继）降到内网直连水平。候选经中继交换（PunchInfo），服务器零改动。
+        _udp = new UdpPunchChannel(_log, PunchRole.Agent, _cfg.AgentToken);
+        _license = new LicenseGate(Path.Combine(AppContext.BaseDirectory, "config", "license.cache.json"), _log);
+        _updater = new Updater(_cfg, _log, () => HasViewer, () => _relay.IsConnected);   // 断网不应用（2026-10-09 事故）
+        // 直连握手先过授权闸门：授权不可用时不允许任何人通过 P2P 接进来
+        _direct.LicenseCheck = () => _license.IsUsable && _cfg.DirectLinkEnabled;
+    }
+
+
+    /// <summary>
+    /// 清理"旧版本残留"的独立 Agent.Worker 进程（同一个安装目录里的）。
+    /// 2026-10 进程合并后 Worker 已并入本进程，正常不会再有这个进程；但**升级场景**里
+    /// （新版 Coordinator 起来时，上一版拉起的 Worker.exe 可能还活着）它还会抢输入钩子、
+    /// 干扰光标仲裁 —— 所以启动时兜这一刀。只杀自己安装目录里的，绝不动别人的进程。
+    /// </summary>
+    /// <summary>操作系统一句话描述（形如 Windows 11 Pro 24H2 build 26100）</summary>
+    private static string DescribeOs()
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+            var product = k?.GetValue("ProductName")?.ToString() ?? "Windows";
+            var display = k?.GetValue("DisplayVersion")?.ToString() ?? "";
+            var build = Environment.OSVersion.Version.Build;
+            return $"{product} {display} build {build}".Replace("  ", " ").Trim();
+        }
+        catch { return Environment.OSVersion.VersionString; }
+    }
+
+    private void KillStrayWorkers()
+    {
+        try
+        {
+            var mine = Path.GetFullPath(AppContext.BaseDirectory);
+            foreach (var p in Process.GetProcessesByName("Agent.Worker"))
+            {
+                try
+                {
+                    var path = p.MainModule?.FileName;
+                    if (string.IsNullOrEmpty(path) ||
+                        !Path.GetFullPath(path).StartsWith(mine, StringComparison.OrdinalIgnoreCase)) continue;
+                    _log.Warn($"清理旧版残留 Worker 进程：pid={p.Id}（{path}）");
+                    p.Kill(entireProcessTree: true);
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+        }
+        catch (Exception ex) { _log.Debug($"清理残留 Worker 失败：{ex.Message}"); }
+    }
+
+    public void Start()
+    {
+        // 【2026-10-11 会话自愈】看门狗/开机任务（SYSTEM）拉起的实例落在 session 0，
+        // 看不到用户桌面（虚拟外屏缺位 → 暂停出帧 + 拒绝打开软件，机器等于废了）。
+        // 控制台会话有登录用户（锁屏也算）时，迁移过去并退出 —— 报平安标记提前补写，
+        // 避免热更新因 45 秒无心跳而回滚。迁移失败（无人登录/接口失败）就地继续服务。
+        try
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "Agent.Coordinator.exe");
+            if (SessionHandover.TryHandoverToConsoleSession(exe, _log))
+            {
+                _updater.ReportAlive();     // 迁移退出前补写报平安（本实例活不过 45s 计时器）
+                Thread.Sleep(500);
+                Environment.Exit(0);
+            }
+        }
+        catch (Exception ex) { _log.Warn($"会话迁移检查异常（忽略）：{ex.Message}"); }
+
+        // 托盘按配置开关（默认**隐藏**：客户要求装完右下角不出现任何显示，2026-10-04）。
+        // 隐藏时没有"托盘右键 → 退出"，退出 = 任务管理器结束进程（README §8 有命令）。
+        if (_cfg.ShowTrayIcon)
+        {
+            _tray = new TrayIcon(_log, $"远程控制 Agent\n{_cfg.AgentId}", new TrayHooks
+            {
+                DirectStatusText = DirectStatusText,
+                DirectEnabled = () => _cfg.DirectLinkEnabled,
+                SetDirectEnabled = SetDirectEnabled,
+                DirectAddressText = () => string.IsNullOrEmpty(_cfg.DirectLinkPublicAddress)
+                    ? (_direct.PublicAddress ?? "") : _cfg.DirectLinkPublicAddress,
+                SetDirectPublicAddress = SetDirectPublicAddress,
+            });
+            _tray.ExitRequested += () => Shutdown();
+        }
+        else
+        {
+            _log.Info("托盘图标按配置隐藏（agent.json 的 ShowTrayIcon=false）：右下角不显示任何图标与气泡。" +
+                      "需要托盘菜单（直连开关/退出）时把它改回 true 并重启被控端。");
+        }
+
+        EnsureBootAutostart();
+        EnsureProcessWatchdog();
+        // 清掉上次优雅退出的标记（现在进程活着，看门狗恢复"死了就拉起"的职责）
+        try { if (File.Exists(CleanExitPath)) File.Delete(CleanExitPath); } catch { }
+
+        _bus.WorkerConnected += OnWorkerConnected;
+        _bus.WorkerDisconnected += OnWorkerDisconnected;
+        _bus.MessageFromWorker += OnWorkerMessage;
+
+        // 帧泵：把采集引擎写进帧通道的码流块搬到发送出口（原 IpcServer.FramePump 的活）
+        _framePump = new Thread(FramePump) { IsBackground = true, Name = "FramePump" };
+        _framePump.Start();
+
+        _relay.Connected += OnRelayConnected;
+        _relay.Disconnected += OnRelayDisconnected;
+        _relay.MessageReceived += OnViewerMessage;
+        // UDP 直连：输入/控制消息从打洞通道来时走同一条分发（与中继完全同权）；
+        // 死链事件只记日志——视频/输入路径每帧/每条自查 IsLive，会自动回中继
+        _udp.MessageReceived += OnViewerMessage;
+        _udp.Dead += () => _log.Info("UDP 直连已回落中继（等下一次打洞）");
+        // 校验不通过时静默停服：托盘/界面/上报都不出现"授权/激活码"字样
+        // （用户不需要知道机制；排查靠本机日志与服务器端状态）
+        _relay.LicenseRejected += reason =>
+        {
+            _log.Error($"服务器校验未通过，暂停服务：{reason}");
+            _license.LockFromServer(reason);      // 触发 LockDown（停直连/停引擎/拒新握手）
+        };
+        _relay.LicenseVerified += code => _license.UpdateFromServer(code);
+        _relay.ViewerCountChanged += n =>
+        {
+            if (n == _viewerCount) return;
+            _viewerCount = n;
+            _log.Info($"当前主控端数量：{n}" + (n > 1
+                ? "（多于一个时视频统一走中继，保证每个主控端都有画面；P2P 直连暂时挂起）"
+                : ""));
+            // 多于一个主控端时把直连也停掉：否则直连那一路会继续"只认直连"而看不到中继画面
+            if (n > 1)
+            {
+                _direct.StopServing("当前有多个主控端，视频改走中继");
+                // 多主控端可能混有旧版本（旧主控端不上报能力、也解不了 H.265）：
+                // 视频统一回 H.264（公共能力集）。回到单主控端后，那次重连会重新协商。
+                if (_bus.IsWorkerConnected)
+                    _bus.SendToWorker(new ProtocolMessage(MessageType.Capabilities,
+                        JsonCodec.Encode(new CapabilitiesInfo { CapVer = 1, H265Decode = false })));
+            }
+        };
+        _license.LockedOut += LockDown;
+        _license.Tick();
+        StartLicenseWatch();
+        _updater.Start();
+        // 热更新自检：进程活过 45 秒即写"报平安"标记（更新脚本据此决定是否回滚）
+        _ = Task.Run(async () => { try { await Task.Delay(TimeSpan.FromSeconds(45), _cts.Token); _updater.ReportAlive(); } catch { } });
+        _ = Task.Run(() => WatchSoftwareStatesAsync(_cts.Token));   // 软件运行状态实时监测（3 秒一轮）
+        _relay.InboundTraffic += OnViewerTraffic;
+        _relay.Start();
+
+        if (_direct.Start())
+        {
+            // 候选地址定期上报（UPnP 映射是异步完成的，所以要周期推送）
+            _ = Task.Run(async () =>
+            {
+                while (!_cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        if (HasViewer)
+                        {
+                            if (!string.IsNullOrWhiteSpace(_cfg.DirectLinkPublicAddress))
+                                _direct.SetManualPublic(_cfg.DirectLinkPublicAddress);
+                            _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+                            // UDP 打洞：候选收集是异步的（STUN 要几百毫秒），没就绪就等下一轮；
+                            // 已连通后不再发（每发一次对端都会重开 20 秒打洞窗口，没必要）。
+                            // 本端是对称 NAT 时也不再发：映射端口对对端无意义，别让它白打。
+                            // UdpPunchEnabled=false 时整个 UDP 直连停用（见 AppConfig 注释）。
+                            if (_cfg.UdpPunchEnabled && !_udp.IsLive && !_udp.SymmetricNat)
+                            {
+                                await _udp.EnsureCandidatesAsync();
+                                if (HasViewer && !_udp.IsLive && !_udp.SymmetricNat)
+                                    _relay.Queue(new ProtocolMessage(MessageType.PunchInfo, _udp.OfferPayload()));
+                            }
+                        }
+                        await Task.Delay(TimeSpan.FromSeconds(15), _cts.Token);
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch { }
+                }
+            });
+        }
+
+        _ = Task.Run(BootstrapAsync);
+        StartDiagnostics();
+        StartWorkerWatchdog();
+        StartUdpPathMonitor();
+    }
+
+    /// <summary>
+    /// UDP 直连路径质量监控（每 2 秒评估一次，2026-10-10）：
+    ///   · 丢包（ping 无应答率）≥30% 持续 10 秒 → 暂停直连视频路径（切中继），保活与探测继续；
+    ///   · 暂停后丢包 ≤10% 持续 30 秒 → 恢复直连。
+    /// 阈值刻意不对称（严进宽出）：切路径本身有代价（画面短暂走远路），确认坏了才切、
+    /// 确认好了才切回。通道断开（IsLive=false）时一切复位 —— 那条路本来就没了。
+    /// </summary>
+    private void StartUdpPathMonitor()
+    {
+        _ = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2), _cts.Token);
+                    if (!_cfg.UdpQualitySwitchEnabled)
+                    {
+                        _udpVideoSuspended = false;
+                        continue;
+                    }
+                    if (!_udp.IsLive)
+                    {
+                        if (_udpVideoSuspended)
+                        {
+                            _udpVideoSuspended = false;
+                            _log.Debug("UDP 直连已断开：路径监控状态复位");
+                        }
+                        _udpBadSince = 0;
+                        _udpGoodSince = 0;
+                        continue;
+                    }
+                    int loss = _udp.PingLossPercent;
+                    long now = Environment.TickCount64;
+                    if (!_udpVideoSuspended)
+                    {
+                        if (loss >= 30)
+                        {
+                            if (_udpBadSince == 0) _udpBadSince = now;
+                            else if (now - _udpBadSince >= 10_000)
+                            {
+                                _udpVideoSuspended = true;
+                                Interlocked.Increment(ref _udpSuspendCount);
+                                _udpGoodSince = 0;
+                                _log.Warn($"UDP 直连丢包持续超标（ping 无应答率 {loss}% ≥10s，本会话第 {_udpSuspendCount} 次切换）：" +
+                                          "视频/控制切回中继；直连保活继续，恢复后自动切回");
+                            }
+                        }
+                        else
+                        {
+                            _udpBadSince = 0;
+                        }
+                    }
+                    else if (loss <= 10)
+                    {
+                        if (_udpGoodSince == 0) _udpGoodSince = now;
+                        else if (now - _udpGoodSince >= 30_000)
+                        {
+                            _udpVideoSuspended = false;
+                            _udpBadSince = 0;
+                            _log.Info("UDP 直连质量已恢复（ping 丢包 ≤10% 持续 30s）：视频/控制切回直连");
+                        }
+                    }
+                    else
+                    {
+                        _udpGoodSince = 0;
+                    }
+                }
+                catch (OperationCanceledException) { return; }
+                catch (Exception ex) { _log.Debug($"UDP 路径监控异常：{ex.Message}"); }
+            }
+        });
+    }
+
+    /// <summary>把帧通道里的码流块搬到发送出口（直连优先/中继兜底，见 OnFrame）</summary>
+    private void FramePump()
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                var chunk = _bus.Frames.Read(200);
+                if (chunk == null) continue;
+                OnFrame(chunk);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"帧泵异常：{ex.Message}");
+                Thread.Sleep(200);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 采集引擎看护：引擎线程死掉（崩溃/被安全软件拦/无显示器退出）后必须**一直**
+    /// 尝试拉起 —— 否则主控端会停在"连上了、但黑屏且点不动"的状态，直到有人去被控端重启程序（实测踩到）。
+    /// 另外引擎缺失超过 30 秒就报给主控端，别让人对着黑屏猜。
+    /// </summary>
+    private void StartWorkerWatchdog()
+    {
+        _ = Task.Run(async () =>
+        {
+            var missingSince = DateTime.MinValue;
+            while (!_cts.IsCancellationRequested)
+            {
+                try { await Task.Delay(TimeSpan.FromSeconds(10), _cts.Token); } catch { return; }
+                if (_cts.IsCancellationRequested) return;
+                try
+                {
+                    if (_bus.IsWorkerConnected)
+                    {
+                        missingSince = DateTime.MinValue;
+                        continue;
+                    }
+                    if (missingSince == DateTime.MinValue) missingSince = DateTime.UtcNow;
+                    if (!_license.IsUsable)
+                    {
+                        _log.Debug($"服务已暂停，暂不启动采集引擎：{_license.LockReason}");
+                        continue;
+                    }
+                    if ((DateTime.UtcNow - missingSince).TotalSeconds >= 30)
+                    {
+                        // 起不来就告诉主控端"为什么黑"；每 30 秒重申一次，不刷屏
+                        ReportError("被控端采集进程未运行（正在自动重启），画面与操作暂时不可用");
+                        missingSince = DateTime.UtcNow;
+                    }
+                    _workerSessionId = SessionInfo.CurrentId;   // 引擎永远跑在本机当前会话（共享模式）
+                    _log.Info("采集引擎未运行，自动拉起");
+                    EnsureWorkerEngineRunning();
+                }
+                catch (Exception ex) { _log.Warn($"引擎看护异常：{ex.Message}"); }
+            }
+        });
+    }
+
+    /// <summary>
+    /// 授权闸门关闭时的**硬停机**：停直连（含已在连的主控端）、停采集引擎、拒绝新的直连握手。
+    /// 这是防"屏蔽中继走 P2P 白嫖"的关键一步 —— 只靠服务器判定的话，P2P 流量不过服务器就管不到。
+    /// 中继连接保持重试，续期后会自动恢复（引擎由看护重新拉起）。
+    /// </summary>
+    private void LockDown(string reason)
+    {
+        try
+        {
+            _log.Error($"【服务暂停】{reason}");
+            _direct.StopServing("服务暂停");       // 清掉已接入的直连主控端并停止监听
+            _host.RequestStop();                    // 没有授权就不采集、不编码（引擎走正常收尾：卸钩子、关编码器）
+            // 不弹托盘气泡、不向主控端报错：界面上不暴露原因
+        }
+        catch (Exception ex) { _log.Warn($"停机处理异常：{ex.Message}"); }
+    }
+
+    /// <summary>
+    /// 授权看护（每 60 秒）：
+    ///  1. 本地判到期/时钟回拨；
+    ///  2. **问一次服务器有没有被撤销** —— 本地看不出"厂商把这条码删了"，
+    ///     而撤销必须让机器停下来（否则客户拿着作废的码继续用，还能走 P2P 直连）；
+    ///  3. 授权不可用时定期重连中继，这样在服务器上装好新激活码后，
+    ///     被控端**不用人工重启**就能自动恢复。
+    /// </summary>
+    private void StartLicenseWatch()
+    {
+        _ = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                try { await Task.Delay(TimeSpan.FromSeconds(60), _cts.Token); } catch { return; }
+                if (_cts.IsCancellationRequested) return;
+                try
+                {
+                    _license.Tick();
+
+                    // 就算本地看着"还在有效期内"，也要确认一下是不是被厂商撤销了。
+                    // 探测失败（断网/超时/接口异常）当作"不知道"，绝不停机。
+                    var probe = await RelayLicenseProbe.QueryAsync(_cfg.ServerUrl, TimeSpan.FromSeconds(8), _cts.Token);
+                    if (probe.Known)
+                    {
+                        // 探到了就说明这一轮联系上服务器了 —— 刷新离线宽限的计时
+                        _license.NoteServerContact();
+                        if (probe.State == "revoked")
+                        {
+                            _log.Error($"服务器判定该激活码已被撤销：{probe.Reason}");
+                            _license.LockFromServer(string.IsNullOrWhiteSpace(probe.Reason)
+                                ? "该激活码已被厂商撤销"
+                                : probe.Reason);
+                        }
+                    }
+
+                    if (_license.IsUsable) continue;
+
+                    // 停机中：每轮都试着连一次中继，拿到新激活码就能自动活过来
+                    _log.Info("重试连接服务器以恢复服务…");
+                    _relay.Restart();
+                }
+                catch (OperationCanceledException) { return; }
+                catch (Exception ex) { _log.Debug($"授权看护异常：{ex.Message}"); }
+            }
+        });
+    }
+
+    /// <summary>每 5 秒打一行链路诊断（帧转发速率 / 发送积压 / 环形缓冲水位）</summary>
+    private void StartDiagnostics()
+    {
+        _ = Task.Run(async () =>
+        {
+            long lastFrames = 0, lastQueued = 0, lastDropped = 0, lastVideoDropped = 0;
+            while (!_cts.IsCancellationRequested)
+            {
+                try { await Task.Delay(5000, _cts.Token); } catch { return; }
+                try
+                {
+                    long f = _bus.Frames.DeliveredCount;
+                    long q = _relay.QueuedCount, d = _relay.DroppedCount;
+                    long vd = _relay.VideoDropped;
+                    double fill = _bus.Frames.FillRatio;
+                    _log.Info($"[诊断] 转发帧 {f - lastFrames}/5s  发送积压={_relay.PendingSends}（视频 {_relay.VideoPending}）" +
+                              $"本周期入队={q - lastQueued} 控制丢弃={d - lastDropped} 视频挤掉={vd - lastVideoDropped}  " +
+                              $"环形水位={fill * 100:F1}%  " +
+                              $"主控端={(HasViewer ? "在线" : "无")}  " +
+                              $"直连={(_direct.HasViewer ? $"已建立({_direct.ViewerEndpoint}, {_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB)" : (_direct.UpnpMapped ? "待接入(UPnP已映射)" : "未建立"))}  " +
+                              $"UDP={( _cfg.UdpPunchEnabled ? (_udp.IsLive ? $"活({_udp.FramesSent}帧/{_udp.BytesSent / 1024}KB,收{_udp.BytesReceived / 1024}KB)" : "未连通") : "停用")}");
+                    lastFrames = f; lastQueued = q; lastDropped = d; lastVideoDropped = vd;
+                    // 【2026-10-09 VSAQ 事故】Worker 状态龄监视：正常时引擎每 1s 上报一次状态。
+                    // 状态断流而引擎"看似在跑"= toCoordinator 泵或引擎线程本身卡死
+                    // （现场表现：视频/状态照常或停滞，但主控端点什么都没反应）。
+                    // 连续 45 秒没有状态且引擎在跑 → 转储栈并硬重启引擎（看门狗兜底，桥内另有 15s 泵级看门狗）。
+                    if (_host.IsRunning && Environment.TickCount64 - Volatile.Read(ref _lastWorkerStatusTick) > 45_000)
+                    {
+                        Volatile.Write(ref _lastWorkerStatusTick, Environment.TickCount64);   // 45s 内只触发一次
+                        _log.Error("Worker 状态断流 >45s（引擎疑似卡死）：转储引擎线程栈并硬重启");
+                        _host.DumpEngineStackAndRequestExit();
+                    }
+                    // 托盘悬停也能看到服务器与直连状态（右键菜单里还有更详细的）。
+                    // 连不上时把**原因**写出来：口令不对和网络不通在用户那里表现完全一样，
+                    // 不写清楚就只能靠猜（现场踩过：装完一直不在线）。
+                    _tray?.SetTooltip(_relay.IsConnected
+                        ? $"服务器√ 直连(可选)：{DirectStatusText()}"
+                        : $"服务器× {_relay.LastFailure}（会自动重试）\n直连(可选)：{DirectStatusText()}");
+                }
+                catch (Exception ex) { _log.Debug($"诊断异常：{ex.Message}"); }
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- 启动流程
+
+    private async Task BootstrapAsync()
+    {
+        try
+        {
+            // 连接口令为空是"装完一直不在线"最常见的原因（安装时没填、或中继启用了鉴权而口令不对）——
+            // 这种事必须在启动日志里说清楚，否则现场只能看到"被控端在运行但列表里没有它"
+            if (string.IsNullOrWhiteSpace(_cfg.AgentToken))
+                _log.Warn("本机没有配置连接口令（agent.json 的 AgentToken 为空）：中继服务器若启用了鉴权，" +
+                          "本机会一直显示「未连接服务器」、主控端列表里也看不到本机。\n" +
+                          "  改法：重新运行安装程序并在「连接设置」里填入口令，或改 agent.json 的 AgentToken 与服务端 RC_TOKEN 一致后重启被控端。");
+
+            // 1. 虚拟副屏
+            _log.Info("[1/3] 检查虚拟副屏…");
+            if (_vdd.Ensure(out var vddMsg))
+                _log.Info($"虚拟副屏：{vddMsg}");
+            else
+                _log.Warn($"虚拟副屏不可用：{vddMsg}");
+
+            // 2. 确认会话（共享模式：远程操作的就是本机已登录用户这个桌面 + 虚拟外屏，
+            //    软件/文件/微信等跟本机用户是同一份 —— 同一个账户、同一个 profile）
+            _log.Info("[2/3] 准备会话…");
+            _workerSessionId = SessionInfo.CurrentId;
+            _log.Info($"共享模式：采集引擎运行在本机当前会话 {_workerSessionId}（远程 = 本机已登录桌面 + 虚拟外屏）");
+
+            // 3. 启动采集引擎
+            _log.Info("[3/3] 启动采集引擎…");
+            EnsureWorkerEngineRunning();
+        }
+        catch (Exception ex)
+        {
+            _log.Error("启动流程异常", ex);
+            ReportError($"Agent 启动异常：{ex.Message}");
+        }
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 拉起采集引擎线程（幂等）。取代旧架构的 LaunchWorker（启动 Agent.Worker.exe 进程）——
+    /// 现在只是让 WorkerHost 开一条 STA 线程，不再有 exe 路径/会话号/进程启动这些事。
+    /// </summary>
+    private void EnsureWorkerEngineRunning()
+    {
+        if (!_license.IsUsable)
+        {
+            _log.Warn($"服务已暂停（{_license.LockReason}）：暂不启动采集引擎");
+            return;
+        }
+        lock (_workerLock)
+        {
+            if (_bus.IsWorkerConnected)
+            {
+                _log.Info("采集引擎已在运行，跳过启动");
+                return;
+            }
+            // 刚拉起过就不要重复拉：引擎线程从启动到 MarkWorkerConnected 有 1~3 秒延迟，
+            // 这期间另一个调用方（看护 / 掉线重试）会以为没起来 → 拉出第二个引擎
+            // → 两个引擎各装一套钩子与采集器（等价于旧架构"两个 Worker 抢帧环"，实测 0 帧）。
+            if (DateTime.UtcNow - _lastWorkerLaunchUtc < TimeSpan.FromSeconds(20))
+            {
+                _log.Info($"刚拉起过采集引擎（{_lastWorkerLaunchUtc:HH:mm:ss}），跳过重复启动");
+                return;
+            }
+            _lastWorkerLaunchUtc = DateTime.UtcNow;
+            _host.Start();
+            _log.Info("已启动采集引擎线程");
+        }
+    }
+
+    // ---------------------------------------------------------------- 中继事件
+
+    /// <summary>
+    /// 中继是透传的，Agent 无法从"自己连上服务器"推断主控端在场。
+    /// 判定方式：最近 6 秒内收到过主控端的任何入站消息（主控端每 0.5~1 秒发心跳；心跳也会触发本事件）。
+    /// </summary>
+    private bool HasViewer =>
+        DateTime.UtcNow - _lastViewerActivity < TimeSpan.FromSeconds(6);
+
+    private void OnViewerTraffic()
+    {
+        bool firstInAWhile = !HasViewer;
+        _lastViewerActivity = DateTime.UtcNow;
+        if (firstInAWhile) OnViewerAttached();
+    }
+
+    /// <summary>
+    /// 确保"开机自启"任务存在，不存在就以 **开机触发 + SYSTEM + 最高权限** 注册一个。
+    ///
+    /// 为什么在被控端里兜这一层：早期安装脚本注册的是"登录时启动、并且绑定安装时那个用户"，
+    /// 被控机器只要停在登录界面（或重启后没人登录）就永远起不来 —— 实测踩到过：
+    /// 机器重启后 4 小时都没上线，服务器上"没有在线被控端"。另外用拷贝文件部署的机器压根没有任务。
+    /// 跑过一次的机器之后就能自己回来。
+    /// 已存在则不动（避免覆盖运维自己改过的配置）；没有管理员权限时只记一行日志。
+    /// </summary>
+    private void EnsureBootAutostart()
+    {
+        // 配置里关掉自启的机器（例如厂商自己的调试机）不碰任务计划
+        if (!_cfg.AutoStartOnBoot)
+        {
+            _log.Debug("配置里 AutoStartOnBoot=false，跳过开机自启检查");
+            return;
+        }
+        const string TaskName = "RemoteControlAgent";
+        try
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "Agent.Coordinator.exe");
+            if (!File.Exists(exe)) return;
+
+            var query = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/query", "/tn", TaskName }) query.ArgumentList.Add(a);
+            using (var q = Process.Start(query))
+            {
+                if (q == null) return;
+                q.StandardOutput.ReadToEnd();
+                q.StandardError.ReadToEnd();
+                q.WaitForExit(5000);
+                if (q.ExitCode == 0) return;    // 已有任务，不动
+            }
+
+            var create = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/create", "/tn", TaskName, "/tr", exe, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "highest", "/f" })
+                create.ArgumentList.Add(a);
+            using var c = Process.Start(create);
+            if (c == null) return;
+            var output = c.StandardOutput.ReadToEnd() + c.StandardError.ReadToEnd();
+            c.WaitForExit(8000);
+            if (c.ExitCode == 0) _log.Info($"已注册开机自启任务（{TaskName}：开机自动启动、SYSTEM 最高权限）");
+            else _log.Warn($"注册开机自启失败（无管理员权限时属正常）：{output.Trim()}");
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"检查开机自启任务异常：{ex.Message}");
+        }
+    }
+
+    /// <summary>优雅退出标记：看门狗看到它就不拉起进程（10 分钟内有效；进程启动时删除）</summary>
+    private string CleanExitPath => Path.Combine(Path.GetTempPath(), "RC-Update", "clean-exit.txt");
+
+    /// <summary>
+    /// 进程级看门狗（2026-10-09 事故）：热更新"报平安后第 2 分钟崩溃"这类进程级死亡，
+    /// 此前只能等下次开机自启 —— 机器一整晚在线列表里消失。这里注册一个每 2 分钟跑一次的
+    /// 计划任务：进程不在且没有"正在更新/刚优雅退出"标记 → 拉起来。
+    /// 不抢热更新的台：应用脚本会写 updating.txt（10 分钟内看门狗不动）。
+    /// 不和人工退出打架：托盘退出/任务管理器前若有优雅退出流程会写 clean-exit.txt（30 分钟内不拉起）；
+    /// 强杀（Stop-Process）没有标记会被拉起——运维真想停住就用托盘退出或先删计划任务。
+    /// </summary>
+    private void EnsureProcessWatchdog()
+    {
+        if (!_cfg.AutoStartOnBoot)
+        {
+            _log.Debug("配置里 AutoStartOnBoot=false，跳过进程看门狗注册");
+            return;
+        }
+        const string TaskName = "RemoteControlAgentWatchdog";
+        try
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "Agent.Coordinator.exe");
+            if (!File.Exists(exe)) return;
+            var workDir = Path.Combine(Path.GetTempPath(), "RC-Update");
+            Directory.CreateDirectory(workDir);
+            var script = Path.Combine(workDir, "watchdog.ps1");
+
+            // 看门狗脚本：每次启动都重写（安装目录/临时目录可能变）
+            var ps = new StringBuilder();
+            ps.AppendLine("$p = Get-Process Agent.Coordinator -ErrorAction SilentlyContinue;");
+            ps.AppendLine("if ($p) { exit 0 }");
+            ps.AppendLine($"$wd = '{workDir.Replace("'", "''")}';");
+            ps.AppendLine("$u = Join-Path $wd 'updating.txt';");
+            ps.AppendLine("if ((Test-Path $u) -and (Get-Item $u).LastWriteTime -gt (Get-Date).AddMinutes(-10)) { exit 0 }");
+            ps.AppendLine("$c = Join-Path $wd 'clean-exit.txt';");
+            ps.AppendLine("if ((Test-Path $c) -and (Get-Item $c).LastWriteTime -gt (Get-Date).AddMinutes(-30)) { exit 0 }");
+            ps.AppendLine($"Start-Process '{exe.Replace("'", "''")}' -WorkingDirectory '{AppContext.BaseDirectory.TrimEnd('\\').Replace("'", "''")}';");
+            ps.AppendLine("$stamp = Join-Path $wd 'watchdog-restarted.txt';");
+            ps.AppendLine("Set-Content $stamp (Get-Date -Format o);");
+            File.WriteAllText(script, ps.ToString(), System.Text.Encoding.UTF8);
+
+            // 幂等注册（已存在则跳过——不覆盖运维改过的配置）
+            var query = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/query", "/tn", TaskName }) query.ArgumentList.Add(a);
+            using (var q = Process.Start(query))
+            {
+                if (q == null) return;
+                q.StandardOutput.ReadToEnd();
+                q.StandardError.ReadToEnd();
+                q.WaitForExit(5000);
+                if (q.ExitCode == 0) return;
+            }
+            var tr = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{script}\"";
+            var create = new ProcessStartInfo("schtasks.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "/create", "/tn", TaskName, "/tr", tr, "/sc", "minute", "/mo", "2", "/ru", "SYSTEM", "/rl", "highest", "/f" })
+                create.ArgumentList.Add(a);
+            using var c = Process.Start(create);
+            if (c == null) return;
+            var output = c.StandardOutput.ReadToEnd() + c.StandardError.ReadToEnd();
+            c.WaitForExit(8000);
+            if (c.ExitCode == 0) _log.Info($"已注册进程看门狗任务（{TaskName}：每 2 分钟，进程不在且非更新/优雅退出时拉起）");
+            else _log.Warn($"注册进程看门狗失败（无管理员权限时属正常）：{output.Trim()}");
+        }
+        catch (Exception ex)
+        {
+            _log.Debug($"进程看门狗注册异常：{ex.Message}");
+        }
+    }
+
+    private void OnRelayConnected()    {
+        _license.NoteServerContact();      // 连上中继 = 联系上服务器，离线宽限重新计时
+        _log.Info("中继连接已建立，等待主控端接入");
+        // 托盘提示里带上连接状态：连不上服务器时用户一眼能看出来（不用翻日志）
+        _tray?.SetTooltip($"远程控制 Agent（{_cfg.AgentId}）\n已连接服务器");
+    }
+
+    private void OnRelayDisconnected(string reason)
+    {
+        _log.Info($"中继连接断开：{reason}");
+        // 断开原因写进托盘：口令不对时用户重装填一次口令就能解决，网络问题只能等 ——
+        // 这两件事在界面上本来完全一样，都是"不在线"
+        var why = _relay.AuthRejected ? "口令不一致或未填（见日志）" : "网络/服务器不可用";
+        _tray?.SetTooltip($"远程控制 Agent（{_cfg.AgentId}）\n未连接服务器（{why}，会自动重试）\n直连(可选)：{DirectStatusText()}");
+    }
+
+    /// <summary>主控端刚接入：推送显示器信息 + 软件列表，并让 Worker 重建码流（保证从关键帧开始）</summary>
+    private void OnViewerAttached()
+    {
+        _log.Info("检测到主控端接入");
+        PushMonitorInfo();
+        PushSoftwareListAsync();
+        _bus.SendToWorker(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
+        _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+        // UDP 打洞从接入这一刻就开始张罗：收集候选（STUN+内网）后把本端 PunchInfo 发给主控端。
+        // 候选还没就绪时这里发出去的是空列表——15 秒周期推送会补上，主控端也会周期重发它的。
+        // 本端是对称 NAT 时不发：候选端口对对端无意义（打洞必然失败），直接走中继。
+        if (!_cfg.UdpPunchEnabled)
+        {
+            // UDP 直连整体停用（2026-10-11 客户现场单向黑洞事故）：不发 PunchInfo，
+            // 主控端不会开打洞窗口，视频/输入全程走 TCP（直连或中继）。
+        }
+        else if (!_udp.SymmetricNat)
+        {
+            _ = Task.Run(async () =>
+            {
+                await _udp.EnsureCandidatesAsync();
+                if (HasViewer && !_udp.IsLive && !_udp.SymmetricNat)
+                    _relay.Queue(new ProtocolMessage(MessageType.PunchInfo, _udp.OfferPayload()));
+            });
+        }
+        else
+        {
+            _log.Info("本机疑似对称 NAT：UDP 打洞无望，本次连接走中继（候选不再发送）");
+        }
+    }
+
+    private DateTime _lastListPush = DateTime.MinValue;
+
+    /// <summary>枚举并上报软件列表（2 秒内重复请求会被合并，避免重复枚举）</summary>
+    private void PushSoftwareListAsync()
+    {
+        if (DateTime.UtcNow - _lastListPush < TimeSpan.FromSeconds(2)) return;
+        _lastListPush = DateTime.UtcNow;
+        _ = Task.Run(() => SendSoftwareList(_sw.Enumerate().ToArray()));
+    }
+
+    private void OnViewerMessage(ProtocolMessage msg)
+    {
+        switch (msg.Type)
+        {
+            case MessageType.PunchInfo:
+                // 主控端的 UDP 打洞候选到了（nonce + 公网映射/内网地址）→ 对着它的候选开打。
+                // 走中继也走 UDP 直连都可能收到这条（去重由打洞幂等性兜住）。
+                // 任一侧是对称 NAT（本端标志或对端上报）都无望打洞：直接不进打洞窗口，
+                // 走中继（对标 UU 的 PunchCheckFireWall："确认打不动就立刻转 relay"）。
+                if (_license.IsUsable)
+                {
+                    var (nonce, eps, peerSym, peerCap) = UdpPunchChannel.DecodeOffer(msg.Payload);
+                    if (peerSym && !_udpSymNoticeLogged)
+                    {
+                        _udpSymNoticeLogged = true;
+                        _log.Info("对端（主控端）上报疑似对称 NAT：UDP 打洞无望，本次连接走中继");
+                    }
+                    if (_cfg.UdpPunchEnabled && eps.Count > 0 && !peerSym)
+                        _udp.OfferPeers(eps, nonce, peerCap);   // 能力位随 offer 一起进通道（KCP/RS-FEC 的 AND 协商）
+                }
+                break;
+
+            case MessageType.RequestSoftwareList:
+                // 主控端每次连接都会发这条（相当于"我上线了"）：必须把接入状态一整套推给它，
+                // 否则"上一个主控端刚断开不到 6 秒"时会被 HasViewer 判定为"仍然在线"而跳过推送，
+                // 表现为新主控端画面一直是黑的（实测踩到）
+                _log.Info("收到软件列表请求（视为主控端上线）");
+                OnViewerAttached();
+                break;
+
+            case MessageType.Capabilities:
+                // 主控端能力协商（2026-10-10 H.265）：转给采集引擎决定/切换编码族。
+                // 多主控端时收下但不转发 —— 只服务公共能力集（H.264），见 ViewerCountChanged。
+                if (_bus.IsWorkerConnected && _viewerCount <= 1)
+                    _bus.SendToWorker(msg);
+                break;
+
+            case MessageType.DiagnosticsRequest:
+                // 诊断（2026-10-11 对标 UU healthd）：协调器**直接**应答，不经过引擎 ——
+                // 引擎卡死/泵坏死时照样可用，这正是 2026-10-10"控制面坏死两小时盲区"的解药。
+                _log.Info("收到诊断请求（协调器直接应答，不经过引擎）");
+                SendToViewer(new ProtocolMessage(MessageType.DiagnosticsReport,
+                    JsonCodec.Encode(BuildDiagnostics())));
+                break;
+
+            case MessageType.EngineRestart:
+                // 远程硬重启采集引擎（诊断配套）：转储引擎线程栈 + WM_QUIT，看门狗自动拉起新引擎。
+                _log.Warn("收到远程重启引擎请求：转储引擎栈并硬重启（看门狗会拉起新引擎）");
+                _host.DumpEngineStackAndRequestExit();
+                ReportError("已请求重启采集引擎（约 10 秒内自动恢复）");
+                break;
+
+            case MessageType.MouseMove:
+            case MessageType.MouseButton:
+            case MessageType.MouseWheel:
+            case MessageType.KeyEvent:
+            case MessageType.ClipboardText:
+            case MessageType.OpenSoftware:
+            case MessageType.CloseSoftware:
+            case MessageType.StreamReset:
+            case MessageType.InputModeHint:
+            case MessageType.CaptureModeHint:
+            case MessageType.MoveWindowHint:
+            case MessageType.MoveAppWindowHint:
+            case MessageType.Disconnect:
+                if (_bus.IsWorkerConnected)
+                {
+                    if (msg.Type == MessageType.InputModeHint && msg.Payload.Length > 0)
+                        _log.Info($"主控端选择鼠标模式：{(RemoteInputMode)msg.Payload[0]}");
+                    if (msg.Type == MessageType.CaptureModeHint && msg.Payload.Length > 0)
+                        _log.Info($"主控端选择画面范围：{(CaptureMode)msg.Payload[0]}");
+                    _bus.SendToWorker(msg);
+                }
+                else if (msg.Type is MessageType.OpenSoftware or MessageType.CloseSoftware)
+                {
+                    ReportError("Worker 未连接，无法执行软件操作");
+                }
+                else
+                {
+                    WarnRateLimited($"Worker 未连接，丢弃 {msg.Type}");
+                }
+                break;
+
+            default:
+                _log.Debug($"忽略来自主控端的消息类型 0x{(byte)msg.Type:X2}");
+                break;
+        }
+    }
+
+    // ---------------------------------------------------------------- IPC 事件
+
+    private void OnWorkerConnected()
+    {
+        _log.Info("Worker 连接成功，等待就绪上报");
+        // 注意：这里**不要**立刻让 Worker 枚举软件（枚举耗时数秒、且在主控端没接入时毫无意义），
+        // 实测该调用会让 Worker 在连接后 ~4 秒退出（IPC 读取循环被阻塞/中断），
+        // 表现为"Worker 起来就死 → 画面 0 帧"。软件列表改由主控端接入时按需请求（OnViewerAttached/PushSoftwareList）。
+        _log.Debug("（跳过启动时的软件列表预取，改为主控端接入时按需请求）");
+    }
+
+    private void OnWorkerDisconnected(string reason)
+    {
+        _log.Warn($"采集引擎断开：{reason}");
+        if (!_cfg.RestartWorkerOnExit || _cts.IsCancellationRequested) return;
+        _ = Task.Run(async () =>
+        {
+            for (int i = 1; i <= 5 && !_cts.IsCancellationRequested; i++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5 * i));
+                if (_bus.IsWorkerConnected) return;
+                _log.Info($"尝试重启采集引擎（第 {i} 次）");
+                EnsureWorkerEngineRunning();
+                await Task.Delay(TimeSpan.FromSeconds(8));
+                if (_bus.IsWorkerConnected) return;
+            }
+        });
+    }
+
+    private void OnWorkerMessage(ProtocolMessage msg)
+    {
+        switch (msg.Type)
+        {
+            case MessageType.WorkerReady:
+            {
+                _workerReady = JsonCodec.Decode<WorkerReadyInfo>(msg.Payload);
+                _log.Info($"Worker 就绪：{_workerReady?.Backend} {_workerReady?.Width}x{_workerReady?.Height} " +
+                          $"monitor={_workerReady?.Monitor} session={_workerReady?.SessionId}");
+                _tray?.SetTooltip($"远程控制 Agent（Worker 已就绪 {_workerReady?.Width}x{_workerReady?.Height}）");
+                PushMonitorInfo();
+                break;
+            }
+            case MessageType.MonitorInfo:
+            {
+                _monitor = JsonCodec.Decode<MonitorInfo>(msg.Payload);
+                if (_monitor != null)
+                {
+                    _log.Info($"远程显示器：{_monitor.Width}x{_monitor.Height} @({_monitor.Left},{_monitor.Top}) count={_monitor.Count}");
+                    SendToViewer(msg);
+                }
+                break;
+            }
+            case MessageType.ClipboardText:
+                _log.Debug($"剪贴板文本（{msg.Payload.Length} 字节）→ 主控端");
+                SendToViewer(msg);
+                break;
+
+            case MessageType.ClipboardFile:
+            {
+                // Worker 传的是本地文件/文件夹路径；这里负责（文件夹→打包 zip →）上传到服务器再通知主控端
+                var file = JsonCodec.Decode<FileDropInfo>(msg.Payload);
+                if (file != null) _ = Task.Run(() => UploadAndNotifyAsync(file));
+                break;
+            }
+
+            case MessageType.StreamReset:
+                // Worker 重建了码流 → 1) 丢弃共享内存里旧码流的残帧 2) 让主控端同步重建解码器
+                DrainFrameRing();
+                _log.Info("Worker 重建码流，已清空残帧并通知主控端重建解码器");
+                SendToViewer(msg);
+                break;
+
+            case MessageType.WorkerStatus:
+            {
+                Volatile.Write(ref _lastWorkerStatusTick, Environment.TickCount64);   // 状态龄监视的喂狗
+                // 补上"视频实际走了哪条路"的计数：主控端据此显示直连/中继，
+                // 验收脚本据此断言 P2P 是否真的生效（中继块数应停止增长）。
+                var st = JsonCodec.Decode<WorkerStatusInfo>(msg.Payload) ?? new WorkerStatusInfo();
+                st.DirectFrames = _direct.FramesSent;
+                st.DirectBytes = _direct.BytesSent;
+                st.DirectActive = _direct.HasViewer;
+                st.RelayChunks = Interlocked.Read(ref _relayVideoChunks);
+                // 中继这条腿的积压/丢弃：主控端据此显示"网络上是不是堵了"
+                st.RelayQueued = _relay.VideoPending;
+                st.RelayDropped = _relay.VideoDropped;
+                // UDP 直连状态（主控端状态栏的"延迟/直连"显示、_rcp status 远程可观测）
+                st.UdpActive = _udp.IsLive;
+                st.UdpEndpoint = _udp.PeerEndpoint ?? "";
+                st.UdpRtt = _udp.RttMs;
+                st.UdpLoss = _udp.LossPercent;
+                st.UdpPingLoss = _udp.PingLossPercent;
+                st.UdpSuspended = _udpVideoSuspended;
+                st.UdpKcp = _udp.KcpActive;
+                st.UdpFecR = _udp.FecParityR;
+                st.UdpFecRecovered = _udp.FecRecoveredChunks;
+                // 视频出口拥塞 → 立刻告诉 Worker 降码率。
+                // Worker 自己看不到出口这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
+                // UDP 直连时改看**丢帧率**（残帧率）与保活 ping 丢包 —— 直连没有队列积压这回事，
+                // 拥塞表现为丢包；已被路径监控暂停的直连不再计入（视频此刻走中继）。
+                bool udpCongested = _udp.IsLive && !_udpVideoSuspended
+                                    && (_udp.LossPercent >= 15 || _udp.PingLossPercent >= 25);
+                bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped || udpCongested;
+                _lastVideoDropped = _relay.VideoDropped;
+                long hintSeq = Interlocked.Increment(ref _hintSeqSent);
+                _bus.SendToWorker(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
+                {
+                    Congested = congested,
+                    VideoQueued = _relay.VideoPending,
+                    VideoDropped = _relay.VideoDropped,
+                    // 主控端在线状态（协调器是权威判定方）——引擎据此决定是否回收副屏孤儿窗口
+                    ViewerOnline = HasViewer,
+                    Seq = hintSeq,
+                })));
+                // 【2026-10-09 二次卡死事故·金丝雀】现场出现"协调器发得出、Worker 收不到"的单向断流
+                // （心跳回显正常、状态照常流出、但打开软件/剪贴板/切画面全部失灵 40+ 分钟）。
+                // Worker 在状态里回显最近收到的序号：发送-回显差距持续 ≥8（约 8 秒）= 送达断了，
+                // 换桥的 toWorker 通道并硬重启引擎——不管断在哪一层，这两刀都能恢复（60s 节流）。
+                long echoed = st.HintSeq;
+                if (hintSeq - echoed >= 8)
+                {
+                    long nowT = Environment.TickCount64;
+                    if (nowT - Interlocked.Read(ref _canaryFiredTick) >= 60_000)
+                    {
+                        Interlocked.Exchange(ref _canaryFiredTick, nowT);
+                        _log.Error($"⚠⚠ 单向断流检测：已发 BitrateHint 序号 {hintSeq}，Worker 只回显到 {echoed} " +
+                                   $"（差 {hintSeq - echoed}）——换 toWorker 通道并硬重启引擎");
+                        _bus.RespawnToWorkerTransport();
+                        _host.DumpEngineStackAndRequestExit();
+                    }
+                }
+                // 授权状态随状态上报一起发出（界面不展示，供厂商侧排障/工具使用）
+                var lp = _license.Payload;
+                st.LicenseId = lp?.Lic ?? "";
+                st.LicenseSub = lp?.Sub ?? "";
+                st.LicenseExpUnix = lp?.Exp ?? 0;
+                st.LicenseDaysLeft = lp != null ? lp.DaysLeft() : 0;
+                st.LicenseLocked = !_license.IsUsable;
+                st.LicenseLockReason = _license.LockReason;
+                // 热更新状态（远程可观测：主控端/_rcp.py 都能看到这台机器的更新进展）
+                st.UpdateState = _updater.State;
+                st.UpdateStaged = _updater.StagedVersion;
+                // 主动上报自身信息，省得主控端只知道一个 ID
+                st.HostName = Environment.MachineName;
+                st.UserName = Environment.UserName;
+                st.OsVersion = _osVersion ??= DescribeOs();
+                st.AgentVersion = _workerReady?.Version ?? "1.0.0";
+                SendToViewer(new ProtocolMessage(MessageType.WorkerStatus, JsonCodec.Encode(st)));
+                break;
+            }
+
+            case MessageType.SoftwareState:
+                SendToViewer(msg);
+                break;
+
+            case MessageType.Error:
+                _log.Error($"Worker 报错：{PayloadCodec.DecodeText(msg.Payload)}");
+                SendToViewer(msg);
+                break;
+
+            default:
+                _log.Debug($"忽略 Worker 消息 0x{(byte)msg.Type:X2}");
+                SendToViewer(msg);
+                break;
+        }
+    }
+
+    /// <summary>丢弃帧通道里尚未发送的旧码流残帧（重建码流时用）</summary>
+    private void DrainFrameRing()
+    {
+        try { _bus.Frames.Reset(); }
+        catch (Exception ex) { _log.Debug($"清空残帧失败：{ex.Message}"); }
+    }
+
+    private void OnFrame(byte[] chunk)
+    {
+        if (!HasViewer) return;   // 无主控端时不做无用功（中继上没有接收方）
+        if (!_license.IsUsable) return;   // 授权不可用：一个字节都不往外送（含 P2P）
+        var payload = PayloadCodec.EncodeVideoFrame(Environment.TickCount64, chunk);
+        var msg = new ProtocolMessage(MessageType.VideoFrame, payload);
+        // UDP 打洞直连最优先（跨网络时的低延迟路径）；多主控端时和 TCP 直连一样只服务一个，
+        // 统一回中继人人有画面。SendVideo 未连通时返回 false 自动落到下一档。
+        // 路径质量监控暂停期间（丢包超标）同样不走 UDP —— 让 TCP 中继把画面稳住。
+        if (_cfg.UdpPunchEnabled && _viewerCount <= 1 && !_udpVideoSuspended && _udp.SendVideo(msg))
+            return;
+        // P2P 直连优先：视频走直连，控制/剪贴板仍走中继；直连断了自动回到中继。
+        // 但**有多个主控端时不能只发直连**：那条通道只服务一个主控端，
+        // 其他主控端会一直黑屏（实测缺陷）→ 这时统一走中继，人人有画面。
+        if (_direct.HasViewer && _viewerCount <= 1)
+        {
+            _direct.Send(msg);
+            return;
+        }
+        Interlocked.Increment(ref _relayVideoChunks);
+        _relay.QueueVideo(msg);
+    }
+
+    // ---------------------------------------------------------------- 文件上传
+
+    private async Task UploadAndNotifyAsync(FileDropInfo file)
+    {
+        // 文件夹复制（2026-10 新增）：先压成临时 zip 再上传，主控端收到 IsFolder 标记后解压还原
+        string uploadPath = file.LocalPath;
+        string uploadName = file.FileName;
+        string? tempZip = null;
+        if (file.IsFolder)
+        {
+            tempZip = FolderTransfer.PackFolder(file.LocalPath, out string packError);
+            if (tempZip == null)
+            {
+                _log.Error($"文件夹打包失败：{packError}");
+                ReportError($"复制文件夹失败：{packError}");
+                return;
+            }
+            // 有跳过的文件不算失败（Telegram/微信等运行时锁文件是正常的），只在日志里提一句
+            if (packError.Length > 0)
+                _log.Info($"文件夹打包提示：{packError}");
+            uploadPath = tempZip;
+            uploadName = file.FileName + ".zip";
+            _log.Info($"文件夹已打包：{file.LocalPath} → {uploadName}（{new FileInfo(tempZip).Length / 1024}KB）");
+        }
+        try
+        {
+            var info = await _uploader.UploadAsync(uploadPath, uploadName);
+            if (info == null)
+            {
+                ReportError($"文件上传失败：{file.FileName}");
+                return;
+            }
+            if (file.IsFolder)
+            {
+                info.IsFolder = true;
+                info.FolderName = file.FileName;
+            }
+            SendToViewer(new ProtocolMessage(MessageType.ClipboardFile, JsonCodec.Encode(info)));
+            _log.Info($"已通知主控端可下载：{info.FileName}（fileId={info.FileId}）");
+        }
+        finally
+        {
+            if (tempZip != null)
+            {
+                try { Directory.Delete(Path.GetDirectoryName(tempZip)!, recursive: true); } catch { }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- 发送
+
+    /// <summary>
+    /// 把"发给主控端"的消息送出去：**直连（P2P）已建立就优先走直连**，否则回退中继。
+    ///
+    /// 为什么必须这样：以前只有视频走直连，鼠标键盘、软件列表、状态上报、剪贴板全都挤在中继上。
+    /// 一旦中继那条腿出问题（实测：机房侧把出站压到 15KB/s → 主控端下载只有 2KB/s），
+    /// "切到 P2P" 就只能救画面，操作和列表照样卡死。现在所有发给主控端的东西都优先走直连，
+    /// 直连断了自动回退中继，不需要人工干预。
+    /// </summary>
+    private void SendToViewer(ProtocolMessage msg)
+    {
+        // UDP 打洞直连优先：状态/软件列表/剪贴板这些小消息走直连（RTT 低），
+        // 250ms 未确认自动回落中继补发（通道内建），接收端按序号去重不会重复。
+        // 大消息（>48KB 的软件列表图标包等）和多头观众仍走中继。
+        // 路径质量监控暂停期间（丢包超标）不走 UDP：点击这类控制消息在坏链路上会丢手感。
+        if (_cfg.UdpPunchEnabled && _udp.IsLive && !_udpVideoSuspended && _viewerCount <= 1 && msg.Payload.Length <= 48 * 1024
+            && msg.Type != MessageType.DirectCandidates && msg.Type != MessageType.PunchInfo)
+        {
+            _udp.Send(msg, m => _relay.Queue(m));
+            return;
+        }
+        if (_direct.HasViewer && _viewerCount <= 1)
+        {
+            _direct.Send(msg);
+            return;
+        }
+        _relay.Queue(msg);
+    }
+
+    /// <summary>把直连候选地址推给主控端（改过公网地址/开关后立刻重推，不用重启）</summary>
+    private void PushDirectCandidates()
+    {
+        try
+        {
+            _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+        }
+        catch (Exception ex) { _log.Debug($"推送直连候选失败：{ex.Message}"); }
+    }
+
+    /// <summary>托盘上显示的直连状态（一句话）</summary>
+    private string DirectStatusText()
+    {
+        if (!_cfg.DirectLinkEnabled) return "已关闭";
+        if (_direct.HasViewer)
+            return $"已建立 ← {_direct.ViewerEndpoint}（{_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB）";
+        if (!string.IsNullOrEmpty(_direct.PublicAddress)) return $"待接入（公网 {_direct.PublicAddress}）";
+        if (_direct.UpnpMapped) return "待接入（UPnP 已映射）";
+        if (_direct.Port > 0) return $"待接入（仅内网 {string.Join("/", _direct.LocalCandidates())}）";
+        return "未启动（端口被占用？）";
+    }
+
+    /// <summary>托盘：开/关直连。关 = 拒绝新的直连握手；开 = 允许（必要时现场启动监听）。都是立即生效。</summary>
+    private void SetDirectEnabled(bool on)
+    {
+        _cfg.DirectLinkEnabled = on;
+        try { _cfg.Save(); } catch (Exception ex) { _log.Warn($"保存配置失败：{ex.Message}"); }
+        if (on)
+        {
+            if (_direct.Port <= 0)
+            {
+                try { _direct.Start(); }
+                catch (Exception ex) { _log.Warn($"启动直连监听失败：{ex.Message}"); }
+            }
+            _log.Info("托盘：已开启 P2P 直连");
+        }
+        else
+        {
+            _direct.StopServing("托盘关闭了直连");
+            _log.Info("托盘：已关闭 P2P 直连（监听端口保留，但拒绝新的直连握手）");
+        }
+        PushDirectCandidates();
+    }
+
+    /// <summary>托盘：设置直连公网地址（做完端口映射后填这里，立即生效并重推候选）</summary>
+    private void SetDirectPublicAddress(string address)
+    {
+        var v = (address ?? "").Trim();
+        _cfg.DirectLinkPublicAddress = v;
+        try { _cfg.Save(); } catch (Exception ex) { _log.Warn($"保存配置失败：{ex.Message}"); }
+        if (v.Length == 0)
+        {
+            _log.Info("托盘：已清空直连公网地址（回退到 UPnP/内网候选；清空要重启被控端才完全生效）");
+        }
+        else
+        {
+            _direct.SetManualPublic(v);
+            _log.Info($"托盘：直连公网地址已设为 {v}");
+        }
+        PushDirectCandidates();
+    }
+
+    private void PushMonitorInfo()
+    {
+        MonitorInfo mi;
+        if (_monitor != null) mi = _monitor;
+        else if (_workerReady != null)
+            mi = new MonitorInfo { Width = _workerReady.Width, Height = _workerReady.Height, Count = 1 };
+        else return;
+        SendToViewer(new ProtocolMessage(MessageType.MonitorInfo, JsonCodec.Encode(mi)));
+    }
+
+    /// <summary>上一次发给主控端的软件列表（实时监测拿它做变化比对）</summary>
+    private List<SoftwareInfo> _lastSoftwareList = new();
+    private readonly object _swListLock = new();
+
+    // ---------------------------------------------------------------- 诊断（healthd 式，2026-10-11）
+
+    /// <summary>
+    /// 收集诊断快照。**只依赖协调器自己知道的事**（日志尾部从磁盘文件读）——
+    /// 引擎彻底卡死时这份报告照样完整，这是与"经引擎的状态上报"的本质区别。
+    /// </summary>
+    private DiagnosticsInfo BuildDiagnostics()
+    {
+        var d = new DiagnosticsInfo
+        {
+            Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            AgentVersion = _workerReady?.Version ?? "",
+            EngineConnected = _bus.IsWorkerConnected,
+            EngineThreadAlive = _host.IsRunning,
+            StatusAgeMs = Environment.TickCount64 - Volatile.Read(ref _lastWorkerStatusTick),
+            ViewerCount = _viewerCount,
+            RelayConnected = _relay.IsConnected,
+            RelayQueued = _relay.VideoPending,
+            RelayDropped = _relay.VideoDropped,
+            UdpActive = _udp.IsLive,
+            UdpEndpoint = _udp.PeerEndpoint ?? "",
+            UdpRtt = _udp.RttMs,
+            UdpLoss = _udp.LossPercent,
+            UdpPingLoss = _udp.PingLossPercent,
+            UdpSuspended = _udpVideoSuspended,
+            UdpKcp = _udp.KcpActive,
+            UdpFecR = _udp.FecParityR,
+            UdpFecRecovered = _udp.FecRecoveredChunks,
+            ConfigSummary = $"backend={_cfg.CaptureBackend} fps={_cfg.FrameRate} kbps={_cfg.BitrateKbps} " +
+                            $"codec={_cfg.VideoCodec} encoder={_cfg.Encoder} vdd={_cfg.EnableVirtualDisplay} " +
+                            $"license={(_license.IsUsable ? "ok" : _license.LockReason)}",
+            WorkerLogTail = ReadLogTail("worker-*.log", 60),
+            CoordinatorLogTail = ReadLogTail("coordinator-*.log", 40),
+        };
+        return d;
+    }
+
+    /// <summary>
+    /// 读安装目录 logs\ 下最新一份匹配日志的尾部。FileShare.ReadWrite 打开 ——
+    /// Logger 正在写也不冲突；引擎死了文件还在，这正是"死了也能拿日志"的关键。
+    /// </summary>
+    private static string ReadLogTail(string pattern, int lines)
+    {
+        try
+        {
+            var dir = Path.Combine(AppContext.BaseDirectory, "logs");
+            if (!Directory.Exists(dir)) return "(logs 目录不存在)";
+            var file = new DirectoryInfo(dir)
+                .EnumerateFiles(pattern)
+                .OrderByDescending(f => f.LastWriteTime)
+                .FirstOrDefault();
+            if (file == null) return $"(没有 {pattern})";
+            var tail = new Queue<string>(lines);
+            using var fs = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (tail.Count == lines) tail.Dequeue();
+                tail.Enqueue(line);
+            }
+            return $"[{file.Name}]\n" + string.Join("\n", tail);
+        }
+        catch (Exception ex)
+        {
+            return $"(读日志失败：{ex.Message})";
+        }
+    }
+
+    /// <summary>
+    /// 实时运行状态监测：每 3 秒轻量枚举一次进程，**只把有变化的项**推给主控端。
+    /// 为什么要有它：光靠"主控端打开/关闭"的事件推状态，用户在被控机上手动开关程序时，
+    /// 列表状态就永远不刷新（现场反馈："我都关了它还显示开着"）。
+    /// 只推变化项是为了省流量 —— 每 3 秒把 28 项全推一遍在弱网上是浪费。
+    /// </summary>
+    private async Task WatchSoftwareStatesAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(3000, ct);
+                if (!HasViewer) continue;
+                List<SoftwareInfo> snapshot;
+                lock (_swListLock) snapshot = _lastSoftwareList;
+                if (snapshot.Count == 0) continue;
+
+                var (byPath, byName) = SoftwareEnumerator.GetRunningStates();
+                var changed = new List<SoftwareStateInfo>();
+                foreach (var sw in snapshot)
+                {
+                    int pid = 0;
+                    bool found = byPath.TryGetValue(sw.ExePath, out pid);
+                    if (!found && !string.IsNullOrEmpty(Path.GetFileName(sw.ExePath)))
+                        found = byName.TryGetValue(Path.GetFileName(sw.ExePath), out pid);
+                    bool running = found && pid > 0;
+                    if (running == sw.IsRunning && pid == sw.Pid) continue;
+                    sw.IsRunning = running;
+                    sw.Pid = running ? pid : 0;
+                    changed.Add(new SoftwareStateInfo { ExePath = sw.ExePath, Pid = sw.Pid, IsRunning = running });
+                }
+                foreach (var c in changed)
+                    SendToViewer(new ProtocolMessage(MessageType.SoftwareState, JsonCodec.Encode(c)));
+                if (changed.Count > 0)
+                    _log.Info($"软件运行状态变化 {changed.Count} 项（实时监测，已推给主控端）");
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex) { _log.Debug($"软件状态监测异常：{ex.Message}"); }
+        }
+    }
+
+    private void SendSoftwareList(SoftwareInfo[] list)
+    {
+        var payload = JsonCodec.Encode(list);
+        lock (_swListLock) _lastSoftwareList = list.ToList();   // 实时监测拿它做比对
+        _log.Info($"上报软件列表：{list.Length} 项（{payload.Length / 1024}KB）");
+        SendToViewer(new ProtocolMessage(MessageType.SoftwareList, payload));
+    }
+
+    private void ReportError(string message)
+    {
+        SendToViewer(new ProtocolMessage(MessageType.Error, PayloadCodec.EncodeText(message)));
+    }
+
+    private void WarnRateLimited(string msg)
+    {
+        if (DateTime.UtcNow - _lastInputWarn < TimeSpan.FromSeconds(5)) return;
+        _lastInputWarn = DateTime.UtcNow;
+        _log.Warn(msg);
+    }
+
+    // ---------------------------------------------------------------- 退出
+
+    private void Shutdown()
+    {
+        _log.Info("收到退出请求，开始关闭…");
+        // 优雅退出标记：进程看门狗 30 分钟内不拉起（强杀没有这步，会被看门狗拉回——按设计）
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(CleanExitPath)!);
+            File.WriteAllText(CleanExitPath, $"clean exit {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        }
+        catch { }
+        try { _cts.Cancel(); } catch { }
+
+        // 1. 通知采集引擎退出（走正常收尾：卸钩子、关编码器，否则会留下 ffmpeg 进程、拖慢整机输入）
+        try
+        {
+            if (_bus.IsWorkerConnected)
+            {
+                _bus.SendToWorker(new ProtocolMessage(MessageType.Stop, PayloadCodec.Empty()));
+                Thread.Sleep(800);
+            }
+        }
+        catch { }
+
+        // 2. 清理"旧版本残留"的独立 Worker 进程（升级场景；进程合并后正常没有这个进程）
+        try
+        {
+            foreach (var p in Process.GetProcessesByName("Agent.Worker"))
+            {
+                try
+                {
+                    p.Kill(entireProcessTree: true);
+                    _log.Info($"已结束旧版残留 Worker pid={p.Id}");
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+        }
+        catch (Exception ex) { _log.Warn($"结束残留 Worker 失败：{ex.Message}"); }
+
+        // 3. 收尾
+        _log.Info("Agent Coordinator 已退出");
+        try { _tray?.Dispose(); } catch { }
+        Application.ExitThread();
+    }
+
+    public void Dispose()
+    {
+        try { _relay.Dispose(); } catch { }
+        try { _udp.Dispose(); } catch { }
+        try { _updater.Dispose(); } catch { }
+        try { _bus.Dispose(); } catch { }
+        try { _uploader.Dispose(); } catch { }
+        try { _direct.Dispose(); } catch { }
+        try { _tray?.Dispose(); } catch { }
+        _cts.Dispose();
+    }
+}

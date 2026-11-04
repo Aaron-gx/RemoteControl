@@ -29,15 +29,22 @@ public sealed unsafe class WgcFrameSource : FrameSource
     private IntPtr _winrtDevice;
     private int _failCount;
     private byte[]? _lastFrame;
+    /// <summary>BGRA 中转缓冲（SoftwareBitmap 解出来是带 stride 的 BGRA，转 NV12 用）</summary>
+    private byte[]? _bgraScratch;
     /// <summary>采集项已被系统关闭（显示器移除/重建/显示模式切换），再取帧也没意义</summary>
     private volatile bool _dead;
     private long _lastFreshTick = Environment.TickCount64;
     private long _lastStaleLogTick;
 
     public override string Backend => "WGC";
+    private readonly bool _nv12Pipeline;
 
-    public WgcFrameSource(DisplayInfo target, Logger log)
+    /// <summary>输出格式：nv12（opt-in 管道，省 62% 流量）或 bgra（默认，久经验证）</summary>
+    public override string PixelFormat => _nv12Pipeline ? "nv12" : "bgra";
+
+    public WgcFrameSource(DisplayInfo target, Logger log, bool nv12Pipeline = false)
     {
+        _nv12Pipeline = nv12Pipeline;
         _target = target;
         _log = log;
         Width = target.Width;
@@ -201,14 +208,46 @@ public sealed unsafe class WgcFrameSource : FrameSource
                 NativeWgc.GetBuffer(reference, out byte* data, out uint capacity);
                 int stride = desc.Stride;
                 int rowBytes = Width * 4;
-                int total = rowBytes * Height;
-                if (_lastFrame == null || _lastFrame.Length != total) _lastFrame = new byte[total];
-                for (int y = 0; y < Height; y++)
+
+                if (!_nv12Pipeline)
                 {
-                    var src = new ReadOnlySpan<byte>(data + desc.StartIndex + y * stride, rowBytes);
-                    src.CopyTo(new Span<byte>(_lastFrame, y * rowBytes, rowBytes));
+                    // ---- BGRA 管线（默认，久经验证）：紧排行拷贝后原样输出 ----
+                    int totalBgra = rowBytes * Height;
+                    if (_lastFrame == null || _lastFrame.Length != totalBgra) _lastFrame = new byte[totalBgra];
+                    fixed (byte* pBgra = _lastFrame)
+                    {
+                        for (int y = 0; y < Height; y++)
+                        {
+                            var src = new ReadOnlySpan<byte>(data + desc.StartIndex + y * stride, rowBytes);
+                            src.CopyTo(new Span<byte>(pBgra + y * rowBytes, rowBytes));
+                        }
+                    }
+                    output.Write(_lastFrame, 0, totalBgra);
+                    return true;
                 }
-                output.Write(_lastFrame, 0, total);
+
+                // ---- NV12 管线（opt-in，2026-10-11）----
+                // 1) 带 stride 的 BGRA → 紧排 BGRA 中转缓冲
+                int totalSrc = rowBytes * Height;
+                if (_bgraScratch == null || _bgraScratch.Length != totalSrc) _bgraScratch = new byte[totalSrc];
+                fixed (byte* pBgra = _bgraScratch)
+                {
+                    for (int y = 0; y < Height; y++)
+                    {
+                        var src = new ReadOnlySpan<byte>(data + desc.StartIndex + y * stride, rowBytes);
+                        src.CopyTo(new Span<byte>(pBgra + y * rowBytes, rowBytes));
+                    }
+                    // 2) BGRA → NV12（BT.601，与 ffmpeg 内部转换同矩阵）
+                    //    【真机问题】在 nvenc/1920x1080 上发现底部条带持续性色度损坏，原因待查，
+                    //    已回退默认 bgra（AppConfig.PixelPipeline）；保留实现供排查/修复后启用。
+                    int totalNv12 = Width * Height * 3 / 2;
+                    if (_lastFrame == null || _lastFrame.Length != totalNv12) _lastFrame = new byte[totalNv12];
+                    fixed (byte* pNv12 = _lastFrame)
+                    {
+                        PixelConvert.BgraToNv12(pBgra, rowBytes, pNv12, Width, Height);
+                    }
+                }
+                output.Write(_lastFrame, 0, _lastFrame.Length);
             }
             return true;
         }

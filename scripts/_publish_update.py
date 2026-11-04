@@ -17,9 +17,32 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 
-RELAY = "__RELAY_HOST__:18080"
-T = "__RELAY_TOKEN__"
-A = "__RELAY_ADMIN_TOKEN__"
+# 中继地址与两个口令从 config\relay-token.txt 读（gitignore 已排除，绝不入版本库；2026-10-14 推 GitHub 前清密）
+#   T = 中继连接口令（上传 API 鉴权）  A = 中继管理口令（/admin/update 推送热更）
+# 格式：relay= / token= / admin=；环境变量 RC_RELAY/RC_TOKEN/RC_ADMIN 可覆盖
+import os as _os
+_rcfg = {"relay": "", "token": "", "admin": ""}
+_rcfgPath = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                          "..", "config", "relay-token.txt")
+try:
+    for _raw in open(_rcfgPath, encoding="utf-8-sig"):
+        _line = _raw.strip()
+        if not _line or _line.startswith("#"):
+            continue
+        if "=" in _line:
+            _k, _v = _line.split("=", 1)
+            if _k.strip().lower() in _rcfg:
+                _rcfg[_k.strip().lower()] = _v.strip()
+        elif not _rcfg["token"]:
+            _rcfg["token"] = _line   # 旧格式兼容：整行就是中继口令
+except OSError:
+    pass
+RELAY = _os.environ.get("RC_RELAY") or _rcfg["relay"]   # 换服务器：set RC_RELAY=新IP:端口
+T = _os.environ.get("RC_TOKEN") or _rcfg["token"]
+A = _os.environ.get("RC_ADMIN") or _rcfg["admin"]
+if not RELAY or not T or not A:
+    raise SystemExit("缺少中继地址/口令：请在 config\\relay-token.txt 里填 relay=、token=、admin=（该文件不入 git），"
+                     "或设 RC_RELAY / RC_TOKEN / RC_ADMIN 环境变量")
 
 
 def b64url(b):

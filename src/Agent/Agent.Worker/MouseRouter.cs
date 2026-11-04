@@ -67,8 +67,16 @@ public sealed class MouseRouter
     private long _lastContestLogTick;
     private long _lastProbeTick;
     private long _lastBlockerScanTick;
+    private long _lastUpgradeLogTick;
+    private long _lastRouteLogTick;
 
     public InputPath CurrentPath { get; private set; } = InputPath.RealCursor;
+    /// <summary>
+    /// 【2026-10-12 保险丝】输入线程反复卡死（SendInput 被钩子链永久阻塞——第三方安全软件/
+    /// 反作弊的僵死钩子）时置位：鼠标改走后台定向注入（PostMessage 不经过钩子链，免疫），
+    /// 直到进程重启。比"永远点不动"强——后台注入对绝大多数应用有效，少数自绘应用除外。
+    /// </summary>
+    public bool HooksPoisoned { get; set; }
     /// <summary>远端鼠标走哪条路（主控端可选；默认真实光标：兼容性最好）</summary>
     public RemoteInputMode Mode { get; set; } = RemoteInputMode.AlwaysRealCursor;
     /// <summary>远端最近点过的窗口（后台注入模式下用来做键盘的"认领"）</summary>
@@ -117,6 +125,8 @@ public sealed class MouseRouter
     {
         // 主控端明确选了后台注入：照办
         RemoteInputMode.AlwaysBackground => InputPath.Background,
+        // 钩子链中毒保险丝：SendInput 已被证明会被永久阻塞，强行走后台注入保命
+        _ when HooksPoisoned => InputPath.Background,
         // 主控端明确选了真实光标：照办 —— 除非光标已经被别人控制住（那时点击会落到主屏上，
         // 比"兼容性差一点"严重得多），这种情况连日志带状态一起告诉主控端
         RemoteInputMode.AlwaysRealCursor => CursorContested ? InputPath.Background : InputPath.RealCursor,
@@ -153,6 +163,15 @@ public sealed class MouseRouter
 
         long now = Environment.TickCount64;
         if (!force && now - _lastProbeTick < CursorReprobeIntervalMs) return !CursorContested;
+
+        // 【2026-10-10"点不了/副屏废掉"根治·护栏一】本机用户正在动手时**不做探针**。
+        // 探针会把真实光标注入到副屏中心等它到位（~24ms），而本机用户的下一个物理事件
+        // 会被仲裁器礼貌归还（拽回主屏）——探针随即把"被自家仲裁器拽回"误读成
+        // "光标被别的程序抢了"，锁定 CursorContested → 远端永久降级后台注入
+        // （Chromium/微信类应用不吃合成点击）→ 现场就是"打开软件点不了、副屏用不了"。
+        // 不探也没损失：真实光标路径的点击是"移动+按键同一次 SendInput"的原子操作，
+        // 本机用户在动手也绝不会点错屏。
+        if (_arbiter != null && _arbiter.LocalActiveWithin(1500)) return !CursorContested;
         _lastProbeTick = now;
 
         var (pw, ph) = _injector.CaptureSize;
@@ -166,6 +185,20 @@ public sealed class MouseRouter
 
         if (!ok)
         {
+            // 【护栏二】探针失败，但探针窗口里本机用户动过（仲裁器刚做过礼貌归还）：
+            // 这是共享模式的正常争夺，不是失控——绝不锁定降级、绝不进"摆位"降级形态，
+            // 否则本机用户一停手也恢复不了（每次远端交互都撞上这个误判）。
+            if (_arbiter != null && (_arbiter.ReturnedRecently(1500) || _arbiter.LocalActiveWithin(500)))
+            {
+                long t = Environment.TickCount64;
+                if (t - _lastContestLogTick > 5000)
+                {
+                    _lastContestLogTick = t;
+                    _log.Info($"光标位置校验未通过，但本机用户刚操作过（仲裁器做了礼貌归还）：判定为正常共享争夺，不降级");
+                }
+                return false;   // 调用方重跑 Decide()：auto=本次走后台，real=保持真实光标（点击原子安全）
+            }
+
             // 移动事件被抢 ≠ 完全没救：不少机器上 SetCursorPos（直接设位置，不走输入事件链）还是通的，
             // 那就用"直接摆光标 + 只发按键"的方式继续走真实光标 —— 点击位置仍然正确。
             if (!_assistedCursor && _injector.TrySetCursorExact(px, py, out int sx, out int sy))
@@ -267,10 +300,36 @@ public sealed class MouseRouter
         if (path == InputPath.RealCursor && _held == 0 && !up && !ProbeCursor("点击前"))
             path = Decide();
 
+        // 【2026-10-10 非客户区升级，对标 UU 的按应用输入路由】点击落在标题栏/关闭按钮/窗口边框
+        // （非客户区）时，后台注入的合成消息到不了那里 —— 现场：客户点窗口关闭按钮"没反应"。
+        // 本机用户空闲且光标可用时，把这一整段交互（按下→抬起）升级为真实光标；
+        // 本机用户在忙或光标被抢时**不升级**（宁可这一下没反应，也不能抢他的光标/把点击打到主屏）。
+        if (path == InputPath.Background && _held == 0 && !up
+            && !LocalBusy && !CursorContested
+            && BackgroundInput.IsNonClient(ScreenX(x), ScreenY(y)))
+        {
+            path = InputPath.RealCursor;
+            long nowTick = Environment.TickCount64;
+            if (nowTick - _lastUpgradeLogTick > 3000)
+            {
+                _lastUpgradeLogTick = nowTick;
+                _log.Info($"点击({x},{y})落在窗口标题栏/边框（非客户区）：本次交互升级为真实光标" +
+                          "（后台注入的合成消息对非客户区无效）");
+            }
+        }
+
         if (_held == 0 && !up)
         {
             _pathLocked = true;
             _lockedPath = path;
+            // 输入路由打点（对标 UU 的 input-diag：现场问题要能从日志直接看出"点击到了没、走了哪条路"）。限流 2s。
+            long rt = Environment.TickCount64;
+            if (rt - _lastRouteLogTick > 2000)
+            {
+                _lastRouteLogTick = rt;
+                _log.Info($"[input] 点击按下({x},{y}) btn={button} → {(path == InputPath.RealCursor ? "真实光标" : "后台注入")}" +
+                          (path == InputPath.Background ? $"（模式={Mode}{(LocalBusy ? "，本机用户在忙" : "")}{(CursorContested ? "，光标被抢" : "")}）" : ""));
+            }
         }
         SwitchTo(path);
 

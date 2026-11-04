@@ -74,18 +74,30 @@ Publish (Join-Path $RepoRoot "src\Tools\LicenseKeygen\LicenseKeygen.csproj")    
 # 要出分发包请跑 scripts\build-viewer-package.py（顺带打出 build\主控端安装包.zip）。
 Step "写入主控端预置值（viewer-defaults.txt）"
 # 【总会写】本机没有 E:\RemoteControl\viewer\config 时也必须写（2026-10-05 三次踩坑：打包清空 build\viewer
-# 后没回写，裸目录的主控端落回 127.0.0.1 默认值，表现为"打不开"）。令牌从仓库 config\relay-token.txt 读
-# （gitignore 已排除，不入版本库）；文件不存在则只写服务器地址。
+# 后没回写，裸目录的主控端落回 127.0.0.1 默认值，表现为"打不开"）。服务器地址与令牌都从仓库
+# config\relay-token.txt 读（key=value 格式；gitignore 已排除，绝不入版本库）。兼容旧格式：整行裸口令。
 $viewerDefaults = Join-Path $build "viewer\viewer-defaults.txt"
 $relayTokenFile = Join-Path $RepoRoot "config\relay-token.txt"
-$relayToken = if (Test-Path -LiteralPath $relayTokenFile) { (Get-Content $relayTokenFile -Raw).Trim() } else { "" }
+$rcRelay = ""; $relayToken = ""
+if (Test-Path -LiteralPath $relayTokenFile) {
+    foreach ($line in Get-Content -LiteralPath $relayTokenFile) {
+        $t = $line.Trim()
+        if (-not $t -or $t.StartsWith("#")) { continue }
+        if ($t -match '^(relay|token|admin)\s*=\s*(.+)$') {
+            switch ($Matches[1]) {
+                "relay" { $rcRelay = $Matches[2].Trim() }
+                "token" { $relayToken = $Matches[2].Trim() }
+            }
+        } elseif (-not $relayToken) { $relayToken = $t }
+    }
+}
 $defaultsLines = @(
     "# 主控端预置值（打包时自动生成）。config\viewer.json 里为空的项会用这里的值补齐。",
-    "ServerUrl=ws://__RELAY_HOST__:18080/ws"
+    "ServerUrl=ws://$rcRelay/ws"
 )
 if ($relayToken) { $defaultsLines += "Token=$relayToken" }
 Set-Content -Path $viewerDefaults -Encoding UTF8 -Value $defaultsLines
-Write-Host "viewer-defaults.txt 已写入（server=__RELAY_HOST__:18080 hasToken=$([bool]$relayToken)）"
+Write-Host "viewer-defaults.txt 已写入（server=$rcRelay hasToken=$([bool]$relayToken)）"
 
 Step "构建 Go 中继服务器"
 if (-not (Test-Path $go)) {

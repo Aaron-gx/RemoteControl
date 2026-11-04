@@ -1,6 +1,7 @@
 # 构建产物
 build/
-toolsnuget-packages/
+tools/
+nuget-packages/
 
 # NuGet / IDE
 *.user
@@ -8,6 +9,14 @@ toolsnuget-packages/
 .vs/
 bin/
 obj/
+
+# 调试产物（ffmpeg 探针转储 / 裸帧抓取，见 scripts/_rcp.py capture 与编码器探测）
+out*.raw
+*_err.txt
+*_out.h264
+t_out.h264
+dec*.txt
+enc*.txt
 
 # 敏感文件（不入版本库）
 config/relay-token.txt

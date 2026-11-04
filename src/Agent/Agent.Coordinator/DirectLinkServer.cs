@@ -191,13 +191,15 @@ public sealed class DirectLinkServer : IDisposable
         try
         {
             // TCP 端口规则（幂等：已存在就不重复加——netsh add 不会去重，重复加会堆积）
+            // 全部走 ArgumentList 逐参数传递（不经 shell 拼接；2026-10-14 安全扫描整改）
             bool tcpRuleExists = false;
-            var check = new System.Diagnostics.ProcessStartInfo("netsh",
-                $"advfirewall firewall show rule name=\"{FirewallRuleName}\"")
+            var check = new System.Diagnostics.ProcessStartInfo("netsh")
             {
                 RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                 StandardOutputEncoding = System.Text.Encoding.UTF8,
             };
+            foreach (var a in new[] { "advfirewall", "firewall", "show", "rule", $"name={FirewallRuleName}" })
+                check.ArgumentList.Add(a);
             using (var p = System.Diagnostics.Process.Start(check))
             {
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
@@ -211,13 +213,14 @@ public sealed class DirectLinkServer : IDisposable
             }
             else
             {
-                var add = new System.Diagnostics.ProcessStartInfo("netsh",
-                    $"advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow " +
-                    $"protocol=TCP localport={Port}")
+                var add = new System.Diagnostics.ProcessStartInfo("netsh")
                 {
                     RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                     StandardOutputEncoding = System.Text.Encoding.UTF8,
                 };
+                foreach (var a in new[] { "advfirewall", "firewall", "add", "rule", $"name={FirewallRuleName}",
+                                          "dir=in", "action=allow", "protocol=TCP", $"localport={Port}" })
+                    add.ArgumentList.Add(a);
                 using var p = System.Diagnostics.Process.Start(add);
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
                 p?.WaitForExit(10000);
@@ -226,12 +229,13 @@ public sealed class DirectLinkServer : IDisposable
 
             // 程序级放行（幂等同上）：UPnP 发现靠组播/单播 UDP 的**应答**进来，
             // 防火墙对无名程序的这类入站默认拦——不放行则 SSDP 永远收不到应答（"UPnP 不可用"的主因之一）
-            var checkProg = new System.Diagnostics.ProcessStartInfo("netsh",
-                $"advfirewall firewall show rule name=\"{FirewallProgramRuleName}\"")
+            var checkProg = new System.Diagnostics.ProcessStartInfo("netsh")
             {
                 RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                 StandardOutputEncoding = System.Text.Encoding.UTF8,
             };
+            foreach (var a in new[] { "advfirewall", "firewall", "show", "rule", $"name={FirewallProgramRuleName}" })
+                checkProg.ArgumentList.Add(a);
             using (var p = System.Diagnostics.Process.Start(checkProg))
             {
                 var output = p?.StandardOutput.ReadToEnd() ?? "";
@@ -242,13 +246,14 @@ public sealed class DirectLinkServer : IDisposable
             }
             var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
             if (string.IsNullOrEmpty(exe)) return;
-            var addProg = new System.Diagnostics.ProcessStartInfo("netsh",
-                $"advfirewall firewall add rule name=\"{FirewallProgramRuleName}\" dir=in action=allow " +
-                $"program=\"{exe}\"")
+            var addProg = new System.Diagnostics.ProcessStartInfo("netsh")
             {
                 RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                 StandardOutputEncoding = System.Text.Encoding.UTF8,
             };
+            foreach (var a in new[] { "advfirewall", "firewall", "add", "rule", $"name={FirewallProgramRuleName}",
+                                      "dir=in", "action=allow", $"program={exe}" })
+                addProg.ArgumentList.Add(a);
             using (var p2 = System.Diagnostics.Process.Start(addProg))
             {
                 var output = p2?.StandardOutput.ReadToEnd() ?? "";

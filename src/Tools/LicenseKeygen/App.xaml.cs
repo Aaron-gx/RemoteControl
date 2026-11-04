@@ -41,7 +41,7 @@ public partial class App : Application
             return r.Ok ? 0 : 2;
         }
 
-        var keyPath = Arg("--key") ?? @"E:\RemoteControl\license\private.pem";
+        var keyPath = Arg("--key") ?? global::LicenseKeygen.MainWindow.DiscoverPrivateKeyPath();
         if (!File.Exists(keyPath))
         {
             Console.Error.WriteLine($"找不到私钥：{keyPath}");

@@ -183,6 +183,10 @@ public static partial class NativeApi
     public const uint BM_CLICK = 0x00F5;
     public const uint BM_SETCHECK = 0x00F1;
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
+    public const uint GW_OWNER = 4;
+
     /// <summary>是否为复选框/三态框（BS_CHECKBOX / BS_AUTOCHECKBOX / BS_3STATE / BS_AUTO3STATE）</summary>
     public static bool IsCheckBoxStyle(int style)
     {

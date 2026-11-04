@@ -43,6 +43,9 @@ public sealed class WebSocketService : IDisposable
     /// <summary>被控端上报的 P2P 直连候选（内网 IP / UPnP 公网地址）</summary>
     public event Action<List<string>, string?>? DirectCandidatesReceived;
 
+    /// <summary>被控端发来的 UDP 打洞信息（PunchOffer JSON 原始负载：会话随机数 + 候选地址）</summary>
+    public event Action<byte[]>? PunchInfoReceived;
+
     public bool IsConnected => _ws?.State == WebSocketState.Open;
     public bool IsRunning => _cts is { IsCancellationRequested: false };
 
@@ -296,6 +299,12 @@ public sealed class WebSocketService : IDisposable
                     DirectCandidatesReceived?.Invoke(list, pub);
                 }
                 catch (Exception ex) { _log.Warn($"解析直连候选失败：{ex.Message}"); }
+                continue;
+            }
+            if (msg.Type == MessageType.PunchInfo)
+            {
+                // 被控端的 UDP 打洞候选（STUN 公网映射 + 内网地址 + 会话随机数）
+                PunchInfoReceived?.Invoke(msg.Payload);
                 continue;
             }
             try { MessageReceived?.Invoke(msg); }

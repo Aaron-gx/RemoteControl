@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
@@ -9,6 +9,8 @@
     <RootNamespace>Agent.Common</RootNamespace>
     <AssemblyName>Agent.Common</AssemblyName>
     <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <!-- 单测要碰 internal（丢片测试钩子/分片参数等）：测试程序集直通 -->
+    <InternalsVisibleTo>Agent.Common.Tests</InternalsVisibleTo>
   </PropertyGroup>
 
 </Project>

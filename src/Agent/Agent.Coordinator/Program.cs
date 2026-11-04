@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using Agent.Common;
+using Agent.Worker;
 
 namespace Agent.Coordinator;
 
@@ -77,6 +78,7 @@ public sealed class CoordinatorApp : IDisposable
     private readonly SoftwareEnumerator _sw;
     private readonly FileUploader _uploader;
     private readonly DirectLinkServer _direct;
+    private readonly UdpPunchChannel _udp;
     private readonly LicenseGate _license;
     private readonly Updater _updater;
     private TrayIcon? _tray;
@@ -97,6 +99,21 @@ public sealed class CoordinatorApp : IDisposable
     private long _canaryFiredTick;
     /// <summary>当前配对的主控端数量（中继推送；>1 时视频统一走中继）</summary>
     private int _viewerCount;
+    // ---- UDP 直连路径质量监控（2026-10-10，对标 UU 的 filter_network_monitor）----
+    // 以前只有"3.5 秒彻底断流"才回落中继：高丢包但不断的链路（晚高峰国际段、WiFi 干扰）会
+    // 一直糊在直连上 —— 视频残帧、点击丢失，而中继（TCP 无损）其实更稳。
+    // 现在按保活 ping 的丢包率做决策：持续超标 → 视频/控制切回中继（直连保活继续探测），
+    // 恢复达标 → 自动切回。被控端侧可测（数自己 ping 的应答），不需要主控端配合。
+    /// <summary>UDP 直连视频路径被质量监控暂停（true 期间视频/控制走中继）</summary>
+    private volatile bool _udpVideoSuspended;
+    /// <summary>ping 丢包持续超标的起点（0 = 当前不超标）</summary>
+    private long _udpBadSince;
+    /// <summary>暂停后丢包恢复达标的起点（0 = 尚未达标）</summary>
+    private long _udpGoodSince;
+    /// <summary>本会话累计切换次数（日志/状态观测用）</summary>
+    private long _udpSuspendCount;
+    /// <summary>“对端是对称 NAT”只提示一次（每次 PunchInfo 都带标志，别刷日志）</summary>
+    private bool _udpSymNoticeLogged;
     /// <summary>上次拉起采集引擎的时间：防止"看护 + 掉线重试"同时拉起两个引擎线程打架（会 0 帧）</summary>
     private DateTime _lastWorkerLaunchUtc = DateTime.MinValue;
     /// <summary>操作系统描述（缓存，避免每秒都查注册表）</summary>
@@ -133,7 +150,7 @@ public sealed class CoordinatorApp : IDisposable
             Console.Error.WriteLine("已有被控端在运行，本次启动退出（单实例保护）。");
             Environment.Exit(0);
         }
-        _log.Info($"版本 1.1.0 / AgentId={_cfg.AgentId} / 进程会话={SessionInfo.CurrentId} / 管理员={SessionInfo.IsElevated}");
+        _log.Info($"版本 {WorkerContext.Version}（协调器外壳，引擎见 worker 日志） / AgentId={_cfg.AgentId} / 进程会话={SessionInfo.CurrentId} / 管理员={SessionInfo.IsElevated}");
         _log.Info($"配置：EnableVirtualDisplay={_cfg.EnableVirtualDisplay} Server={_cfg.ServerUrl} " +
                   $"FPS={_cfg.FrameRate} 编码器={_cfg.Encoder}");
         if (!string.IsNullOrEmpty(_cfg.ConfigNotice))
@@ -156,6 +173,9 @@ public sealed class CoordinatorApp : IDisposable
         _sw = new SoftwareEnumerator(_log, _cfg.ReportSoftwareIcons);
         _uploader = new FileUploader(_cfg, _log);
         _direct = new DirectLinkServer(_cfg, _log);
+        // 【2026-10-10 UU 式直连】UDP 打洞通道：跨网络（双方都没开 UPnP）时视频/输入不走中继，
+        // RTT 从 ~170ms（香港中继）降到内网直连水平。候选经中继交换（PunchInfo），服务器零改动。
+        _udp = new UdpPunchChannel(_log, PunchRole.Agent, _cfg.AgentToken);
         _license = new LicenseGate(Path.Combine(AppContext.BaseDirectory, "config", "license.cache.json"), _log);
         _updater = new Updater(_cfg, _log, () => HasViewer, () => _relay.IsConnected);   // 断网不应用（2026-10-09 事故）
         // 直连握手先过授权闸门：授权不可用时不允许任何人通过 P2P 接进来
@@ -208,6 +228,22 @@ public sealed class CoordinatorApp : IDisposable
 
     public void Start()
     {
+        // 【2026-10-11 会话自愈】看门狗/开机任务（SYSTEM）拉起的实例落在 session 0，
+        // 看不到用户桌面（虚拟外屏缺位 → 暂停出帧 + 拒绝打开软件，机器等于废了）。
+        // 控制台会话有登录用户（锁屏也算）时，迁移过去并退出 —— 报平安标记提前补写，
+        // 避免热更新因 45 秒无心跳而回滚。迁移失败（无人登录/接口失败）就地继续服务。
+        try
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "Agent.Coordinator.exe");
+            if (SessionHandover.TryHandoverToConsoleSession(exe, _log))
+            {
+                _updater.ReportAlive();     // 迁移退出前补写报平安（本实例活不过 45s 计时器）
+                Thread.Sleep(500);
+                Environment.Exit(0);
+            }
+        }
+        catch (Exception ex) { _log.Warn($"会话迁移检查异常（忽略）：{ex.Message}"); }
+
         // 托盘按配置开关（默认**隐藏**：客户要求装完右下角不出现任何显示，2026-10-04）。
         // 隐藏时没有"托盘右键 → 退出"，退出 = 任务管理器结束进程（README §8 有命令）。
         if (_cfg.ShowTrayIcon)
@@ -245,6 +281,10 @@ public sealed class CoordinatorApp : IDisposable
         _relay.Connected += OnRelayConnected;
         _relay.Disconnected += OnRelayDisconnected;
         _relay.MessageReceived += OnViewerMessage;
+        // UDP 直连：输入/控制消息从打洞通道来时走同一条分发（与中继完全同权）；
+        // 死链事件只记日志——视频/输入路径每帧/每条自查 IsLive，会自动回中继
+        _udp.MessageReceived += OnViewerMessage;
+        _udp.Dead += () => _log.Info("UDP 直连已回落中继（等下一次打洞）");
         // 校验不通过时静默停服：托盘/界面/上报都不出现"授权/激活码"字样
         // （用户不需要知道机制；排查靠本机日志与服务器端状态）
         _relay.LicenseRejected += reason =>
@@ -261,7 +301,15 @@ public sealed class CoordinatorApp : IDisposable
                 ? "（多于一个时视频统一走中继，保证每个主控端都有画面；P2P 直连暂时挂起）"
                 : ""));
             // 多于一个主控端时把直连也停掉：否则直连那一路会继续"只认直连"而看不到中继画面
-            if (n > 1) _direct.StopServing("当前有多个主控端，视频改走中继");
+            if (n > 1)
+            {
+                _direct.StopServing("当前有多个主控端，视频改走中继");
+                // 多主控端可能混有旧版本（旧主控端不上报能力、也解不了 H.265）：
+                // 视频统一回 H.264（公共能力集）。回到单主控端后，那次重连会重新协商。
+                if (_bus.IsWorkerConnected)
+                    _bus.SendToWorker(new ProtocolMessage(MessageType.Capabilities,
+                        JsonCodec.Encode(new CapabilitiesInfo { CapVer = 1, H265Decode = false })));
+            }
         };
         _license.LockedOut += LockDown;
         _license.Tick();
@@ -287,6 +335,16 @@ public sealed class CoordinatorApp : IDisposable
                             if (!string.IsNullOrWhiteSpace(_cfg.DirectLinkPublicAddress))
                                 _direct.SetManualPublic(_cfg.DirectLinkPublicAddress);
                             _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+                            // UDP 打洞：候选收集是异步的（STUN 要几百毫秒），没就绪就等下一轮；
+                            // 已连通后不再发（每发一次对端都会重开 20 秒打洞窗口，没必要）。
+                            // 本端是对称 NAT 时也不再发：映射端口对对端无意义，别让它白打。
+                            // UdpPunchEnabled=false 时整个 UDP 直连停用（见 AppConfig 注释）。
+                            if (_cfg.UdpPunchEnabled && !_udp.IsLive && !_udp.SymmetricNat)
+                            {
+                                await _udp.EnsureCandidatesAsync();
+                                if (HasViewer && !_udp.IsLive && !_udp.SymmetricNat)
+                                    _relay.Queue(new ProtocolMessage(MessageType.PunchInfo, _udp.OfferPayload()));
+                            }
                         }
                         await Task.Delay(TimeSpan.FromSeconds(15), _cts.Token);
                     }
@@ -299,6 +357,81 @@ public sealed class CoordinatorApp : IDisposable
         _ = Task.Run(BootstrapAsync);
         StartDiagnostics();
         StartWorkerWatchdog();
+        StartUdpPathMonitor();
+    }
+
+    /// <summary>
+    /// UDP 直连路径质量监控（每 2 秒评估一次，2026-10-10）：
+    ///   · 丢包（ping 无应答率）≥30% 持续 10 秒 → 暂停直连视频路径（切中继），保活与探测继续；
+    ///   · 暂停后丢包 ≤10% 持续 30 秒 → 恢复直连。
+    /// 阈值刻意不对称（严进宽出）：切路径本身有代价（画面短暂走远路），确认坏了才切、
+    /// 确认好了才切回。通道断开（IsLive=false）时一切复位 —— 那条路本来就没了。
+    /// </summary>
+    private void StartUdpPathMonitor()
+    {
+        _ = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2), _cts.Token);
+                    if (!_cfg.UdpQualitySwitchEnabled)
+                    {
+                        _udpVideoSuspended = false;
+                        continue;
+                    }
+                    if (!_udp.IsLive)
+                    {
+                        if (_udpVideoSuspended)
+                        {
+                            _udpVideoSuspended = false;
+                            _log.Debug("UDP 直连已断开：路径监控状态复位");
+                        }
+                        _udpBadSince = 0;
+                        _udpGoodSince = 0;
+                        continue;
+                    }
+                    int loss = _udp.PingLossPercent;
+                    long now = Environment.TickCount64;
+                    if (!_udpVideoSuspended)
+                    {
+                        if (loss >= 30)
+                        {
+                            if (_udpBadSince == 0) _udpBadSince = now;
+                            else if (now - _udpBadSince >= 10_000)
+                            {
+                                _udpVideoSuspended = true;
+                                Interlocked.Increment(ref _udpSuspendCount);
+                                _udpGoodSince = 0;
+                                _log.Warn($"UDP 直连丢包持续超标（ping 无应答率 {loss}% ≥10s，本会话第 {_udpSuspendCount} 次切换）：" +
+                                          "视频/控制切回中继；直连保活继续，恢复后自动切回");
+                            }
+                        }
+                        else
+                        {
+                            _udpBadSince = 0;
+                        }
+                    }
+                    else if (loss <= 10)
+                    {
+                        if (_udpGoodSince == 0) _udpGoodSince = now;
+                        else if (now - _udpGoodSince >= 30_000)
+                        {
+                            _udpVideoSuspended = false;
+                            _udpBadSince = 0;
+                            _log.Info("UDP 直连质量已恢复（ping 丢包 ≤10% 持续 30s）：视频/控制切回直连");
+                        }
+                    }
+                    else
+                    {
+                        _udpGoodSince = 0;
+                    }
+                }
+                catch (OperationCanceledException) { return; }
+                catch (Exception ex) { _log.Debug($"UDP 路径监控异常：{ex.Message}"); }
+            }
+        });
     }
 
     /// <summary>把帧通道里的码流块搬到发送出口（直连优先/中继兜底，见 OnFrame）</summary>
@@ -446,7 +579,8 @@ public sealed class CoordinatorApp : IDisposable
                               $"本周期入队={q - lastQueued} 控制丢弃={d - lastDropped} 视频挤掉={vd - lastVideoDropped}  " +
                               $"环形水位={fill * 100:F1}%  " +
                               $"主控端={(HasViewer ? "在线" : "无")}  " +
-                              $"直连={(_direct.HasViewer ? $"已建立({_direct.ViewerEndpoint}, {_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB)" : (_direct.UpnpMapped ? "待接入(UPnP已映射)" : "未建立"))}");
+                              $"直连={(_direct.HasViewer ? $"已建立({_direct.ViewerEndpoint}, {_direct.FramesSent}帧/{_direct.BytesSent / 1024}KB)" : (_direct.UpnpMapped ? "待接入(UPnP已映射)" : "未建立"))}  " +
+                              $"UDP={( _cfg.UdpPunchEnabled ? (_udp.IsLive ? $"活({_udp.FramesSent}帧/{_udp.BytesSent / 1024}KB,收{_udp.BytesReceived / 1024}KB)" : "未连通") : "停用")}");
                     lastFrames = f; lastQueued = q; lastDropped = d; lastVideoDropped = vd;
                     // 【2026-10-09 VSAQ 事故】Worker 状态龄监视：正常时引擎每 1s 上报一次状态。
                     // 状态断流而引擎"看似在跑"= toCoordinator 泵或引擎线程本身卡死
@@ -699,6 +833,27 @@ public sealed class CoordinatorApp : IDisposable
         PushSoftwareListAsync();
         _bus.SendToWorker(new ProtocolMessage(MessageType.StreamReset, PayloadCodec.Empty()));
         _relay.Queue(new ProtocolMessage(MessageType.DirectCandidates, _direct.CandidatesJson()));
+        // UDP 打洞从接入这一刻就开始张罗：收集候选（STUN+内网）后把本端 PunchInfo 发给主控端。
+        // 候选还没就绪时这里发出去的是空列表——15 秒周期推送会补上，主控端也会周期重发它的。
+        // 本端是对称 NAT 时不发：候选端口对对端无意义（打洞必然失败），直接走中继。
+        if (!_cfg.UdpPunchEnabled)
+        {
+            // UDP 直连整体停用（2026-10-11 客户现场单向黑洞事故）：不发 PunchInfo，
+            // 主控端不会开打洞窗口，视频/输入全程走 TCP（直连或中继）。
+        }
+        else if (!_udp.SymmetricNat)
+        {
+            _ = Task.Run(async () =>
+            {
+                await _udp.EnsureCandidatesAsync();
+                if (HasViewer && !_udp.IsLive && !_udp.SymmetricNat)
+                    _relay.Queue(new ProtocolMessage(MessageType.PunchInfo, _udp.OfferPayload()));
+            });
+        }
+        else
+        {
+            _log.Info("本机疑似对称 NAT：UDP 打洞无望，本次连接走中继（候选不再发送）");
+        }
     }
 
     private DateTime _lastListPush = DateTime.MinValue;
@@ -715,12 +870,52 @@ public sealed class CoordinatorApp : IDisposable
     {
         switch (msg.Type)
         {
+            case MessageType.PunchInfo:
+                // 主控端的 UDP 打洞候选到了（nonce + 公网映射/内网地址）→ 对着它的候选开打。
+                // 走中继也走 UDP 直连都可能收到这条（去重由打洞幂等性兜住）。
+                // 任一侧是对称 NAT（本端标志或对端上报）都无望打洞：直接不进打洞窗口，
+                // 走中继（对标 UU 的 PunchCheckFireWall："确认打不动就立刻转 relay"）。
+                if (_license.IsUsable)
+                {
+                    var (nonce, eps, peerSym, peerCap) = UdpPunchChannel.DecodeOffer(msg.Payload);
+                    if (peerSym && !_udpSymNoticeLogged)
+                    {
+                        _udpSymNoticeLogged = true;
+                        _log.Info("对端（主控端）上报疑似对称 NAT：UDP 打洞无望，本次连接走中继");
+                    }
+                    if (_cfg.UdpPunchEnabled && eps.Count > 0 && !peerSym)
+                        _udp.OfferPeers(eps, nonce, peerCap);   // 能力位随 offer 一起进通道（KCP/RS-FEC 的 AND 协商）
+                }
+                break;
+
             case MessageType.RequestSoftwareList:
                 // 主控端每次连接都会发这条（相当于"我上线了"）：必须把接入状态一整套推给它，
                 // 否则"上一个主控端刚断开不到 6 秒"时会被 HasViewer 判定为"仍然在线"而跳过推送，
                 // 表现为新主控端画面一直是黑的（实测踩到）
                 _log.Info("收到软件列表请求（视为主控端上线）");
                 OnViewerAttached();
+                break;
+
+            case MessageType.Capabilities:
+                // 主控端能力协商（2026-10-10 H.265）：转给采集引擎决定/切换编码族。
+                // 多主控端时收下但不转发 —— 只服务公共能力集（H.264），见 ViewerCountChanged。
+                if (_bus.IsWorkerConnected && _viewerCount <= 1)
+                    _bus.SendToWorker(msg);
+                break;
+
+            case MessageType.DiagnosticsRequest:
+                // 诊断（2026-10-11 对标 UU healthd）：协调器**直接**应答，不经过引擎 ——
+                // 引擎卡死/泵坏死时照样可用，这正是 2026-10-10"控制面坏死两小时盲区"的解药。
+                _log.Info("收到诊断请求（协调器直接应答，不经过引擎）");
+                SendToViewer(new ProtocolMessage(MessageType.DiagnosticsReport,
+                    JsonCodec.Encode(BuildDiagnostics())));
+                break;
+
+            case MessageType.EngineRestart:
+                // 远程硬重启采集引擎（诊断配套）：转储引擎线程栈 + WM_QUIT，看门狗自动拉起新引擎。
+                _log.Warn("收到远程重启引擎请求：转储引擎栈并硬重启（看门狗会拉起新引擎）");
+                _host.DumpEngineStackAndRequestExit();
+                ReportError("已请求重启采集引擎（约 10 秒内自动恢复）");
                 break;
 
             case MessageType.MouseMove:
@@ -845,9 +1040,23 @@ public sealed class CoordinatorApp : IDisposable
                 // 中继这条腿的积压/丢弃：主控端据此显示"网络上是不是堵了"
                 st.RelayQueued = _relay.VideoPending;
                 st.RelayDropped = _relay.VideoDropped;
+                // UDP 直连状态（主控端状态栏的"延迟/直连"显示、_rcp status 远程可观测）
+                st.UdpActive = _udp.IsLive;
+                st.UdpEndpoint = _udp.PeerEndpoint ?? "";
+                st.UdpRtt = _udp.RttMs;
+                st.UdpLoss = _udp.LossPercent;
+                st.UdpPingLoss = _udp.PingLossPercent;
+                st.UdpSuspended = _udpVideoSuspended;
+                st.UdpKcp = _udp.KcpActive;
+                st.UdpFecR = _udp.FecParityR;
+                st.UdpFecRecovered = _udp.FecRecoveredChunks;
                 // 视频出口拥塞 → 立刻告诉 Worker 降码率。
-                // Worker 自己看不到中继这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
-                bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped;
+                // Worker 自己看不到出口这条腿有多堵（它只看得到帧环），所以这个信号必须由协调器给。
+                // UDP 直连时改看**丢帧率**（残帧率）与保活 ping 丢包 —— 直连没有队列积压这回事，
+                // 拥塞表现为丢包；已被路径监控暂停的直连不再计入（视频此刻走中继）。
+                bool udpCongested = _udp.IsLive && !_udpVideoSuspended
+                                    && (_udp.LossPercent >= 15 || _udp.PingLossPercent >= 25);
+                bool congested = _relay.VideoPending >= 4 || _relay.VideoDropped > _lastVideoDropped || udpCongested;
                 _lastVideoDropped = _relay.VideoDropped;
                 long hintSeq = Interlocked.Increment(ref _hintSeqSent);
                 _bus.SendToWorker(new ProtocolMessage(MessageType.IpcBitrateHint, JsonCodec.Encode(new BitrateHintInfo
@@ -925,6 +1134,11 @@ public sealed class CoordinatorApp : IDisposable
         if (!_license.IsUsable) return;   // 授权不可用：一个字节都不往外送（含 P2P）
         var payload = PayloadCodec.EncodeVideoFrame(Environment.TickCount64, chunk);
         var msg = new ProtocolMessage(MessageType.VideoFrame, payload);
+        // UDP 打洞直连最优先（跨网络时的低延迟路径）；多主控端时和 TCP 直连一样只服务一个，
+        // 统一回中继人人有画面。SendVideo 未连通时返回 false 自动落到下一档。
+        // 路径质量监控暂停期间（丢包超标）同样不走 UDP —— 让 TCP 中继把画面稳住。
+        if (_cfg.UdpPunchEnabled && _viewerCount <= 1 && !_udpVideoSuspended && _udp.SendVideo(msg))
+            return;
         // P2P 直连优先：视频走直连，控制/剪贴板仍走中继；直连断了自动回到中继。
         // 但**有多个主控端时不能只发直连**：那条通道只服务一个主控端，
         // 其他主控端会一直黑屏（实测缺陷）→ 这时统一走中继，人人有画面。
@@ -998,6 +1212,16 @@ public sealed class CoordinatorApp : IDisposable
     /// </summary>
     private void SendToViewer(ProtocolMessage msg)
     {
+        // UDP 打洞直连优先：状态/软件列表/剪贴板这些小消息走直连（RTT 低），
+        // 250ms 未确认自动回落中继补发（通道内建），接收端按序号去重不会重复。
+        // 大消息（>48KB 的软件列表图标包等）和多头观众仍走中继。
+        // 路径质量监控暂停期间（丢包超标）不走 UDP：点击这类控制消息在坏链路上会丢手感。
+        if (_cfg.UdpPunchEnabled && _udp.IsLive && !_udpVideoSuspended && _viewerCount <= 1 && msg.Payload.Length <= 48 * 1024
+            && msg.Type != MessageType.DirectCandidates && msg.Type != MessageType.PunchInfo)
+        {
+            _udp.Send(msg, m => _relay.Queue(m));
+            return;
+        }
         if (_direct.HasViewer && _viewerCount <= 1)
         {
             _direct.Send(msg);
@@ -1081,6 +1305,75 @@ public sealed class CoordinatorApp : IDisposable
     /// <summary>上一次发给主控端的软件列表（实时监测拿它做变化比对）</summary>
     private List<SoftwareInfo> _lastSoftwareList = new();
     private readonly object _swListLock = new();
+
+    // ---------------------------------------------------------------- 诊断（healthd 式，2026-10-11）
+
+    /// <summary>
+    /// 收集诊断快照。**只依赖协调器自己知道的事**（日志尾部从磁盘文件读）——
+    /// 引擎彻底卡死时这份报告照样完整，这是与"经引擎的状态上报"的本质区别。
+    /// </summary>
+    private DiagnosticsInfo BuildDiagnostics()
+    {
+        var d = new DiagnosticsInfo
+        {
+            Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            AgentVersion = _workerReady?.Version ?? "",
+            EngineConnected = _bus.IsWorkerConnected,
+            EngineThreadAlive = _host.IsRunning,
+            StatusAgeMs = Environment.TickCount64 - Volatile.Read(ref _lastWorkerStatusTick),
+            ViewerCount = _viewerCount,
+            RelayConnected = _relay.IsConnected,
+            RelayQueued = _relay.VideoPending,
+            RelayDropped = _relay.VideoDropped,
+            UdpActive = _udp.IsLive,
+            UdpEndpoint = _udp.PeerEndpoint ?? "",
+            UdpRtt = _udp.RttMs,
+            UdpLoss = _udp.LossPercent,
+            UdpPingLoss = _udp.PingLossPercent,
+            UdpSuspended = _udpVideoSuspended,
+            UdpKcp = _udp.KcpActive,
+            UdpFecR = _udp.FecParityR,
+            UdpFecRecovered = _udp.FecRecoveredChunks,
+            ConfigSummary = $"backend={_cfg.CaptureBackend} fps={_cfg.FrameRate} kbps={_cfg.BitrateKbps} " +
+                            $"codec={_cfg.VideoCodec} encoder={_cfg.Encoder} vdd={_cfg.EnableVirtualDisplay} " +
+                            $"license={(_license.IsUsable ? "ok" : _license.LockReason)}",
+            WorkerLogTail = ReadLogTail("worker-*.log", 60),
+            CoordinatorLogTail = ReadLogTail("coordinator-*.log", 40),
+        };
+        return d;
+    }
+
+    /// <summary>
+    /// 读安装目录 logs\ 下最新一份匹配日志的尾部。FileShare.ReadWrite 打开 ——
+    /// Logger 正在写也不冲突；引擎死了文件还在，这正是"死了也能拿日志"的关键。
+    /// </summary>
+    private static string ReadLogTail(string pattern, int lines)
+    {
+        try
+        {
+            var dir = Path.Combine(AppContext.BaseDirectory, "logs");
+            if (!Directory.Exists(dir)) return "(logs 目录不存在)";
+            var file = new DirectoryInfo(dir)
+                .EnumerateFiles(pattern)
+                .OrderByDescending(f => f.LastWriteTime)
+                .FirstOrDefault();
+            if (file == null) return $"(没有 {pattern})";
+            var tail = new Queue<string>(lines);
+            using var fs = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (tail.Count == lines) tail.Dequeue();
+                tail.Enqueue(line);
+            }
+            return $"[{file.Name}]\n" + string.Join("\n", tail);
+        }
+        catch (Exception ex)
+        {
+            return $"(读日志失败：{ex.Message})";
+        }
+    }
 
     /// <summary>
     /// 实时运行状态监测：每 3 秒轻量枚举一次进程，**只把有变化的项**推给主控端。
@@ -1194,6 +1487,7 @@ public sealed class CoordinatorApp : IDisposable
     public void Dispose()
     {
         try { _relay.Dispose(); } catch { }
+        try { _udp.Dispose(); } catch { }
         try { _updater.Dispose(); } catch { }
         try { _bus.Dispose(); } catch { }
         try { _uploader.Dispose(); } catch { }

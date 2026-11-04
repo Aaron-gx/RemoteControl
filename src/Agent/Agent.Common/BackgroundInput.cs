@@ -62,6 +62,31 @@ public static class BackgroundInput
         return pid != 0 && pid != Environment.ProcessId;
     }
 
+    private const uint WM_NCHITTEST = 0x84;
+    private static readonly IntPtr HTCLIENT = (IntPtr)1;
+
+    /// <summary>
+    /// 这个屏幕坐标落在窗口的**非客户区**吗（标题栏 / 关闭·最小化·最大化按钮 / 窗口边框）。
+    /// 后台定向注入只投递客户区消息，非客户区根本不消费合成消息 ——
+    /// 现场（2026-10-10）：客户在主控端点窗口的关闭按钮"没反应"、厂商一用真实光标就能关掉，
+    /// 根因就是鼠标路由在后台注入上。路由器据此把非客户区点击升级为真实光标。
+    /// </summary>
+    public static bool IsNonClient(int screenX, int screenY)
+    {
+        var hwnd = HitTest(screenX, screenY);
+        if (hwnd == IntPtr.Zero) return false;
+        var root = NativeApi.GetAncestor(hwnd, NativeApi.GA_ROOT);
+        if (root == IntPtr.Zero) root = hwnd;
+        var lParam = (IntPtr)((screenY << 16) | (screenX & 0xFFFF));
+        try
+        {
+            NativeApi.SendMessageTimeoutW(root, WM_NCHITTEST, IntPtr.Zero, lParam,
+                NativeApi.SMTO_ABORTIFHUNG, 80, out var result);
+            return result != HTCLIENT;   // HTCAPTION/HTCLOSE/HTMAXBUTTON/HTBORDER… 全算非客户区
+        }
+        catch { return false; }
+    }
+
     /// <summary>投递 WM_MOUSEMOVE（带按键状态，拖拽时要带 MK_LBUTTON）</summary>
     public static bool PostMove(IntPtr hwnd, int x, int y, int buttonState)
         => PostClient(hwnd, NativeApi.WM_MOUSEMOVE, x, y, buttonState);

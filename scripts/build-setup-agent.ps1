@@ -22,7 +22,7 @@
 param(
     [string]$RepoRoot = "",
     [string]$ToolsRoot = "E:\tools",
-    [string]$RelayServer = "__RELAY_HOST__:18080",
+    [string]$RelayServer = "",            # 空 = 从 config\relay-token.txt 的 relay= 行读（该文件不入 git）
     [string]$Token = "",            # 预置中继令牌（会写进 setup-defaults.ini）
     [switch]$SkipAgentBuild,        # 跳过 dotnet publish（用现有 build\agent）
     [switch]$AlsoLegacyExe          # 额外产出自制版单文件安装器（老脚本分发用，+210MB）
@@ -30,6 +30,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Split-Path -Parent $PSScriptRoot }
+if ([string]::IsNullOrWhiteSpace($RelayServer)) {
+    # 中继地址从 config\relay-token.txt 读（relay= 行；gitignore 已排除，绝不入版本库）
+    $rcRelayFile = Join-Path $RepoRoot "config\relay-token.txt"
+    if (Test-Path -LiteralPath $rcRelayFile) {
+        foreach ($line in Get-Content -LiteralPath $rcRelayFile) {
+            if ($line -match '^\s*relay\s*=\s*(.+?)\s*$') { $RelayServer = $Matches[1] }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($RelayServer)) { throw "未指定中继地址：请传 -RelayServer 或在 config\relay-token.txt 里填 relay=" }
+}
 
 $env:DOTNET_ROOT = Join-Path $ToolsRoot "dotnet"
 $env:PATH = "$env:DOTNET_ROOT;" + $env:PATH
